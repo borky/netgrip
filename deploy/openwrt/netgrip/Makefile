@@ -32,6 +32,7 @@ define Package/netgrip/install
 	$(INSTALL_BIN) ./files/etc/init.d/netgrip $(1)/etc/init.d/netgrip
 	$(INSTALL_DIR) $(1)/usr/libexec
 	$(INSTALL_BIN) ./files/usr/libexec/netgrip-restore-rules $(1)/usr/libexec/netgrip-restore-rules
+	$(INSTALL_BIN) ./files/usr/libexec/netgrip-heal-register $(1)/usr/libexec/netgrip-heal-register
 endef
 
 define Package/netgrip/postinst
@@ -75,7 +76,7 @@ if [ -z "$${IPKG_INSTROOT}" ]; then
 	# Survive sysupgrades: the apk registry does not survive, but the
 	# preserved files do, so procd starts the panel on first boot.
 	# /etc/netgrip/ keeps the netpulse embedded-agent env across upgrades.
-	for f in /usr/sbin/netgrip /etc/init.d/netgrip /etc/rc.d/S99netgrip /usr/libexec/netgrip-restore-rules /etc/netgrip/; do
+	for f in /usr/sbin/netgrip /etc/init.d/netgrip /etc/rc.d/S99netgrip /usr/libexec/netgrip-restore-rules /usr/libexec/netgrip-heal-register /etc/netgrip/; do
 		grep -qxF "$$f" /etc/sysupgrade.conf 2>/dev/null || echo "$$f" >> /etc/sysupgrade.conf
 	done
 fi

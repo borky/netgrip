@@ -69,6 +69,8 @@ cp "$REPO_ROOT/deploy/openwrt/netgrip/files/netgrip.init" "$PKG_DIR/etc/init.d/n
 chmod 755 "$PKG_DIR/etc/init.d/netgrip"
 cp "$REPO_ROOT/deploy/openwrt/netgrip/files/netgrip-restore-rules" "$PKG_DIR/usr/libexec/netgrip-restore-rules"
 chmod 755 "$PKG_DIR/usr/libexec/netgrip-restore-rules"
+cp "$REPO_ROOT/deploy/openwrt/netgrip/files/usr/libexec/netgrip-heal-register" "$PKG_DIR/usr/libexec/netgrip-heal-register"
+chmod 755 "$PKG_DIR/usr/libexec/netgrip-heal-register"
 
 # CONTROL files
 cat > "$PKG_DIR/CONTROL/control" << CTRL
@@ -125,7 +127,7 @@ fi
 # Survive sysupgrades: the apk registry does not survive, but the
 # preserved files do, so procd starts the panel on first boot.
 # /etc/netgrip/ keeps the netpulse embedded-agent env across upgrades.
-for f in /usr/sbin/netgrip /etc/init.d/netgrip /etc/rc.d/S99netgrip /usr/libexec/netgrip-restore-rules /etc/netgrip/; do
+for f in /usr/sbin/netgrip /etc/init.d/netgrip /etc/rc.d/S99netgrip /usr/libexec/netgrip-restore-rules /usr/libexec/netgrip-heal-register /etc/netgrip/; do
   grep -qxF "$f" /etc/sysupgrade.conf 2>/dev/null || echo "$f" >> /etc/sysupgrade.conf
 done
 exit 0
