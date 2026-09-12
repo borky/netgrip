@@ -139,6 +139,9 @@ export const demoSqm: T.SQMProbe = {
   interface: "wan",
   download: "280000",
   upload: "280000",
+  profile: "balanced",
+  qdisc: "cake",
+  script: "piece_of_cake.qos",
 };
 
 export const demoOvpn: T.OVPNProbe = {
