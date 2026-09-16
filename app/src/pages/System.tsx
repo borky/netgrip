@@ -16,11 +16,11 @@ import { OptionsCard } from "../components/system/OptionsCard";
 import { NetPulseStandaloneBanner, NetPulseStatusChip } from "../components/system/NetPulseStatus";
 import { useTranslation } from "react-i18next";
 
-// Hidden by design (#146): zero-touch NetPulse integration. The embedded
-// agent is always on and self-enrolls, so the manual configuration card has
-// no place in the UI for now. Code (component, i18n keys, API) is kept
-// compiled; flip this flag to bring the card back.
-const NETPULSE_CARD_HIDDEN = true;
+// Zero-touch NetPulse discovery only works when the server is reachable by
+// LAN broadcast (#146); on subnets where it isn't (server on a different
+// subnet than the router's LAN), manual configuration is the only way to
+// pair, so the card stays available.
+const NETPULSE_CARD_HIDDEN = false;
 
 function GroupLabel({ children }: { children: ReactNode }) {
   return <p className="text-eyebrow text-faint mb-2 animate-fade-up">{children}</p>;
