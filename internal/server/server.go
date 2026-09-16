@@ -1198,7 +1198,9 @@ func (s *Server) handleEthPorts(w http.ResponseWriter, _ *http.Request) {
 func (s *Server) handleUsteer(w http.ResponseWriter, _ *http.Request) {
 	aps, err := modules.UsteerNetwork()
 	if err != nil {
-		writeError(w, http.StatusBadGateway, err.Error())
+		// usteer isn't installed on most routers; that's not a gateway
+		// failure, just an empty mesh view.
+		writeJSON(w, map[string]any{"aps": []modules.UsteerAP{}})
 		return
 	}
 	writeJSON(w, map[string]any{"aps": aps})
