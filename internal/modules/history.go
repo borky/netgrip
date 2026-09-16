@@ -47,9 +47,10 @@ func collectLoop() {
 
 func sample() {
 	counters := NetDevCounters()
+	bridge := LANBridge()
 	var rx, tx int64
 	for _, c := range counters {
-		if c.Name == "br-lan" {
+		if c.Name == bridge {
 			rx = c.RxBytes
 			tx = c.TxBytes
 			break

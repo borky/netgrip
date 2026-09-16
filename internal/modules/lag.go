@@ -67,22 +67,10 @@ func lagProtoPresent() bool {
 
 func lagDeviceName(name string) string { return "bond-" + name }
 
-// lagBridgeSection returns the UCI section id of the br-lan bridge device
+// lagBridgeSection returns the UCI section id of the LAN bridge device
 // (e.g. "@device[0]" or an anonymous cfg id).
 func lagBridgeSection() string {
-	out, err := exec.Command("uci", "show", "network").Output()
-	if err != nil {
-		return ""
-	}
-	for _, line := range strings.Split(string(out), "\n") {
-		line = strings.TrimSpace(line)
-		// network.<sec>.name='br-lan'
-		if strings.HasSuffix(line, ".name='br-lan'") {
-			sec := strings.TrimSuffix(strings.TrimPrefix(line, "network."), ".name='br-lan'")
-			return sec
-		}
-	}
-	return ""
+	return BridgeDeviceSection()
 }
 
 func lagBridgePorts(sec string) []string {
@@ -233,7 +221,7 @@ func SetLAG(cfg LAGConfig) (*LAGProbe, bool, error) {
 
 	bridgeSec := lagBridgeSection()
 	if bridgeSec == "" {
-		return ProbeLAGs(), false, fmt.Errorf("br-lan bridge not found")
+		return ProbeLAGs(), false, fmt.Errorf("LAN bridge not found in the network config")
 	}
 
 	snap, err := executor.Snapshot("network")
@@ -335,7 +323,7 @@ func lagHealth(name string, want []string) bool {
 				ok = false
 			}
 		}
-		if _, err := os.Stat("/sys/class/net/br-lan"); err == nil && ok {
+		if _, err := os.Stat("/sys/class/net/" + LANBridge()); err == nil && ok {
 			return true
 		}
 		time.Sleep(time.Second)
@@ -351,7 +339,7 @@ func DeleteLAG(name string) (*LAGProbe, bool, error) {
 	}
 	bridgeSec := lagBridgeSection()
 	if bridgeSec == "" {
-		return ProbeLAGs(), false, fmt.Errorf("br-lan bridge not found")
+		return ProbeLAGs(), false, fmt.Errorf("LAN bridge not found in the network config")
 	}
 
 	snap, err := executor.Snapshot("network")
