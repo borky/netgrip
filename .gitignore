@@ -4,3 +4,6 @@
 /owpanel
 *.test
 /app/tsconfig.tsbuildinfo
+/netgrip-armv7
+/go.work
+/go.work.sum
