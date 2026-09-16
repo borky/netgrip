@@ -249,8 +249,19 @@ func fdbFromBrctl(bridge string) map[string][]string {
 	if err != nil {
 		return nil
 	}
+	return parseBrctlShowmacs(string(out), portNames)
+}
+
+// parseBrctlShowmacs groups the learned MACs by port name. Under VLAN
+// filtering the bridge keeps one FDB entry per (port, VLAN, MAC) and brctl
+// prints no VLAN column, so a trunked device shows up once per VLAN it
+// carries - a switch on seven VLANs appeared seven times in the client
+// list. Each port keeps one entry per MAC; a MAC learned on two different
+// ports is still reported on both, which is what loop detection looks for.
+func parseBrctlShowmacs(out string, portNames map[int]string) map[string][]string {
 	fdb := map[string][]string{}
-	for _, line := range strings.Split(string(out), "\n")[1:] {
+	seen := map[string]bool{}
+	for _, line := range strings.Split(out, "\n")[1:] {
 		fields := strings.Fields(line)
 		if len(fields) < 3 || fields[2] == "yes" {
 			continue
@@ -259,9 +270,16 @@ func fdbFromBrctl(bridge string) map[string][]string {
 		if err != nil {
 			continue
 		}
-		if name, ok := portNames[portNo]; ok {
-			fdb[name] = append(fdb[name], fields[1])
+		name, ok := portNames[portNo]
+		if !ok {
+			continue
 		}
+		key := name + "\x00" + fields[1]
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		fdb[name] = append(fdb[name], fields[1])
 	}
 	return fdb
 }
