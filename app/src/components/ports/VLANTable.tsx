@@ -5,7 +5,21 @@ import { api } from "../../api";
 import type { VLANProbe, VLANPort } from "../../types";
 import { Banner, Button, Card, ConfirmDialog, Input } from "../ui";
 
-type CellState = "empty" | "untagged" | "tagged";
+// The four states a port can have in a VLAN, as UCI writes them:
+// not a member, untagged + PVID ("lan2:u*"), untagged ("lan2:u"),
+// tagged ("lan2:t"). Offered directly rather than cycled: a cycle has to
+// pass through "remove", which is a dead end on a VLAN whose last port
+// can't be taken away.
+type CellState = "empty" | "untaggedPvid" | "untagged" | "tagged";
+
+const CELL_STATES: CellState[] = ["empty", "untaggedPvid", "untagged", "tagged"];
+
+const CELL_LABEL: Record<CellState, string> = {
+  empty: "–",
+  untaggedPvid: "U*",
+  untagged: "U",
+  tagged: "T",
+};
 
 /** VLANs (lan.md §5, vive en Puertos en el código real). Bajo Opciones avanzadas. */
 export function VLANTable() {
@@ -26,28 +40,23 @@ export function VLANTable() {
     if (!v) return "empty";
     const p = v.ports.find((p) => p.port === port);
     if (!p) return "empty";
-    return p.tagged ? "tagged" : "untagged";
+    if (p.tagged) return "tagged";
+    return p.pvid ? "untaggedPvid" : "untagged";
   };
 
-  const cycleCell = async (vid: number, port: string) => {
-    const current = cellState(vid, port);
+  const setCell = async (vid: number, port: string, state: CellState) => {
     const vlan = probe.vlans.find((v) => v.vid === vid);
     if (!vlan) return;
 
-    let newPorts: VLANPort[];
-    switch (current) {
-      case "empty":
-        newPorts = [...vlan.ports, { port, tagged: false }];
-        break;
-      case "untagged":
-        newPorts = vlan.ports.map((p) =>
-          p.port === port ? { ...p, tagged: true } : p
-        );
-        break;
-      case "tagged":
-        newPorts = vlan.ports.filter((p) => p.port !== port);
-        break;
-    }
+    const others = vlan.ports.filter((p) => p.port !== port);
+    const newPorts: VLANPort[] =
+      state === "empty"
+        ? others
+        : [...others, {
+            port,
+            tagged: state === "tagged",
+            pvid: state === "untaggedPvid",
+          }];
 
     setLoading(true);
     setError("");
@@ -101,16 +110,9 @@ export function VLANTable() {
   const cellClass = (state: CellState) => {
     switch (state) {
       case "tagged": return "bg-accent-soft text-accent font-semibold";
+      case "untaggedPvid":
       case "untagged": return "bg-success-soft text-success font-semibold";
       default: return "bg-fill text-faint";
-    }
-  };
-
-  const cellLabel = (state: CellState) => {
-    switch (state) {
-      case "tagged": return "T";
-      case "untagged": return "U";
-      default: return "–";
     }
   };
 
@@ -141,16 +143,20 @@ export function VLANTable() {
                   const state = cellState(vlan.vid, port);
                   return (
                     <td key={port} className="text-center px-1 py-0.5 border-b border-border/50">
-                      <button
-                        type="button"
-                        onClick={() => cycleCell(vlan.vid, port)}
+                      <select
+                        value={state}
+                        onChange={(e) => setCell(vlan.vid, port, e.target.value as CellState)}
                         disabled={loading || vlan.default}
-                        title={`${vlan.vid} · ${port}: ${state === "tagged" ? t("vlan.tagged") : state === "untagged" ? t("vlan.untagged") : t("vlan.notMember")}`}
-                        className={`w-full py-1 rounded-sm text-caption font-mono transition-colors duration-[var(--dur-fast)] ring-focus ${cellClass(state)}
+                        aria-label={`VLAN ${vlan.vid} · ${port}`}
+                        title={`${vlan.vid} · ${port}: ${t("vlan." + state)}`}
+                        className={`w-full py-1 rounded-sm text-caption font-mono text-center appearance-none
+                          transition-colors duration-[var(--dur-fast)] ring-focus border-0 ${cellClass(state)}
                           ${vlan.default ? "cursor-not-allowed opacity-50" : "cursor-pointer hover:opacity-80"}`}
                       >
-                        {cellLabel(state)}
-                      </button>
+                        {CELL_STATES.map((s) => (
+                          <option key={s} value={s}>{CELL_LABEL[s]}</option>
+                        ))}
+                      </select>
                     </td>
                   );
                 })}
@@ -191,6 +197,7 @@ export function VLANTable() {
       </div>
 
       <div className="flex flex-wrap gap-x-4 gap-y-1 mt-3 text-caption text-muted">
+        <span><span className="inline-block w-3 h-3 rounded-sm bg-success-soft border border-success/30 mr-1 align-middle" /> U* = {t("vlan.untaggedPvid")}</span>
         <span><span className="inline-block w-3 h-3 rounded-sm bg-success-soft border border-success/30 mr-1 align-middle" /> U = {t("vlan.untagged")}</span>
         <span><span className="inline-block w-3 h-3 rounded-sm bg-accent-soft border border-accent/30 mr-1 align-middle" /> T = {t("vlan.tagged")}</span>
         <span><span className="inline-block w-3 h-3 rounded-sm bg-fill border border-border mr-1 align-middle" /> – = {t("vlan.notMember")}</span>

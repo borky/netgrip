@@ -55,23 +55,20 @@ func ApplyRoleProfile(req RoleApply) error {
 	snapFirewall, _ := executor.Snapshot("firewall")
 
 	// Ensure the VLAN exists
-	section := findVLANSection(role.VID)
+	section := findVLANSectionByVID(role.VID)
 	if section == "" {
-		cmd := fmt.Sprintf("config bridge-vlan\n\toption device 'br-lan'\n\toption vlan '%d'\n", role.VID)
-		importCmd := fmt.Sprintf("uci import network <<'EOF'\n%sEOF\n", cmd)
 		_ = executor.Run(executor.Op{Kind: "uci_set", Args: []string{"network.bridge_vlan_" + fmt.Sprintf("%d", role.VID), "bridge-vlan"}})
-		_ = importCmd
-		// Simpler approach: add via uci commands
 		addVLANSection(role.VID)
 	}
 
 	// Add port to the VLAN as untagged
 	vidStr := fmt.Sprintf("%d", role.VID)
-	sec := findVLANSection(role.VID)
+	sec := findVLANSectionByVID(role.VID)
 	if sec != "" {
 		// Remove port from other VLANs first
 		removePortFromAllVLANs(req.Port)
-		executor.Run(executor.Op{Kind: "uci_add_list", Args: []string{"network." + sec + ".ports", req.Port}})
+		executor.Run(executor.Op{Kind: "uci_add_list", Args: []string{"network." + sec + ".ports",
+			formatVlanPort(VLANPort{Port: req.Port, PVID: true})}})
 	}
 
 	ops := []executor.Op{
@@ -106,7 +103,7 @@ func ApplyRoleProfile(req RoleApply) error {
 
 func addVLANSection(vid int) {
 	vidStr := fmt.Sprintf("%d", vid)
-	cmd := fmt.Sprintf("config bridge-vlan 'vlan_%s'\n\toption device 'br-lan'\n\toption vlan '%s'\n", vidStr, vidStr)
+	cmd := fmt.Sprintf("config bridge-vlan 'vlan_%s'\n\toption device '%s'\n\toption vlan '%s'\n", vidStr, LANBridge(), vidStr)
 	importCmd := exec.Command("sh", "-c", "echo '"+cmd+"' | uci import -m network")
 	_ = importCmd.Run()
 }
@@ -119,16 +116,20 @@ func removePortFromAllVLANs(port string) {
 		return
 	}
 	for _, line := range splitLines(string(out)) {
-		if contains(line, ".ports=") && (contains(line, "="+port+"'") || contains(line, "="+port+":t'")) {
-			// Extract section and remove port from list
-			parts := splitN(line, "=", 3)
-			if len(parts) >= 2 {
-				key := parts[0]
-				val := trimQuote(parts[len(parts)-1])
-				if val == port || val == port+":t" {
-					executor.Run(executor.Op{Kind: "uci_del_list", Args: []string{key, val}})
-				}
-			}
+		if !contains(line, ".ports=") {
+			continue
+		}
+		parts := splitN(line, "=", 3)
+		if len(parts) < 2 {
+			continue
+		}
+		key := parts[0]
+		val := trimQuote(parts[len(parts)-1])
+		// Match every UCI port form for this port - "lan2", "lan2:t",
+		// "lan2:u", "lan2:u*" - not just the bare and tagged ones, or the
+		// untagged/PVID entry survives and the port stays in two VLANs.
+		if parseVlanPort(val).Port == port {
+			executor.Run(executor.Op{Kind: "uci_del_list", Args: []string{key, val}})
 		}
 	}
 }
