@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gnacho/netgrip/internal/executor"
+	"github.com/gnacho/netgrip/internal/ubus"
 )
 
 var validNameRe = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,32}$`)
@@ -475,8 +476,12 @@ func buildClientOVPN(name, remote string) (string, error) {
 	return b.String(), nil
 }
 
+// wanIPv4 returns the IPv4 of the active WAN uplink. The interface is
+// resolved rather than assumed to be named "wan": on a multi-WAN router the
+// live uplink can be any interface, and a VPN endpoint or DDNS record built
+// from the wrong one points at an address nothing answers on.
 func wanIPv4() string {
-	return ubusIPv4("wan")
+	return ubusIPv4(ubus.ActiveWANInterfaceName())
 }
 
 func lanIPv4() string {

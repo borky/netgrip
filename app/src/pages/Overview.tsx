@@ -104,7 +104,7 @@ function InternetCard({ wan, mode }: { wan?: WanStatus; mode?: ModeProbe }) {
           {!wan.up && <Banner tone="danger" className="mb-2">{t("overview.wanDown")}</Banner>}
           <KeyValue items={[
             { label: t("wan.gateway"), value: wan.gateway ?? "—", mono: true },
-            { label: t("wan.dns"), value: wan.dns.join("  ") || "—", mono: true },
+            { label: t("wan.dns"), value: (wan.dns ?? []).join("  ") || "—", mono: true },
             ...(wan.up ? [{ label: t("system.uptime"), value: t("overview.wanSince", { time: fmtUptime(t, wan.uptime) }) }] : []),
           ]} />
         </>
