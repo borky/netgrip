@@ -3,7 +3,6 @@ package modules
 import (
 	"os"
 	"os/exec"
-	"regexp"
 	"strconv"
 	"strings"
 
@@ -17,14 +16,39 @@ type IfaceCounters struct {
 	TxBytes int64  `json:"tx_bytes"`
 }
 
-var reNetDevIface = regexp.MustCompile(`^(br-lan|br0|lan\d+|wan|eth\d+|swp\d+|phy\d+-ap\d+|wlan\d+(-\d+)?)$`)
+// isWirelessNetdev reports whether a netdev belongs to a wireless phy.
+func isWirelessNetdev(name string) bool {
+	_, err := os.Stat("/sys/class/net/" + name + "/phy80211")
+	return err == nil
+}
 
-// NetDevCounters parses /proc/net/dev for the interesting interfaces.
+// isPhysicalEthPort reports whether a netdev is a real ethernet port, asking
+// the kernel instead of matching its name: port names are board-specific
+// (lan1, wan2, sfp1, port3, enp2s0 on x86), so a fixed name pattern
+// silently hides every port on a router that names them differently. A
+// port qualifies when it is ARPHRD_ETHER (type 1), is not a virtual device
+// (bridges, VLANs and tunnels live under /devices/virtual) and is not a
+// wireless netdev.
+func isPhysicalEthPort(name string) bool {
+	data, err := os.ReadFile("/sys/class/net/" + name + "/type")
+	if err != nil || strings.TrimSpace(string(data)) != "1" {
+		return false
+	}
+	target, err := os.Readlink("/sys/class/net/" + name)
+	if err != nil || strings.Contains(target, "/virtual/") {
+		return false
+	}
+	return !isWirelessNetdev(name)
+}
+
+// NetDevCounters parses /proc/net/dev for the interfaces worth reporting:
+// the physical ports, the LAN bridge and the wireless netdevs.
 func NetDevCounters() []IfaceCounters {
 	data, err := os.ReadFile("/proc/net/dev")
 	if err != nil {
 		return []IfaceCounters{}
 	}
+	bridge := LANBridge()
 	var counters []IfaceCounters
 	for _, line := range strings.Split(string(data), "\n") {
 		parts := strings.SplitN(line, ":", 2)
@@ -32,7 +56,7 @@ func NetDevCounters() []IfaceCounters {
 			continue
 		}
 		name := strings.TrimSpace(parts[0])
-		if !reNetDevIface.MatchString(name) {
+		if name != bridge && !isPhysicalEthPort(name) && !isWirelessNetdev(name) {
 			continue
 		}
 		fields := strings.Fields(parts[1])
@@ -66,7 +90,37 @@ type EthPort struct {
 	Devices   []EthDevice `json:"devices"`
 }
 
-var reEthPortName = regexp.MustCompile(`^(lan\d+|wan|eth\d+|swp\d+)$`)
+// wanPortBase resolves the physical port name that carries the active WAN
+// uplink, so EthPorts can mark it dynamically instead of assuming the port
+// is named "wan" (routers with more than one port, or where the physical
+// WAN port has a different name - e.g. a PPPoE uplink wired to "lan1" while
+// a cellular failover interface is named "wan" with no Ethernet port at
+// all, both real on the LBR20). Strips a VLAN suffix (e.g. "lan1.7") to
+// match the base port name; returns "" when the active uplink isn't on any
+// known physical port (a modem, a bridge, or nothing detected).
+func wanPortBase() string {
+	device := ubus.ActiveWANDevice()
+	if device == "" {
+		return ""
+	}
+	if i := strings.LastIndexByte(device, '.'); i > 0 {
+		if base := device[:i]; isPhysicalEthPort(base) {
+			return base
+		}
+	}
+	return device
+}
+
+// wanPortName is wanPortBase with the conventional fallback, for callers
+// that need a port to act on even when no WAN interface is currently up -
+// an AP-mode router has none, and that is exactly when the mode switch
+// needs to name the port.
+func wanPortName() string {
+	if p := wanPortBase(); p != "" {
+		return p
+	}
+	return "wan"
+}
 
 // EthPorts lists the physical ports with link state, speed and the
 // devices learned on each (names resolved from DHCP leases when present).
@@ -79,6 +133,7 @@ func EthPorts() []EthPort {
 	}
 	fdb := bridgeFdb()
 	names := leaseNames()
+	wanBase := wanPortName()
 
 	masters := map[string]bool{}
 	for _, line := range strings.Split(string(out), "\n") {
@@ -103,14 +158,14 @@ func EthPorts() []EthPort {
 		if i := strings.LastIndexByte(full, '@'); i >= 0 {
 			base = full[:i]
 		}
-		if !reEthPortName.MatchString(base) {
+		if !isPhysicalEthPort(base) {
 			continue
 		}
 		if masters[base] {
 			continue // switch uplink, not a user port
 		}
 		port := EthPort{Name: base, Devices: []EthDevice{}}
-		port.Wan = base == "wan" && WanPortActive()
+		port.Wan = base == wanBase && WanPortActive()
 		port.Up = strings.Contains(line, "LOWER_UP")
 		if speed, err := os.ReadFile("/sys/class/net/" + base + "/speed"); err == nil {
 			if mbps, err := strconv.Atoi(strings.TrimSpace(string(speed))); err == nil && mbps > 0 {
@@ -151,13 +206,18 @@ func ubusLeases() ([]ubus.Lease, error) {
 }
 
 // bridgeFdb returns the learned MACs grouped by port name, via
-// `brctl showmacs` against br-lan first and br0 as fallback (GLuON uses
-// br0). The port numbers in showmacs are the low byte of the kernel
+// `brctl showmacs` against the configured LAN bridge, falling back to the
+// conventional names (br-lan, then br0 as used by GLuON) when the config
+// resolves to something that isn't up. The port numbers in showmacs are
+// the low byte of the kernel
 // port_id, resolved via /sys/class/net/<bridge>/brif/<dev>/port_id
 // (verified on an ipq807x DSA switch: brctl show order is NOT the port
 // order).
 func bridgeFdb() map[string][]string {
-	for _, bridge := range []string{"br-lan", "br0"} {
+	for _, bridge := range []string{LANBridge(), "br-lan", "br0"} {
+		if bridge == "" {
+			continue
+		}
 		if fdb := fdbFromBrctl(bridge); fdb != nil {
 			return fdb
 		}

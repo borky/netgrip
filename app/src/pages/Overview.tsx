@@ -513,8 +513,7 @@ function PortsCard({ ports, onNavigate }: { ports?: EthPort[]; onNavigate: (p: s
   const [selected, setSelected] = useState<string>();
 
   const sorted = useMemo(() => !ports ? [] : [...ports].sort((a, b) => {
-    if (a.name === "wan") return -1;
-    if (b.name === "wan") return 1;
+    if (a.wan !== b.wan) return a.wan ? -1 : 1;
     return a.name.localeCompare(b.name, undefined, { numeric: true });
   }), [ports]);
 
