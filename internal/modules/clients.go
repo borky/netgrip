@@ -37,7 +37,11 @@ type Client struct {
 	ParentalNext    string `json:"parental_next,omitempty"`
 	LeaseExpiry     int64  `json:"lease_expiry,omitempty"`
 	LeaseSource     string `json:"lease_source,omitempty"` // local | gateway
-	IPSource        string `json:"ip_source,omitempty"`    // arp: IP resolved from the neighbor table, no DHCP lease (#212)
+	IPSource        string `json:"ip_source,omitempty"`    // arp | reservation: no DHCP lease to take it from (#212)
+	// NameSource is set when the name does not come from a DHCP lease:
+	// "reservation" = the name pinned in /etc/config/dhcp, which is all a
+	// device with a fixed address of its own ever gets.
+	NameSource string `json:"name_source,omitempty"`
 	// Data quota (#308): current-period usage vs the configured cap, empty
 	// when the client has no quota.
 	QuotaUsed      int64  `json:"quota_used,omitempty"`
@@ -69,7 +73,7 @@ func ListClients(requesterIP string) []Client {
 			arp = mergeArp(arp, parseProcArp(out))
 		}
 	}
-	reserved := reservedMACs()
+	reservations := dhcpReservations()
 	denied, availBands := blockedBands()
 	// Parental schedule (#304): which MACs are blocked now by a schedule/pause
 	// (distinct from the manual block), and the wifi MACs the scheduler owns in
@@ -104,8 +108,8 @@ func ListClients(requesterIP string) []Client {
 						c.Blocked = blockedEverywhere(on, availBands)
 					}
 				}
-				fillIdentity(&c, mac, requesterIP, leaseSource, byMac, arp)
-				c.Reserved = reserved[mac]
+				fillIdentity(&c, mac, requesterIP, leaseSource, byMac, arp, reservations)
+				_, c.Reserved = reservations[mac]
 				c.Reservable = c.IP != ""
 				clients = append(clients, c)
 			}
@@ -145,8 +149,8 @@ func ListClients(requesterIP string) []Client {
 				}
 				seenWired[mac] = true
 				c := Client{MAC: mac, Type: "cable", Iface: port, Blocked: len(denied[mac]) > 0 || cableBlk[mac]}
-				fillIdentity(&c, mac, requesterIP, leaseSource, byMac, arp)
-				c.Reserved = reserved[mac]
+				fillIdentity(&c, mac, requesterIP, leaseSource, byMac, arp, reservations)
+				_, c.Reserved = reservations[mac]
 				c.Reservable = c.IP != ""
 				c.Blockable = executor.ServiceEnabled("firewall")
 				clients = append(clients, c)
@@ -288,13 +292,23 @@ func mergeArp(base, extra map[string]string) map[string]string {
 // fillIdentity fills name, IP, lease data and the self flag for one
 // client from the lease map, falling back to the ARP table for the IP
 // when the device has no DHCP lease (#212).
-func fillIdentity(c *Client, mac, requesterIP, leaseSource string, byMac map[string]ubus.Lease, arp map[string]string) {
+func fillIdentity(c *Client, mac, requesterIP, leaseSource string, byMac map[string]ubus.Lease,
+	arp map[string]string, reservations map[string]dhcpReservation) {
 	if l, ok := byMac[mac]; ok {
 		c.Name = l.Hostname
 		c.IP = l.IP
 		c.Self = requesterIP != "" && l.IP == requesterIP
 		c.LeaseExpiry = l.Expires.Unix()
 		c.LeaseSource = leaseSource
+	}
+	// The name the admin pinned in /etc/config/dhcp. A device with a fixed
+	// address set on the device itself never asks for a lease, so its name
+	// lives only in the reservation - without this it showed as a bare MAC
+	// even though the router knew what it was.
+	res, hasRes := reservations[mac]
+	if (c.Name == "" || c.Name == "*") && hasRes && res.Name != "" {
+		c.Name = res.Name
+		c.NameSource = "reservation"
 	}
 	if c.IP == "" {
 		if ip, ok := arp[mac]; ok {
@@ -303,52 +317,91 @@ func fillIdentity(c *Client, mac, requesterIP, leaseSource string, byMac map[str
 			c.Self = requesterIP != "" && ip == requesterIP
 		}
 	}
+	// Last resort for the address: what the reservation promises. The device
+	// may be off or silent, so ARP knows nothing about it yet.
+	if c.IP == "" && hasRes && res.IP != "" {
+		c.IP = res.IP
+		c.IPSource = "reservation"
+		c.Self = requesterIP != "" && res.IP == requesterIP
+	}
 	if c.Name == "" || c.Name == "*" {
 		c.Name = mac
 	}
 }
 
-// reservedMACs lists MACs with a DHCP reservation, locally or, on dumb
-// APs, from the gateway's dhcp config (read-only).
-func reservedMACs() map[string]bool {
-	reserved := map[string]bool{}
+// dhcpReservation is one `config host` entry of /etc/config/dhcp: the name
+// and address an admin pinned to a MAC. Both are optional.
+type dhcpReservation struct {
+	Name string
+	IP   string
+}
+
+// dhcpReservations maps each reserved MAC to its entry, locally or, on dumb
+// APs, from the gateway's dhcp config (read-only). A host entry can carry
+// several MACs (GL firmware stores mac as a list), and they all share the
+// entry's name and address.
+func dhcpReservations() map[string]dhcpReservation {
+	res := map[string]dhcpReservation{}
 	local, err := exec.Command("sh", "-c", "uci show dhcp | grep '=host' | cut -d. -f2 | cut -d= -f1").Output()
 	if err == nil && len(strings.Fields(string(local))) > 0 {
 		for _, section := range strings.Fields(string(local)) {
-			mac := strings.ToLower(uciGet("dhcp." + section + ".mac"))
-			if mac != "" {
-				reserved[mac] = true
+			entry := dhcpReservation{
+				Name: uciGet("dhcp." + section + ".name"),
+				IP:   uciGet("dhcp." + section + ".ip"),
+			}
+			// A list option comes back space separated; each MAC is its own key.
+			for _, mac := range strings.Fields(strings.ToLower(uciGet("dhcp." + section + ".mac"))) {
+				if mac != "" {
+					res[mac] = entry
+				}
 			}
 		}
-		return reserved
+		return res
 	}
 	// Fallback: parse the gateway's /etc/config/dhcp host blocks.
 	out, err := gatewaySSH("cat /etc/config/dhcp")
 	if err != nil {
-		return reserved
+		return res
+	}
+	var macs []string
+	var entry dhcpReservation
+	flush := func() {
+		for _, mac := range macs {
+			res[mac] = entry
+		}
+		macs, entry = nil, dhcpReservation{}
 	}
 	inHost := false
+	value := func(line string) string {
+		parts := strings.Fields(line)
+		if len(parts) < 3 {
+			return ""
+		}
+		return strings.Trim(strings.Join(parts[2:], " "), "'\"")
+	}
 	for _, line := range strings.Split(out, "\n") {
 		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "config host") {
-			inHost = true
+		if strings.HasPrefix(line, "config ") {
+			flush()
+			inHost = strings.HasPrefix(line, "config host")
 			continue
 		}
-		if strings.HasPrefix(line, "config ") {
-			inHost = false
+		if !inHost {
+			continue
 		}
-		if inHost && (strings.HasPrefix(line, "option mac") || strings.HasPrefix(line, "list mac")) {
-			// GL firmware stores mac as a LIST (multiple MACs per host entry)
-			parts := strings.Fields(line)
-			if len(parts) >= 3 {
-				mac := strings.ToLower(strings.Trim(parts[2], "'\""))
-				if reMac.MatchString(mac) {
-					reserved[mac] = true
-				}
+		switch {
+		case strings.HasPrefix(line, "option mac"), strings.HasPrefix(line, "list mac"):
+			if mac := strings.ToLower(value(line)); reMac.MatchString(mac) {
+				macs = append(macs, mac)
 			}
+		case strings.HasPrefix(line, "option name"):
+			entry.Name = value(line)
+		case strings.HasPrefix(line, "option ip"):
+			entry.IP = value(line)
 		}
 	}
-	return reserved
+	flush()
+	return res
 }
 
 // blockedBands maps each denied MAC to the set of bands whose wifi-iface
