@@ -235,6 +235,10 @@ export default {
       title: "¿Qué es un LAG?",
       body: "Varios cables que funcionan como un único enlace más rápido y redundante (LACP). Útil para NAS o servidores; ambos extremos deben soportarlo.",
     },
+    multiwan: {
+      title: "Dos conexiones a Internet",
+      body: "Con una segunda conexión el router puede mantener la casa en línea cuando falla la primera. La conmutación usa una cada vez y cambia sola; el equilibrado reparte el tráfico entre las que elijas. Aquí solo se gestiona IPv4, y el control de tráfico sigue aplicándose a una sola conexión.",
+    },
     portforward: {
       title: "Abrir puertos a Internet",
       body: "Permite que algo de tu casa (un NAS, una cámara, un servidor de juegos) sea accesible desde fuera. Abre solo lo imprescindible: cada regla es una puerta a tu red.",
