@@ -32,6 +32,7 @@ const state = {
   captive: { ...D.demoCaptivePortal },
   iot: { ...D.demoIot },
   fwd: structuredClone(D.demoFwd),
+  mwan: structuredClone(D.demoMultiWan),
   ts: { ...D.demoTailscale },
   lan: structuredClone(D.demoLan),
   dns: structuredClone(D.demoDns),
@@ -507,7 +508,34 @@ export const demoApi: typeof api = {
 
   // puertos
   ethports: () => get({ ports: D.demoEthPorts }),
-  multiwan: () => get(D.demoMultiWan),
+  multiwan: () => get(state.mwan),
+  setMultiwan: async (req) => {
+    const m = state.mwan;
+    m.installed = true;
+    m.mode = req.mode;
+    m.managed = req.mode !== "off";
+    m.running = req.mode !== "off";
+    m.enabled = m.running;
+    m.primary_iface = req.mode === "failover" ? req.primary : undefined;
+    m.candidates = m.candidates.map((c) => {
+      const pooled = req.mode === "balance" && (req.balance?.[c.name] ?? !c.metered);
+      return {
+        ...c,
+        primary: req.mode === "failover" && c.name === req.primary,
+        balance: pooled,
+        weight: req.weights?.[c.name] ?? 1,
+        track: req.track?.[c.name] ?? c.track,
+        active: req.mode === "failover" ? c.name === req.primary : pooled || c.active,
+      };
+    });
+    return write(state.mwan);
+  },
+  setMultiwanPrimary: async (iface) => {
+    const m = state.mwan;
+    m.primary_iface = iface;
+    m.candidates = m.candidates.map((c) => ({ ...c, primary: c.name === iface, active: c.name === iface }));
+    return write(state.mwan);
+  },
   portforward: () => get(state.fwd),
   addFwdRule: async (src_dport, dest_ip, dest_port, proto) => {
     state.fwd.rules.push({ section: `fwd_${state.fwd.rules.length}`, name: "", src_dport, dest_ip, dest_port, proto });

@@ -1,10 +1,18 @@
+import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Split } from "lucide-react";
 import { api } from "../../api";
-import type { MultiWanProbe, WanCandidate } from "../../types";
-import { Banner, Button, Card, Pill, SkeletonRows, StatusDot } from "../ui";
+import type { MultiWanProbe, MultiWanRequest, WanCandidate } from "../../types";
+import {
+  ActionBanner, AdvancedDisclosure, Banner, Button, Card, ConfirmDialog,
+  Field, Pill, SegmentedControl, SkeletonRows, StatusDot,
+} from "../ui";
 import type { PillTone } from "../ui";
+import { useActionCycle } from "../wifi/action";
 import { InstallProgress, useInstallJob } from "../wizard/common";
+
+const MODES = ["off", "failover", "balance"] as const;
+type Mode = (typeof MODES)[number];
 
 /** How long a link has been up, in the same shape the WAN card uses. */
 function fmtDur(s: number): string {
@@ -32,7 +40,15 @@ function stateLabel(c: WanCandidate): { key: string; tone: PillTone } {
   return { key: "mwan.standby", tone: "muted" };
 }
 
-function UplinkRow({ c }: { c: WanCandidate }) {
+const isValidIp = (v: string) =>
+  /^(\d{1,3}\.){3}\d{1,3}$/.test(v) && v.split(".").every((n) => Number(n) <= 255);
+
+function UplinkRow({ c, mode, busy, onPrimary }: {
+  c: WanCandidate;
+  mode: Mode;
+  busy: boolean;
+  onPrimary?: (name: string) => void;
+}) {
   const { t } = useTranslation();
   const state = stateLabel(c);
   const where = [c.proto, c.port ? t("mwan.viaPort", { port: c.port }) : ""].filter(Boolean).join(" · ");
@@ -54,16 +70,22 @@ function UplinkRow({ c }: { c: WanCandidate }) {
           ? t("mwan.activeShare", { pct: c.share_pct })
           : t(state.key)}
       </Pill>
-      {c.primary && <Pill tone="accent">{t("mwan.primary")}</Pill>}
+      {/* Making a connection the main one is one click on its own row.
+          It only means anything in failover: while balancing, every
+          connection in the pool is equal by definition. */}
+      {mode === "failover" && c.primary && <Pill tone="accent">{t("mwan.primary")}</Pill>}
+      {mode === "failover" && !c.primary && onPrimary && (
+        <Button size="sm" variant="secondary" disabled={busy} onClick={() => onPrimary(c.name)}>
+          {t("mwan.makePrimary")}
+        </Button>
+      )}
     </div>
   );
 }
 
 /**
  * Card "Internet connections": every uplink the router has, which one is
- * carrying traffic, and — once there is more than one — what to do about it.
- *
- * Read-only for now: the mode controls arrive with the write path.
+ * carrying traffic, and what should happen when one of them dies.
  */
 export function MultiWanCard({ probe, onChange, index = 2 }: {
   probe?: MultiWanProbe;
@@ -72,9 +94,40 @@ export function MultiWanCard({ probe, onChange, index = 2 }: {
 }) {
   const { t } = useTranslation();
   const { job, running, begin } = useInstallJob();
+  const { phase, detail, busy, run, clear } = useActionCycle();
 
-  // Installing the manager is the whole of the offer: once it is there the
-  // probe comes back with the modes available.
+  const [mode, setMode] = useState<Mode>("off");
+  const [weights, setWeights] = useState<Record<string, number>>({});
+  const [pool, setPool] = useState<Record<string, boolean>>({});
+  const [track, setTrack] = useState<Record<string, string>>({});
+  const [confirming, setConfirming] = useState(false);
+
+  // The form follows the router until the user touches it; after an apply
+  // the probe comes back and becomes the new starting point.
+  useEffect(() => {
+    if (!probe) return;
+    setMode(MODES.includes(probe.mode as Mode) ? (probe.mode as Mode) : "off");
+    setWeights(Object.fromEntries(probe.candidates.map((c) => [c.name, c.weight || 1])));
+    setPool(Object.fromEntries(probe.candidates.map((c) => [c.name, probe.mode === "balance" ? c.balance : !c.metered])));
+    setTrack(Object.fromEntries(probe.candidates.map((c) => [c.name, c.track.join(", ")])));
+  }, [probe]);
+
+  const parsedTrack = useMemo(() => {
+    const out: Record<string, string[]> = {};
+    for (const [name, raw] of Object.entries(track)) {
+      const ips = raw.split(",").map((v) => v.trim()).filter(Boolean);
+      if (ips.length > 0) out[name] = ips;
+    }
+    return out;
+  }, [track]);
+
+  const trackError = useMemo(
+    () => Object.entries(parsedTrack).find(([, ips]) => ips.length > 4 || ips.some((ip) => !isValidIp(ip)))?.[0],
+    [parsedTrack],
+  );
+
+  if (probe && !probe.applicable) return null;
+
   const install = () => {
     void begin(() => api.wizardPackages(["mwan3"])).then(async () => {
       try {
@@ -85,8 +138,38 @@ export function MultiWanCard({ probe, onChange, index = 2 }: {
     });
   };
 
-  // On an access point there is no uplink to talk about at all.
-  if (probe && !probe.applicable) return null;
+  const apply = (req: MultiWanRequest) => {
+    void run(() => api.setMultiwan(req), 3000).then(async (res) => {
+      if (res?.status === "applied") onChange?.(res.state);
+      else onChange?.(await api.multiwan().catch(() => probe!));
+    });
+  };
+
+  const applyCurrent = () => {
+    setConfirming(false);
+    apply({
+      mode,
+      // Turning failover on should not move the house onto another line:
+      // the connection already carrying traffic stays the main one unless
+      // the user says otherwise.
+      primary:
+        mode === "failover"
+          ? probe?.primary_iface ||
+            probe?.candidates.find((c) => c.active)?.name ||
+            probe?.candidates[0]?.name
+          : undefined,
+      weights: mode === "balance" ? weights : undefined,
+      balance: mode === "balance" ? pool : undefined,
+      track: parsedTrack,
+    });
+  };
+
+  const makePrimary = (iface: string) => {
+    void run(() => api.setMultiwanPrimary(iface), 3000).then(async (res) => {
+      if (res?.status === "applied") onChange?.(res.state);
+      else onChange?.(await api.multiwan().catch(() => probe!));
+    });
+  };
 
   const modeKey: Record<string, string> = {
     failover: "mwan.modeFailover",
@@ -94,59 +177,181 @@ export function MultiWanCard({ probe, onChange, index = 2 }: {
     custom: "mwan.modeCustom",
     off: "mwan.modeOff",
   };
+  const dirty = !!probe && mode !== probe.mode;
+  const configurable = !!probe && probe.multi_wan_possible && probe.installed && !probe.foreign;
+  // A pool of nothing would take the house offline the moment it applied.
+  const emptyPool = mode === "balance" && !Object.values(pool).some(Boolean);
 
   return (
-    <Card
-      index={index}
-      icon={Split}
-      title={t("mwan.title")}
-      action={
-        probe && probe.multi_wan_possible && probe.installed ? (
-          <Pill tone={probe.mode === "custom" ? "warn" : probe.mode === "off" ? "muted" : "accent"}>
-            {t(modeKey[probe.mode] ?? "mwan.modeOff")}
-          </Pill>
-        ) : undefined
-      }
-    >
-      {!probe ? (
-        <SkeletonRows rows={3} />
-      ) : (
-        <>
-          <div className="divide-y divide-border/50">
-            {probe.candidates.map((c) => (
-              <UplinkRow key={c.name} c={c} />
-            ))}
-          </div>
+    <>
+      <Card
+        index={index}
+        icon={Split}
+        title={t("mwan.title")}
+        action={
+          probe && probe.multi_wan_possible && probe.installed ? (
+            <Pill tone={probe.mode === "custom" ? "warn" : probe.mode === "off" ? "muted" : "accent"}>
+              {t(modeKey[probe.mode] ?? "mwan.modeOff")}
+            </Pill>
+          ) : undefined
+        }
+      >
+        {!probe ? (
+          <SkeletonRows rows={3} />
+        ) : (
+          <>
+            {configurable && (
+              <div className="mb-3 space-y-1.5">
+                <SegmentedControl
+                  ariaLabel={t("mwan.modeLabel")}
+                  value={mode}
+                  onChange={(v) => setMode(v as Mode)}
+                  options={MODES.map((m) => ({ value: m, label: t(modeKey[m]) }))}
+                />
+                <p className="text-caption text-muted">{t(`mwan.hint.${mode}`)}</p>
+              </div>
+            )}
 
-          {/* One uplink: nothing to choose between, so say what a second
-              one would buy rather than showing dead controls. */}
-          {!probe.multi_wan_possible && (
-            <p className="text-caption text-muted mt-2">{t("mwan.singleBody")}</p>
-          )}
-
-          {probe.multi_wan_possible && !probe.installed && (
-            <div className="mt-3 flex flex-col gap-2">
-              <Banner
-                tone="info"
-                action={
-                  <Button size="sm" onClick={install} loading={running}>
-                    {t("services.installNow")}
-                  </Button>
-                }
-              >
-                {t("mwan.installPrompt")}
-              </Banner>
-              <InstallProgress job={job} />
+            <div className="divide-y divide-border/50">
+              {probe.candidates.map((c) => (
+                <UplinkRow
+                  key={c.name}
+                  c={c}
+                  mode={configurable && !dirty ? mode : "off"}
+                  busy={busy}
+                  onPrimary={makePrimary}
+                />
+              ))}
             </div>
-          )}
 
-          {probe.multi_wan_possible && probe.installed && probe.foreign && (
-            <Banner tone="warn" className="mt-3">
-              {t("mwan.foreignBanner", { sections: probe.foreign_sections.join(", ") })}
-            </Banner>
-          )}
-        </>
-      )}
-    </Card>
+            {!probe.multi_wan_possible && (
+              <p className="text-caption text-muted mt-2">{t("mwan.singleBody")}</p>
+            )}
+
+            {probe.multi_wan_possible && !probe.installed && (
+              <div className="mt-3 flex flex-col gap-2">
+                <Banner
+                  tone="info"
+                  action={
+                    <Button size="sm" onClick={install} loading={running}>
+                      {t("services.installNow")}
+                    </Button>
+                  }
+                >
+                  {t("mwan.installPrompt")}
+                </Banner>
+                <InstallProgress job={job} />
+              </div>
+            )}
+
+            {probe.multi_wan_possible && probe.installed && probe.foreign && (
+              <Banner tone="warn" className="mt-3">
+                {t("mwan.foreignBanner", { sections: probe.foreign_sections.join(", ") })}
+              </Banner>
+            )}
+
+            {configurable && (
+              <AdvancedDisclosure label={t("common.advanced")} className="mt-3">
+                <div className="space-y-4 pt-1">
+                  {mode === "balance" && (
+                    <div className="space-y-2">
+                      <span className="text-caption text-muted block">{t("mwan.weights")}</span>
+                      {probe.candidates.map((c) => {
+                        const used = pool[c.name] ?? !c.metered;
+                        const total = probe.candidates
+                          .filter((o) => pool[o.name] ?? !o.metered)
+                          .reduce((n, o) => n + (weights[o.name] ?? 1), 0);
+                        const share = used && total > 0 ? Math.round(((weights[c.name] ?? 1) / total) * 100) : 0;
+                        return (
+                          <div key={c.name} className="flex items-center gap-3 flex-wrap">
+                            <label className="flex items-center gap-2 min-w-40">
+                              <input
+                                type="checkbox"
+                                checked={used}
+                                onChange={(e) => setPool((p) => ({ ...p, [c.name]: e.target.checked }))}
+                                className="accent-accent"
+                              />
+                              <span className="text-small">{c.name}</span>
+                            </label>
+                            <input
+                              type="range"
+                              min={1}
+                              max={10}
+                              value={weights[c.name] ?? 1}
+                              disabled={!used}
+                              aria-label={t("mwan.weightAria", { name: c.name })}
+                              onChange={(e) => setWeights((wt) => ({ ...wt, [c.name]: Number(e.target.value) }))}
+                              className="flex-1 accent-accent disabled:opacity-40"
+                            />
+                            <span className="w-24 shrink-0 text-right text-caption tabular-nums text-muted">
+                              {used ? `${share}%` : t("mwan.weightOff")}
+                            </span>
+                          </div>
+                        );
+                      })}
+                      {probe.candidates.some((c) => c.metered && (pool[c.name] ?? false)) && (
+                        <Banner tone="warn">{t("mwan.meteredWarn")}</Banner>
+                      )}
+                    </div>
+                  )}
+
+                  <div className="space-y-2">
+                    <span className="text-caption text-muted block">{t("mwan.tracking")}</span>
+                    <p className="text-caption text-muted">{t("mwan.trackingHint")}</p>
+                    {probe.candidates.map((c) => (
+                      <Field
+                        key={c.name}
+                        label={c.name}
+                        mono
+                        error={trackError === c.name ? t("mwan.trackInvalid") : undefined}
+                        inputProps={{
+                          value: track[c.name] ?? "",
+                          placeholder: probe.default_track.join(", "),
+                          onChange: (e) => setTrack((tr) => ({ ...tr, [c.name]: e.target.value })),
+                        }}
+                      />
+                    ))}
+                  </div>
+                </div>
+              </AdvancedDisclosure>
+            )}
+
+            {configurable && (
+              <div className="mt-3 flex items-center gap-2 flex-wrap">
+                <Button
+                  onClick={() => setConfirming(true)}
+                  loading={busy}
+                  disabled={!!trackError || emptyPool}
+                >
+                  {t("mwan.apply")}
+                </Button>
+                {emptyPool && <span className="text-caption text-danger">{t("mwan.needOneBalance")}</span>}
+              </div>
+            )}
+
+            {phase && (
+              <div className="mt-3">
+                <ActionBanner
+                  phase={phase}
+                  text={phase === "done" ? t("mwan.applied") : phase === "failed" ? t("mwan.rolledBack") : undefined}
+                  detail={detail}
+                  onDone={clear}
+                />
+              </div>
+            )}
+          </>
+        )}
+      </Card>
+
+      <ConfirmDialog
+        open={confirming}
+        onClose={() => setConfirming(false)}
+        onConfirm={applyCurrent}
+        title={t("mwan.switchTitle", { mode: t(modeKey[mode]) })}
+        consequence={t("mwan.switchConsequence")}
+        confirmLabel={t("mwan.switchConfirm")}
+        busy={busy}
+      />
+    </>
   );
 }

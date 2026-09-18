@@ -306,6 +306,18 @@ const realApi = {
       body: JSON.stringify({ enabled }),
     }),
   multiwan: () => request<import("./types").MultiWanProbe>("/api/multiwan"),
+  setMultiwan: (req: import("./types").MultiWanRequest) =>
+    request<import("./types").ModuleResult<import("./types").MultiWanProbe>>("/api/multiwan", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(req),
+    }),
+  setMultiwanPrimary: (iface: string) =>
+    request<import("./types").ModuleResult<import("./types").MultiWanProbe>>("/api/multiwan/primary", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ iface }),
+    }),
   portforward: () => request<import("./types").FwdProbe>("/api/portforward"),
   addFwdRule: (src_dport: string, dest_ip: string, dest_port: string, proto: string) =>
     request<import("./types").ModuleResult<import("./types").FwdProbe>>("/api/portforward", {
