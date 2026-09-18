@@ -428,6 +428,7 @@ export const demoApi: typeof api = {
 
   // puertos
   ethports: () => get({ ports: D.demoEthPorts }),
+  multiwan: () => get(D.demoMultiWan),
   portforward: () => get(state.fwd),
   addFwdRule: async (src_dport, dest_ip, dest_port, proto) => {
     state.fwd.rules.push({ section: `fwd_${state.fwd.rules.length}`, name: "", src_dport, dest_ip, dest_port, proto });

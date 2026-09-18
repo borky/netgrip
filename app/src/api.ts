@@ -298,6 +298,7 @@ const realApi = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ enabled }),
     }),
+  multiwan: () => request<import("./types").MultiWanProbe>("/api/multiwan"),
   portforward: () => request<import("./types").FwdProbe>("/api/portforward"),
   addFwdRule: (src_dport: string, dest_ip: string, dest_port: string, proto: string) =>
     request<import("./types").ModuleResult<import("./types").FwdProbe>>("/api/portforward", {
