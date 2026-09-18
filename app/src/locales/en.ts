@@ -1649,6 +1649,7 @@ export default {
       openvpn: "OpenVPN",
       sqm: "SQM",
       nlbwmon: "Per-device usage",
+      mwan3: "Multi-WAN (failover)",
       tailscale: "Tailscale",
       adguard: "AdGuard Home",
       netifyd: "Traffic analysis",
