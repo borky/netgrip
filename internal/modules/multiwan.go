@@ -26,6 +26,7 @@ import (
 
 	"github.com/gnacho/netgrip/internal/executor"
 	"github.com/gnacho/netgrip/internal/ubus"
+	"github.com/gnacho/netpulse/agent/probe"
 )
 
 // wanProtos are the protocols an uplink is configured with. Everything else
@@ -1331,4 +1332,85 @@ func mwanShares(cfg mwanConfig, online map[string]bool) map[string]int {
 	}
 	shares[group[0].iface] = 100 - assigned
 	return shares
+}
+
+// ---------------------------------------------------------------------------
+// What the monitoring side is told
+// ---------------------------------------------------------------------------
+
+// netpulseMultiWan projects the local state into the shape the agent carries
+// to the monitoring side: what is happening, not how it is configured.
+// Metrics, weights, tracking targets and section names stay here — they are
+// how a policy is expressed, and nobody reading a dashboard needs them.
+//
+// Never nil. A router with fewer than two uplinks reports an empty list,
+// which is a statement in its own right: the monitoring side keeps the last
+// section it was sent, so "nothing to show" has to be said out loud or a
+// panel would linger after a line is unplugged.
+func netpulseMultiWan(candidates []WanCandidate, cfg mwanConfig, online map[string]bool, steering bool) *probe.MultiWanInfo {
+	out := &probe.MultiWanInfo{Mode: MWModeOff, Uplinks: []probe.WanUplink{}}
+	if len(candidates) < 2 {
+		return out
+	}
+	if steering {
+		out.Mode, out.Managed, out.Primary = cfg.Mode, cfg.Managed, cfg.Primary
+		out.Sticky = cfg.Sticky && cfg.Mode == MWModeBalance
+		out.Active = pickMwanActive(cfg, online)
+	}
+	shares := map[string]int{}
+	if out.Mode == MWModeBalance {
+		shares = mwanShares(cfg, online)
+	}
+	for _, c := range candidates {
+		ip := ""
+		if len(c.IPv4) > 0 {
+			ip = c.IPv4[0]
+		}
+		u := probe.WanUplink{
+			Name: c.Name, Proto: c.Proto, Port: c.Port, IP: ip, Gateway: c.Gateway,
+			Up: c.Up, Metered: c.Metered, SharePct: shares[c.Name],
+		}
+		switch {
+		case !steering:
+			// Without a policy the routed uplink is the active one, which
+			// is what discovery already worked out.
+			u.Active = c.Active
+		default:
+			u.Active = c.Name == out.Active || shares[c.Name] > 0
+			u.Primary = out.Mode == MWModeFailover && c.Name == out.Primary
+			if online != nil {
+				if online[c.Name] {
+					u.Online = "online"
+				} else if _, tracked := cfg.Ifaces[c.Name]; tracked {
+					u.Online = "offline"
+				}
+			}
+		}
+		out.Uplinks = append(out.Uplinks, u)
+	}
+	return out
+}
+
+// netpulseMultiWanHook is what the agent calls, once per push. It uses only
+// the cheap sources — the interface dump discovery already needs, the config
+// and the tracker's state files — and holds the answer briefly, so a change
+// is never more than one push late.
+var netpulseMultiWanCache struct {
+	mu   sync.Mutex
+	at   time.Time
+	info *probe.MultiWanInfo
+}
+
+const netpulseMultiWanTTL = 20 * time.Second
+
+func netpulseMultiWanHook() *probe.MultiWanInfo {
+	netpulseMultiWanCache.mu.Lock()
+	defer netpulseMultiWanCache.mu.Unlock()
+	if time.Since(netpulseMultiWanCache.at) < netpulseMultiWanTTL {
+		return netpulseMultiWanCache.info
+	}
+	netpulseMultiWanCache.at = time.Now()
+	cfg, states, steering := mwanLiveState()
+	netpulseMultiWanCache.info = netpulseMultiWan(wanCandidates(), cfg, mwanOnline(states), steering)
+	return netpulseMultiWanCache.info
 }
