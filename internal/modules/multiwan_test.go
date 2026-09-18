@@ -6,6 +6,7 @@ import (
 
 	"github.com/gnacho/netgrip/internal/executor"
 	"github.com/gnacho/netgrip/internal/ubus"
+	"github.com/gnacho/netpulse/agent/probe"
 )
 
 // A router with a fibre uplink and a cellular backup, behind a firewall zone
@@ -939,5 +940,124 @@ mwan3.` + mwanPolicyName + `=policy
 	}
 	if readMwanConfig(strings.Replace(show, "sticky='1'", "sticky='0'", 1)).Sticky {
 		t.Fatal("a rule that does not pin must not be reported as sticky")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// What the monitoring side is told
+// ---------------------------------------------------------------------------
+
+// The config as netgrip writes it for failover, with the fibre preferred.
+const mwanShowOurFailover = `mwan3.fiber=interface
+mwan3.cell=interface
+mwan3.` + mwanMemberPrefix + `fiber=member
+mwan3.` + mwanMemberPrefix + `fiber.interface='fiber'
+mwan3.` + mwanMemberPrefix + `fiber.metric='1'
+mwan3.` + mwanMemberPrefix + `fiber.weight='1'
+mwan3.` + mwanMemberPrefix + `cell=member
+mwan3.` + mwanMemberPrefix + `cell.interface='cell'
+mwan3.` + mwanMemberPrefix + `cell.metric='2'
+mwan3.` + mwanMemberPrefix + `cell.weight='1'
+mwan3.` + mwanPolicyName + `=policy
+mwan3.` + mwanRuleName + `=rule
+mwan3.` + mwanRuleName + `.use_policy='` + mwanPolicyName + `'
+`
+
+func uplinkByName(info *probe.MultiWanInfo, name string) *probe.WanUplink {
+	for i := range info.Uplinks {
+		if info.Uplinks[i].Name == name {
+			return &info.Uplinks[i]
+		}
+	}
+	return nil
+}
+
+func TestNetpulseProjectionCarriesWhatIsHappening(t *testing.T) {
+	cfg := readMwanConfig(mwanShowOurFailover)
+	online := map[string]bool{"fiber": true, "cell": true}
+	got := netpulseMultiWan(classifyFixture(t), cfg, online, true)
+
+	if got.Mode != MWModeFailover || got.Primary != "fiber" || got.Active != "fiber" || !got.Managed {
+		t.Fatalf("policy summary = %+v", got)
+	}
+	fiber, cell := uplinkByName(got, "fiber"), uplinkByName(got, "cell")
+	if fiber == nil || cell == nil {
+		t.Fatalf("uplinks = %+v", got.Uplinks)
+	}
+	if !fiber.Active || !fiber.Primary || fiber.Port != "lan4" || fiber.IP != "203.0.113.10" {
+		t.Fatalf("fiber = %+v", *fiber)
+	}
+	// The modem's address exists only on the runtime child discovery folds
+	// in, and it must survive the projection.
+	if cell.Active || cell.IP != "192.0.2.77" || !cell.Metered || cell.Online != "online" {
+		t.Fatalf("cell = %+v", *cell)
+	}
+	// None of the policy's own vocabulary travels.
+	if fiber.SharePct != 0 {
+		t.Fatalf("failover has no split to report: %+v", *fiber)
+	}
+}
+
+// The split is derived rather than asked for, so it is fresh on every push.
+func TestNetpulseProjectionDerivesTheSplit(t *testing.T) {
+	show := strings.ReplaceAll(mwanShowOurFailover, "cell.metric='2'", "cell.metric='1'")
+	show = strings.ReplaceAll(show, "cell.weight='1'", "cell.weight='9'")
+	got := netpulseMultiWan(classifyFixture(t), readMwanConfig(show),
+		map[string]bool{"fiber": true, "cell": true}, true)
+	if got.Mode != MWModeBalance {
+		t.Fatalf("mode = %q, want balance", got.Mode)
+	}
+	fiber, cell := uplinkByName(got, "fiber"), uplinkByName(got, "cell")
+	if cell.SharePct != 90 || fiber.SharePct != 10 {
+		t.Fatalf("split = %d/%d, want 90/10", cell.SharePct, fiber.SharePct)
+	}
+	// Both are carrying traffic while balancing, and neither is "the main".
+	if !cell.Active || !fiber.Active || cell.Primary || fiber.Primary {
+		t.Fatalf("uplinks = %+v", got.Uplinks)
+	}
+}
+
+func TestMwanSharesFollowWhatIsOnline(t *testing.T) {
+	show := strings.ReplaceAll(mwanShowOurFailover, "cell.metric='2'", "cell.metric='1'")
+	show = strings.ReplaceAll(show, "cell.weight='1'", "cell.weight='3'")
+	cfg := readMwanConfig(show)
+	// A link the tracker calls down carries nothing, whatever its weight.
+	got := mwanShares(cfg, map[string]bool{"fiber": true})
+	if got["fiber"] != 100 || got["cell"] != 0 {
+		t.Fatalf("shares = %v, want everything on the one that is up", got)
+	}
+	// And a standby group is never counted: only the lowest metric with
+	// something online carries traffic.
+	failover := readMwanConfig(mwanShowOurFailover)
+	if got := mwanShares(failover, map[string]bool{"fiber": true, "cell": true}); got["cell"] != 0 || got["fiber"] != 100 {
+		t.Fatalf("shares = %v, want the standby at zero", got)
+	}
+}
+
+// One connection is not multi-WAN. The list is empty rather than absent:
+// the monitoring side keeps the last section it was sent, so "nothing to
+// show" has to be said out loud.
+func TestNetpulseProjectionIsEmptyBelowTwoUplinks(t *testing.T) {
+	got := netpulseMultiWan(classifyFixture(t)[:1], mwanConfig{}, nil, false)
+	if got == nil {
+		t.Fatal("the section must be sent, not omitted")
+	}
+	if len(got.Uplinks) != 0 || got.Mode != MWModeOff {
+		t.Fatalf("got %+v, want an empty list", got)
+	}
+}
+
+// Two uplinks and nothing steering between them: still worth listing, with
+// no policy claimed and the routed one marked.
+func TestNetpulseProjectionWithoutAPolicy(t *testing.T) {
+	got := netpulseMultiWan(classifyFixture(t), mwanConfig{}, nil, false)
+	if got.Mode != MWModeOff || got.Managed || got.Active != "" {
+		t.Fatalf("got %+v, want no policy", got)
+	}
+	if len(got.Uplinks) != 2 {
+		t.Fatalf("uplinks = %+v", got.Uplinks)
+	}
+	if fiber := uplinkByName(got, "fiber"); !fiber.Active {
+		t.Fatalf("the routed uplink is the active one here: %+v", *fiber)
 	}
 }

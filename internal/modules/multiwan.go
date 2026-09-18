@@ -26,6 +26,7 @@ import (
 
 	"github.com/gnacho/netgrip/internal/executor"
 	"github.com/gnacho/netgrip/internal/ubus"
+	"github.com/gnacho/netpulse/agent/probe"
 )
 
 // wanProtos are the protocols an uplink is configured with. Everything else
@@ -1141,29 +1142,88 @@ func MwanActiveUplink() string {
 		return mwanActive.name
 	}
 	mwanActive.at = time.Now()
-	mwanActive.name = ""
-
-	if _, err := os.Stat(mwanStateDir); err != nil {
+	cfg, online, ok := mwanLiveState()
+	if !ok {
+		mwanActive.name = ""
 		return ""
+	}
+	mwanActive.name = pickMwanActive(cfg, online)
+	return mwanActive.name
+}
+
+// mwanLiveState is the cheap half of the picture: the config, which `uci`
+// answers instantly, and the tracker's verdict on each link, which is one
+// word per file under its run directory. Everything else mwan3 can tell us
+// costs a shell script and the best part of a second — measured, on the
+// class of hardware this runs on — so nothing on a polled path uses it.
+func mwanLiveState() (mwanConfig, map[string]bool, bool) {
+	if _, err := os.Stat(mwanStateDir); err != nil {
+		return mwanConfig{}, nil, false
 	}
 	show, err := exec.Command("uci", "show", mwanPkg).Output()
 	if err != nil {
-		return ""
+		return mwanConfig{}, nil, false
 	}
-	cfg := readMwanConfig(string(show))
-	online := map[string]bool{}
 	entries, err := os.ReadDir(mwanStateDir)
 	if err != nil {
-		return ""
+		return mwanConfig{}, nil, false
 	}
+	online := map[string]bool{}
 	for _, e := range entries {
 		b, err := os.ReadFile(mwanStateDir + "/" + e.Name())
 		if err == nil && strings.TrimSpace(string(b)) == "online" {
 			online[e.Name()] = true
 		}
 	}
-	mwanActive.name = pickMwanActive(cfg, online)
-	return mwanActive.name
+	return readMwanConfig(string(show)), online, true
+}
+
+// mwanShares is how traffic divides between the uplinks, worked out the way
+// mwan3 does it rather than asked for: only the lowest metric group with
+// something online carries anything, and inside it the split follows the
+// weights. Deriving it keeps the number fresh on every push, where asking
+// `mwan3 policies` would cost a third of a second each time.
+func mwanShares(cfg mwanConfig, online map[string]bool) map[string]int {
+	type member struct {
+		iface  string
+		weight int
+	}
+	lowest, group := 0, []member{}
+	for _, m := range cfg.Members {
+		if m.Interface == "" || !online[m.Interface] {
+			continue
+		}
+		switch {
+		case len(group) == 0 || m.Metric < lowest:
+			lowest, group = m.Metric, []member{{m.Interface, m.Weight}}
+		case m.Metric == lowest:
+			group = append(group, member{m.Interface, m.Weight})
+		}
+	}
+	shares := map[string]int{}
+	total := 0
+	for _, m := range group {
+		total += m.weight
+	}
+	if total == 0 {
+		return shares
+	}
+	// Heaviest first, so the rounding remainder lands there rather than
+	// leaving the column short of 100.
+	sort.Slice(group, func(i, j int) bool {
+		if group[i].weight != group[j].weight {
+			return group[i].weight > group[j].weight
+		}
+		return group[i].iface < group[j].iface
+	})
+	assigned := 0
+	for _, m := range group[1:] {
+		pct := m.weight * 100 / total
+		shares[m.iface] = pct
+		assigned += pct
+	}
+	shares[group[0].iface] = 100 - assigned
+	return shares
 }
 
 // pickMwanActive works out which member is carrying traffic from the config
@@ -1201,4 +1261,85 @@ func pickMwanActive(cfg mwanConfig, online map[string]bool) string {
 		}
 	}
 	return best
+}
+
+// ---------------------------------------------------------------------------
+// What the monitoring side is told
+// ---------------------------------------------------------------------------
+
+// netpulseMultiWan projects the local state into the shape the agent carries
+// to the monitoring side: what is happening, not how it is configured.
+// Metrics, weights, tracking targets and section names stay here — they are
+// how a policy is expressed, and nobody reading a dashboard needs them.
+//
+// Never nil. A router with fewer than two uplinks reports an empty list,
+// which is a statement in its own right: the monitoring side keeps the last
+// section it was sent, so "nothing to show" has to be said out loud or a
+// panel would linger after a line is unplugged.
+func netpulseMultiWan(candidates []WanCandidate, cfg mwanConfig, online map[string]bool, steering bool) *probe.MultiWanInfo {
+	out := &probe.MultiWanInfo{Mode: MWModeOff, Uplinks: []probe.WanUplink{}}
+	if len(candidates) < 2 {
+		return out
+	}
+	if steering {
+		out.Mode, out.Managed, out.Primary = cfg.Mode, cfg.Managed, cfg.Primary
+		out.Sticky = cfg.Sticky && cfg.Mode == MWModeBalance
+		out.Active = pickMwanActive(cfg, online)
+	}
+	shares := map[string]int{}
+	if out.Mode == MWModeBalance {
+		shares = mwanShares(cfg, online)
+	}
+	for _, c := range candidates {
+		ip := ""
+		if len(c.IPv4) > 0 {
+			ip = c.IPv4[0]
+		}
+		u := probe.WanUplink{
+			Name: c.Name, Proto: c.Proto, Port: c.Port, IP: ip, Gateway: c.Gateway,
+			Up: c.Up, Metered: c.Metered, SharePct: shares[c.Name],
+		}
+		switch {
+		case !steering:
+			// Without a policy the routed uplink is the active one, which
+			// is what discovery already worked out.
+			u.Active = c.Active
+		default:
+			u.Active = c.Name == out.Active || shares[c.Name] > 0
+			u.Primary = out.Mode == MWModeFailover && c.Name == out.Primary
+			if online != nil {
+				if online[c.Name] {
+					u.Online = "online"
+				} else if _, tracked := cfg.Ifaces[c.Name]; tracked {
+					u.Online = "offline"
+				}
+			}
+		}
+		out.Uplinks = append(out.Uplinks, u)
+	}
+	return out
+}
+
+// netpulseMultiWanHook is what the agent calls, once per push. It uses only
+// the cheap sources — the interface dump discovery already needs, the config
+// and the tracker's state files — and holds the answer briefly, so a change
+// is never more than one push late.
+var netpulseMultiWanCache struct {
+	mu   sync.Mutex
+	at   time.Time
+	info *probe.MultiWanInfo
+}
+
+const netpulseMultiWanTTL = 20 * time.Second
+
+func netpulseMultiWanHook() *probe.MultiWanInfo {
+	netpulseMultiWanCache.mu.Lock()
+	defer netpulseMultiWanCache.mu.Unlock()
+	if time.Since(netpulseMultiWanCache.at) < netpulseMultiWanTTL {
+		return netpulseMultiWanCache.info
+	}
+	netpulseMultiWanCache.at = time.Now()
+	cfg, online, steering := mwanLiveState()
+	netpulseMultiWanCache.info = netpulseMultiWan(wanCandidates(), cfg, online, steering)
+	return netpulseMultiWanCache.info
 }
