@@ -471,6 +471,19 @@ func fileExists(path string) bool {
 // NETPULSE_ENABLED se ignora (se trata como 1; se sigue persistiendo por
 // compatibilidad) y una config incompleta NO apaga nada: el agente queda en
 // searching y el descubrimiento (#147) puede completarla solo.
+// panelPort is the port this panel listens on. The monitoring side links
+// to it, and guessing the port gets it wrong on any router not using the
+// default — including every GL.iNet board, where 8080 is the stock web UI
+// and netgrip has to live elsewhere. Set once at startup.
+var panelPort = 8090
+
+// SetPanelPort records the port the panel was started on.
+func SetPanelPort(p int) {
+	if p > 0 {
+		panelPort = p
+	}
+}
+
 func applyNetPulseAgent(p netpulsePaths) {
 	npMu.Lock()
 	if npCancel != nil {
@@ -509,6 +522,7 @@ func applyNetPulseAgent(p netpulsePaths) {
 		EnvFile:      p.env,
 		Version:      version,
 		Kind:         "netgrip",
+		PanelPort:    panelPort,
 		// The uplink policy this panel manages travels with the push, so
 		// the monitoring side shows the connection actually in use rather
 		// than the one holding the cheapest route.

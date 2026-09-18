@@ -44,6 +44,9 @@ func main() {
 	modules.StartSelfUpdateScheduler(version)
 	modules.StartParentalScheduler()
 	modules.StartQuotaScheduler()
+	// The monitoring side links to this panel, so it has to know where it
+	// answers rather than assume a default.
+	modules.SetPanelPort(*port)
 	modules.StartFleetDiscovery(version, *port)
 	modules.StartPoEWatchdog()
 	log.Printf("netgrip %s listening on %s (rpcd: %s)", version, addr, resolvedRPCd)
