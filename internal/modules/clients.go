@@ -121,6 +121,12 @@ func ListClients(requesterIP string) []Client {
 	// show wired clients when the router is the gateway (router mode); a dumb
 	// AP's clients are its wireless associates.
 	if !isAP {
+		// Whether blocking is possible is a property of the router, not of
+		// each client, but it was being asked once per client — and
+		// `/etc/init.d/firewall enabled` costs ~120 ms, because it sources
+		// OpenWrt's whole init framework. On a router with fifty clients
+		// that turned a listing into six seconds of CPU, every time.
+		firewallOn := executor.ServiceEnabled("firewall")
 		wifiPorts := map[string]bool{}
 		for _, radio := range radios {
 			for _, iface := range radio.Interfaces {
@@ -152,7 +158,7 @@ func ListClients(requesterIP string) []Client {
 				fillIdentity(&c, mac, requesterIP, leaseSource, byMac, arp, reservations)
 				_, c.Reserved = reservations[mac]
 				c.Reservable = c.IP != ""
-				c.Blockable = executor.ServiceEnabled("firewall")
+				c.Blockable = firewallOn
 				clients = append(clients, c)
 			}
 		}
