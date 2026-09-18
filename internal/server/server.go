@@ -48,6 +48,7 @@ func New(rpcdURL, version string) *Server {
 	s.mux.HandleFunc("GET /api/wan", s.requireAuth(s.handleWan))
 	s.mux.HandleFunc("GET /api/wan/config", s.requireAuth(s.handleWanConfigGet))
 	s.mux.HandleFunc("POST /api/wan/config", s.requireAuth(s.handleWanConfigPost))
+	s.mux.HandleFunc("GET /api/multiwan", s.requireAuth(s.handleMultiWanGet))
 	s.mux.HandleFunc("GET /api/wireless", s.requireAuth(s.handleWireless))
 	s.mux.HandleFunc("GET /api/leases", s.requireAuth(s.handleLeases))
 	s.mux.HandleFunc("GET /api/ipv6", s.requireAuth(s.handleIPv6Get))
@@ -375,6 +376,12 @@ func (s *Server) handleWan(w http.ResponseWriter, _ *http.Request) {
 
 func (s *Server) handleWanConfigGet(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, modules.ReadWANConfig())
+}
+
+// handleMultiWanGet lists the internet uplinks and, when mwan3 is
+// installed, what it is doing with them. Read-only.
+func (s *Server) handleMultiWanGet(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, modules.ProbeMultiWAN())
 }
 
 func (s *Server) handleWanConfigPost(w http.ResponseWriter, r *http.Request) {
