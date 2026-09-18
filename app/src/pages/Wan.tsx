@@ -48,7 +48,7 @@ function fmtDur(s: number): string {
 
 /** Página WAN (#243): estado de salida a Internet + configuración (lectura con
  *  Editar; el form no abre por defecto) + port-forwarding. */
-export function WanPage({ fwd, onFwdChange, mwan }: {
+export function WanPage({ fwd, onFwdChange, mwan, onMwanChange }: {
   fwd?: FwdProbe;
   onFwdChange?: (p: FwdProbe) => void;
   mwan?: MultiWanProbe;
@@ -200,7 +200,7 @@ export function WanPage({ fwd, onFwdChange, mwan }: {
         )}
       </Card>
 
-      <MultiWanCard probe={mwan} index={2} />
+      <MultiWanCard probe={mwan} onChange={onMwanChange} index={2} />
 
       {fwd && onFwdChange && (
         <div className="md:col-span-2">

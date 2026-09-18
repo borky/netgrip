@@ -1,8 +1,10 @@
 import { useTranslation } from "react-i18next";
 import { Split } from "lucide-react";
+import { api } from "../../api";
 import type { MultiWanProbe, WanCandidate } from "../../types";
-import { Banner, Card, Pill, SkeletonRows, StatusDot } from "../ui";
+import { Banner, Button, Card, Pill, SkeletonRows, StatusDot } from "../ui";
 import type { PillTone } from "../ui";
+import { InstallProgress, useInstallJob } from "../wizard/common";
 
 /** How long a link has been up, in the same shape the WAN card uses. */
 function fmtDur(s: number): string {
@@ -63,8 +65,25 @@ function UplinkRow({ c }: { c: WanCandidate }) {
  *
  * Read-only for now: the mode controls arrive with the write path.
  */
-export function MultiWanCard({ probe, index = 2 }: { probe?: MultiWanProbe; index?: number }) {
+export function MultiWanCard({ probe, onChange, index = 2 }: {
+  probe?: MultiWanProbe;
+  onChange?: (p: MultiWanProbe) => void;
+  index?: number;
+}) {
   const { t } = useTranslation();
+  const { job, running, begin } = useInstallJob();
+
+  // Installing the manager is the whole of the offer: once it is there the
+  // probe comes back with the modes available.
+  const install = () => {
+    void begin(() => api.wizardPackages(["mwan3"])).then(async () => {
+      try {
+        onChange?.(await api.multiwan());
+      } catch {
+        /* the next poll picks it up */
+      }
+    });
+  };
 
   // On an access point there is no uplink to talk about at all.
   if (probe && !probe.applicable) return null;
@@ -106,7 +125,19 @@ export function MultiWanCard({ probe, index = 2 }: { probe?: MultiWanProbe; inde
           )}
 
           {probe.multi_wan_possible && !probe.installed && (
-            <Banner tone="info" className="mt-3">{t("mwan.installPrompt")}</Banner>
+            <div className="mt-3 flex flex-col gap-2">
+              <Banner
+                tone="info"
+                action={
+                  <Button size="sm" onClick={install} loading={running}>
+                    {t("services.installNow")}
+                  </Button>
+                }
+              >
+                {t("mwan.installPrompt")}
+              </Banner>
+              <InstallProgress job={job} />
+            </div>
           )}
 
           {probe.multi_wan_possible && probe.installed && probe.foreign && (
