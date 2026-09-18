@@ -525,6 +525,8 @@ const realApi = {
     }),
   ntfyTest: () =>
     request<{ ok: boolean }>("/api/ntfy/test", { method: "POST" }),
+  cpu: () =>
+    request<import("./types").CPUProbe>("/api/cpu"),
   nlbwmon: () =>
     request<import("./types").NlbwmonProbe>("/api/nlbwmon"),
   nlbwmonTop: () =>

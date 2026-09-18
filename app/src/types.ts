@@ -584,6 +584,41 @@ export interface HistoryEntry {
 /** One accounted row from nlbwmon: a device (key = MAC) or a protocol
  *  (key = "HTTPS", "QUIC", "other"…). Down/Up are from the DEVICE's point
  *  of view, unlike Client.rx_bytes where rx is what the AP received. */
+/** One core. dropped/squeezed are since boot; the _rate fields are per
+ *  second since the previous poll — the ones that say it is happening now. */
+export interface CPUCore {
+  idx: number;
+  usage_pct: number;
+  freq_mhz?: number;
+  dropped: number;
+  dropped_rate: number;
+  squeezed: number;
+  squeezed_rate: number;
+}
+
+export interface CPUProc {
+  pid: number;
+  name: string;
+  usage_pct: number;
+}
+
+export interface CPUProbe {
+  cores: CPUCore[];
+  usage_pct: number;
+  /** The highest single core: on a router this predicts trouble, the
+   *  average does not. */
+  busiest_pct: number;
+  load: number[];
+  governor?: string;
+  temp_c?: number;
+  /** Which chip the reading came from: a board may expose no CPU sensor,
+   *  and a WiFi radio idles warmer than a SoC. */
+  temp_source?: string;
+  procs: CPUProc[];
+  /** True until there are two samples to compare. */
+  warming: boolean;
+}
+
 export interface NlbwUsage {
   key: string;
   ip?: string;
