@@ -527,6 +527,8 @@ const realApi = {
     request<{ ok: boolean }>("/api/ntfy/test", { method: "POST" }),
   nlbwmon: () =>
     request<import("./types").NlbwmonProbe>("/api/nlbwmon"),
+  nlbwmonTop: () =>
+    request<import("./types").NlbwmonTop>("/api/nlbwmon/top"),
   setNlbwmon: (cfg: import("./types").NlbwmonConfig) =>
     request<import("./types").ModuleResult<import("./types").NlbwmonProbe>>("/api/nlbwmon", {
       method: "POST",

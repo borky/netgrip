@@ -9,6 +9,7 @@ import { api, isDemo } from "../api";
 import type {
   Board, Client, DPIProbe, DriftProbe, EthPort, HistoryEntry,
   IfaceCounters, ModeProbe, SystemInfo, WanStatus,
+  NlbwmonTop,
 } from "../types";
 import type { HealthScore } from "../hooks/useHealthScore";
 import {
@@ -390,10 +391,24 @@ function TopConsumersCard({ clients, onNavigate }: { clients?: Client[]; onNavig
   const { t } = useTranslation();
   const [probe, setProbe] = useState<DPIProbe>();
   const snapshots = useAppSeries();
+  // Accounting per device and per protocol from nlbwmon. It is the only
+  // source that covers wired clients and anything behind a switch: the
+  // counters in Client come from this router's own wireless stations, so a
+  // gateway whose clients all sit behind a switch has none of them.
+  const [top, setTop] = useState<NlbwmonTop>();
 
   useEffect(() => {
     if (!isDemo()) return;
     api.dpi().then(setProbe).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    const load = () => api.nlbwmonTop()
+      .then((r) => setTop(r?.devices?.length || r?.apps?.length ? r : undefined))
+      .catch(() => {});
+    load();
+    const id = setInterval(load, 60000);
+    return () => clearInterval(id);
   }, []);
 
   const demo = isDemo();
@@ -430,6 +445,21 @@ function TopConsumersCard({ clients, onNavigate }: { clients?: Client[]; onNavig
     if (withBytes.length === 0) return null;
     return [...withBytes].sort((a, b) => b.rx_bytes + b.tx_bytes - (a.rx_bytes + a.tx_bytes)).slice(0, 5);
   }, [chart, clients]);
+
+  /** Devices as nlbwmon accounts them, named from the client list when the
+   *  MAC is one we know. Preferred over the wireless counters because it
+   *  covers every client, not just the stations of this router. */
+  const usageTop = useMemo(() => {
+    if (!top?.devices?.length) return null;
+    const nameOf = new Map((clients ?? []).map((c) => [c.mac.toLowerCase(), c.name || c.ip || c.mac]));
+    const max = top.devices[0].down_bytes + top.devices[0].up_bytes || 1;
+    return top.devices.slice(0, 5).map((d) => ({
+      key: d.key,
+      label: nameOf.get(d.key.toLowerCase()) ?? d.ip ?? d.key,
+      bytes: d.down_bytes + d.up_bytes,
+      pct: ((d.down_bytes + d.up_bytes) / max) * 100,
+    }));
+  }, [top, clients]);
 
   const multiSeries = chart
     ? chart.series.map((s, i) => ({
@@ -470,6 +500,38 @@ function TopConsumersCard({ clients, onNavigate }: { clients?: Client[]; onNavig
               );
             })}
           </div>
+        </>
+      ) : usageTop ? (
+        <>
+          <div className="space-y-2.5">
+            {usageTop.map((d) => (
+              <div key={d.key}>
+                <div className="flex justify-between text-small mb-1">
+                  <span className="font-medium truncate" translate="no">{d.label}</span>
+                  <span className="text-muted" style={{ fontVariantNumeric: "tabular-nums" }}>{fmtBytes(d.bytes)}</span>
+                </div>
+                <div className="h-1.5 rounded-full bg-surface-2 overflow-hidden">
+                  <div className="h-full rounded-full bg-accent transition-[width] duration-500" style={{ width: `${d.pct}%` }} />
+                </div>
+              </div>
+            ))}
+          </div>
+          {top!.apps.length > 0 && (
+            <div className="mt-4 border-t border-border/50 pt-3">
+              <div className="text-caption text-muted mb-2">{t("overview.byProtocol")}</div>
+              <div className="grid gap-x-4 gap-y-1.5 sm:grid-cols-2">
+                {top!.apps.slice(0, 6).map((a) => (
+                  <div key={a.key} className="flex items-center gap-2 text-small">
+                    <span className="flex-1 truncate font-medium">{a.key}</span>
+                    <span className="text-muted" style={{ fontVariantNumeric: "tabular-nums" }}>
+                      {fmtBytes(a.down_bytes + a.up_bytes)}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+          <p className="mt-3 text-caption text-faint">{t("overview.usagePeriod")}</p>
         </>
       ) : clientTop ? (
         <div className="space-y-2.5">

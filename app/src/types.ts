@@ -573,6 +573,22 @@ export interface HistoryEntry {
   clients: number;
 }
 
+/** One accounted row from nlbwmon: a device (key = MAC) or a protocol
+ *  (key = "HTTPS", "QUIC", "other"…). Down/Up are from the DEVICE's point
+ *  of view, unlike Client.rx_bytes where rx is what the AP received. */
+export interface NlbwUsage {
+  key: string;
+  ip?: string;
+  conns: number;
+  down_bytes: number;
+  up_bytes: number;
+}
+
+export interface NlbwmonTop {
+  devices: NlbwUsage[];
+  apps: NlbwUsage[];
+}
+
 export interface NlbwmonProbe {
   installed: boolean;
   running: boolean;
