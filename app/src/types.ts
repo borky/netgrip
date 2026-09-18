@@ -217,6 +217,12 @@ export interface FwdRule {
   dest_ip: string;
   dest_port: string;
   proto: string;
+  /** "forward": DNAT to a host on the LAN. "input": a port on the router
+   *  itself (a VPN listener, an exposed admin page). */
+  kind?: "forward" | "input";
+  /** Created by NetGrip, so it can be removed from here. Rules set up in
+   *  LuCI or by hand are listed read-only. */
+  managed?: boolean;
 }
 
 export interface FwdProbe {

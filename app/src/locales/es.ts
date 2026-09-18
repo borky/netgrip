@@ -835,6 +835,9 @@ export default {
     keyLabel: "Clave",
   },
   fwd: {
+    thisRouter: "este router",
+    external: "externa",
+    externalHint: "Creada fuera de NetGrip (LuCI o a mano). Aquí se ve, allí se edita.",
     title: "Reenvío de puertos",
     noWan: "Solo aplica en el gateway (requiere WAN y firewall)",
     empty: "Sin reglas todavía",
