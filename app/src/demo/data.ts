@@ -389,6 +389,29 @@ export const demoLag: T.LAGProbe = {
 
 /** Top consumers for the demo: devices by MAC and protocols, the shape
  *  nlbwmon reports on a real router. */
+/** A four-core router with the NIC interrupt pinned to one core: the shape
+ *  the card exists to make visible. */
+export const demoCpu = {
+  cores: [
+    { idx: 0, usage_pct: 12.4, freq_mhz: 716, dropped: 0, dropped_rate: 0, squeezed: 201, squeezed_rate: 0 },
+    { idx: 1, usage_pct: 88.1, freq_mhz: 716, dropped: 41255, dropped_rate: 37.5, squeezed: 92140, squeezed_rate: 12.2 },
+    { idx: 2, usage_pct: 9.7, freq_mhz: 716, dropped: 0, dropped_rate: 0, squeezed: 28, squeezed_rate: 0 },
+    { idx: 3, usage_pct: 14.2, freq_mhz: 716, dropped: 130, dropped_rate: 0, squeezed: 4170, squeezed_rate: 0 },
+  ],
+  usage_pct: 31.1,
+  busiest_pct: 88.1,
+  load: [1.42, 1.18, 0.95],
+  governor: "performance",
+  temp_c: 53,
+  temp_source: "ath10k_hwmon",
+  procs: [
+    { pid: 1201, name: "netgrip", usage_pct: 11.2 },
+    { pid: 980, name: "hostapd", usage_pct: 3.4 },
+    { pid: 1444, name: "dnsmasq", usage_pct: 1.1 },
+  ],
+  warming: false,
+};
+
 export const demoNlbwmonTop = {
   devices: [
     { key: "aa:bb:cc:00:11:01", ip: "192.168.1.31", conns: 4210, down_bytes: 48_300_000_000, up_bytes: 3_100_000_000 },

@@ -144,6 +144,7 @@ func New(rpcdURL, version string) *Server {
 	s.mux.HandleFunc("GET /api/https", s.requireAuth(s.handleHTTPSGet))
 	s.mux.HandleFunc("POST /api/https", s.requireAuth(s.handleHTTPSEnable))
 	s.mux.HandleFunc("POST /api/wol", s.requireAuth(s.handleWoL))
+	s.mux.HandleFunc("GET /api/cpu", s.requireAuth(s.handleCPUGet))
 	s.mux.HandleFunc("GET /api/nlbwmon", s.requireAuth(s.handleNlbwmonGet))
 	s.mux.HandleFunc("GET /api/nlbwmon/top", s.requireAuth(s.handleNlbwmonTopGet))
 	s.mux.HandleFunc("POST /api/nlbwmon", s.requireAuth(s.handleNlbwmonSet))
@@ -1696,6 +1697,12 @@ func (s *Server) handleWoL(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]string{"status": "sent"})
+}
+
+// handleCPUGet: per-core load, clock, temperature and the packet-drop
+// counters. Cheap enough to poll: only /proc and /sys reads.
+func (s *Server) handleCPUGet(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, modules.ProbeCPU())
 }
 
 func (s *Server) handleNlbwmonGet(w http.ResponseWriter, _ *http.Request) {

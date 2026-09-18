@@ -356,6 +356,7 @@ export const demoApi: typeof api = {
     if (cfg.ssid) state.iot.ssid = cfg.ssid;
     return write(state.iot);
   },
+  cpu: () => get(D.demoCpu),
   nlbwmon: () => get(state.nlbwmon),
   nlbwmonTop: () => get(D.demoNlbwmonTop),
   setNlbwmon: async (cfg) => write({ ...state.nlbwmon, ...cfg, running: cfg.enabled ?? state.nlbwmon.running }),
