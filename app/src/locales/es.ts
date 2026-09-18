@@ -1014,7 +1014,7 @@ export default {
     hint: {
       off: "Las conexiones se dejan como están: la que elija el router es la que lleva el tráfico.",
       failover: "Una conexión lo lleva todo. Si deja de llegar a Internet, la siguiente toma el relevo sola, y se lo devuelve cuando se recupera.",
-      balance: "El tráfico se reparte entre las conexiones que elijas. Cada una conserva las sesiones que empezaron en ella.",
+      balance: "El tráfico se reparte entre las conexiones que elijas, según los porcentajes que pongas. Cada equipo se queda en una sola cada vez, así que desde un mismo ordenador verás una conexión, no una mezcla.",
     },
     makePrimary: "Hacer principal",
     apply: "Aplicar",
@@ -1025,6 +1025,9 @@ export default {
     weightOff: "Solo de reserva",
     needOneBalance: "Elige al menos una conexión que lleve tráfico.",
     meteredWarn: "Has elegido una conexión de pago por uso para el tráfico diario. Va a costar dinero.",
+    sticky: "Mantener cada equipo en una sola conexión",
+    stickyOnHint: "Recomendado. Un equipo se queda unos diez minutos en la conexión por la que empezó, así no se cortan las llamadas ni las sesiones. Los porcentajes de abajo deciden en cuál cae, no cada cuánto cambia.",
+    stickyOffHint: "Cada conexión nueva se reparte según los porcentajes de abajo. El tráfico se reparte mejor, pero una web puede verte cambiar de dirección a media sesión y cerrarte la sesión.",
     tracking: "Cómo se comprueba una conexión",
     trackingHint: "Direcciones a las que el router hace ping por cada conexión para saber si llega de verdad a Internet. Separadas por comas; vacío para las de siempre.",
     trackInvalid: "Escribe hasta cuatro direcciones IPv4 separadas por comas.",

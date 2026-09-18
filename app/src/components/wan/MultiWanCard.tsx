@@ -100,6 +100,7 @@ export function MultiWanCard({ probe, onChange, index = 2 }: {
   const [weights, setWeights] = useState<Record<string, number>>({});
   const [pool, setPool] = useState<Record<string, boolean>>({});
   const [track, setTrack] = useState<Record<string, string>>({});
+  const [sticky, setSticky] = useState(true);
   const [confirming, setConfirming] = useState(false);
   const [takingOver, setTakingOver] = useState(false);
 
@@ -120,6 +121,7 @@ export function MultiWanCard({ probe, onChange, index = 2 }: {
     setWeights(Object.fromEntries(probe.candidates.map((c) => [c.name, c.weight || 1])));
     setPool(Object.fromEntries(probe.candidates.map((c) => [c.name, probe.mode === "balance" ? c.balance : !c.metered])));
     setTrack(Object.fromEntries(probe.candidates.map((c) => [c.name, c.track.join(", ")])));
+    setSticky(probe.mode === "balance" ? probe.sticky : true);
   }, [probe]);
 
   const parsedTrack = useMemo(() => {
@@ -172,6 +174,7 @@ export function MultiWanCard({ probe, onChange, index = 2 }: {
           : undefined,
       weights: mode === "balance" ? weights : undefined,
       balance: mode === "balance" ? pool : undefined,
+      sticky: mode === "balance" ? sticky : undefined,
       track: parsedTrack,
     });
   };
@@ -316,6 +319,24 @@ export function MultiWanCard({ probe, onChange, index = 2 }: {
                       {probe.candidates.some((c) => c.metered && (pool[c.name] ?? false)) && (
                         <Banner tone="warn">{t("mwan.meteredWarn")}</Banner>
                       )}
+
+                      {/* The shares describe new connections, not what any
+                          one device sees: each device stays put while this
+                          is on, which is the thing people notice first. */}
+                      <label className="flex items-start gap-2 pt-1">
+                        <input
+                          type="checkbox"
+                          checked={sticky}
+                          onChange={(e) => setSticky(e.target.checked)}
+                          className="mt-1 accent-accent"
+                        />
+                        <span className="text-small">
+                          {t("mwan.sticky")}
+                          <span className="block text-caption text-muted">
+                            {sticky ? t("mwan.stickyOnHint") : t("mwan.stickyOffHint")}
+                          </span>
+                        </span>
+                      </label>
                     </div>
                   )}
 

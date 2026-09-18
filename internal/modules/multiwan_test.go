@@ -890,3 +890,54 @@ mwan3.` + mwanRuleName + `.use_policy='gone'
 		t.Fatalf("active = %q, want nothing: the rule names no policy that exists", got)
 	}
 }
+
+// Balancing pins each device to one connection by default, which is what
+// keeps calls and logins alive — and also why one device sees one address
+// for minutes at a time. It has to be possible to turn that off.
+func TestBalanceStickinessIsOnByDefaultAndCanBeTurnedOff(t *testing.T) {
+	off := false
+	on := true
+	for name, tc := range map[string]struct {
+		req  MultiWanRequest
+		want bool
+	}{
+		"default":   {MultiWanRequest{Mode: MWModeBalance}, true},
+		"asked on":  {MultiWanRequest{Mode: MWModeBalance, Sticky: &on}, true},
+		"asked off": {MultiWanRequest{Mode: MWModeBalance, Sticky: &off}, false},
+		// Failover has one link at a time; pinning means nothing there.
+		"failover ignores it": {MultiWanRequest{Mode: MWModeFailover, Primary: "fiber", Sticky: &on}, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			plan, err := buildMwanPlan(tc.req, classifyFixture(t))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if plan.Sticky != tc.want {
+				t.Fatalf("sticky = %v, want %v", plan.Sticky, tc.want)
+			}
+			ops := buildMwanOps(plan, readMwanConfig(""), false)
+			want := "uci_set mwan3." + mwanRuleName + ".sticky 0"
+			if tc.want {
+				want = "uci_set mwan3." + mwanRuleName + ".sticky 1"
+			}
+			if !hasOp(ops, want) {
+				t.Fatalf("missing %q", want)
+			}
+		})
+	}
+}
+
+// And the panel has to show the switch in the position the router is in.
+func TestProbeReportsStickiness(t *testing.T) {
+	show := `mwan3.` + mwanRuleName + `=rule
+mwan3.` + mwanRuleName + `.sticky='1'
+mwan3.` + mwanRuleName + `.use_policy='` + mwanPolicyName + `'
+mwan3.` + mwanPolicyName + `=policy
+`
+	if !readMwanConfig(show).Sticky {
+		t.Fatal("a sticky rule must be reported as sticky")
+	}
+	if readMwanConfig(strings.Replace(show, "sticky='1'", "sticky='0'", 1)).Sticky {
+		t.Fatal("a rule that does not pin must not be reported as sticky")
+	}
+}
