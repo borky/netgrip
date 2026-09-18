@@ -806,3 +806,87 @@ mwan3.`+mwanMemberPrefix+`cell.metric='2'
 		t.Fatalf("a loaded policy should pass: %v", err)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Which uplink the rest of the panel should call "the WAN"
+// ---------------------------------------------------------------------------
+
+// The reported symptom: with the mobile link set as the main one, the WAN
+// card still showed the wired address. mwan3 steers with marks and leaves
+// the kernel routes alone, so the route table is not the answer.
+func TestActiveUplinkFollowsThePolicyNotTheRouteTable(t *testing.T) {
+	show := `mwan3.fiber=interface
+mwan3.cell=interface
+mwan3.` + mwanMemberPrefix + `cell=member
+mwan3.` + mwanMemberPrefix + `cell.interface='cell'
+mwan3.` + mwanMemberPrefix + `cell.metric='1'
+mwan3.` + mwanMemberPrefix + `fiber=member
+mwan3.` + mwanMemberPrefix + `fiber.interface='fiber'
+mwan3.` + mwanMemberPrefix + `fiber.metric='2'
+mwan3.` + mwanPolicyName + `=policy
+mwan3.` + mwanRuleName + `=rule
+mwan3.` + mwanRuleName + `.use_policy='` + mwanPolicyName + `'
+`
+	cfg := readMwanConfig(show)
+	both := map[string]bool{"fiber": true, "cell": true}
+	if got := pickMwanActive(cfg, both); got != "cell" {
+		t.Fatalf("active = %q, want the uplink the policy prefers", got)
+	}
+	// When the preferred one drops, traffic moves to the next metric.
+	if got := pickMwanActive(cfg, map[string]bool{"fiber": true}); got != "fiber" {
+		t.Fatalf("active = %q, want the surviving uplink", got)
+	}
+	if got := pickMwanActive(cfg, map[string]bool{}); got != "" {
+		t.Fatalf("active = %q, want nothing while every link is down", got)
+	}
+}
+
+// Balanced mode has several links carrying traffic; the single-WAN views
+// need one address, and the heaviest member is the honest choice.
+func TestActiveUplinkPrefersTheHeaviestOfAPool(t *testing.T) {
+	show := `mwan3.a=interface
+mwan3.b=interface
+mwan3.` + mwanMemberPrefix + `a=member
+mwan3.` + mwanMemberPrefix + `a.interface='a'
+mwan3.` + mwanMemberPrefix + `a.metric='1'
+mwan3.` + mwanMemberPrefix + `a.weight='1'
+mwan3.` + mwanMemberPrefix + `b=member
+mwan3.` + mwanMemberPrefix + `b.interface='b'
+mwan3.` + mwanMemberPrefix + `b.metric='1'
+mwan3.` + mwanMemberPrefix + `b.weight='4'
+mwan3.` + mwanPolicyName + `=policy
+mwan3.` + mwanRuleName + `=rule
+mwan3.` + mwanRuleName + `.use_policy='` + mwanPolicyName + `'
+`
+	if got := pickMwanActive(readMwanConfig(show), map[string]bool{"a": true, "b": true}); got != "b" {
+		t.Fatalf("active = %q, want the member carrying the larger share", got)
+	}
+}
+
+// A config that mwan3 never loaded must not be believed: this is the exact
+// state a too-long policy name leaves behind, and answering with one of its
+// members would put a wrong address on the WAN card.
+func TestActiveUplinkIgnoresAConfigThatCannotSteer(t *testing.T) {
+	long := "netgrip_policy_default" // 22 chars: over mwan3's limit
+	show := `mwan3.fiber=interface
+mwan3.` + mwanMemberPrefix + `fiber=member
+mwan3.` + mwanMemberPrefix + `fiber.interface='fiber'
+mwan3.` + mwanMemberPrefix + `fiber.metric='1'
+mwan3.` + long + `=policy
+mwan3.netgrip_rule_default=rule
+mwan3.netgrip_rule_default.use_policy='` + long + `'
+`
+	if got := pickMwanActive(readMwanConfig(show), map[string]bool{"fiber": true}); got != "" {
+		t.Fatalf("active = %q, want nothing: mwan3 refused those sections", got)
+	}
+	// A rule pointing at a policy that does not exist steers nothing either.
+	orphan := `mwan3.fiber=interface
+mwan3.` + mwanMemberPrefix + `fiber=member
+mwan3.` + mwanMemberPrefix + `fiber.interface='fiber'
+mwan3.` + mwanRuleName + `=rule
+mwan3.` + mwanRuleName + `.use_policy='gone'
+`
+	if got := pickMwanActive(readMwanConfig(orphan), map[string]bool{"fiber": true}); got != "" {
+		t.Fatalf("active = %q, want nothing: the rule names no policy that exists", got)
+	}
+}

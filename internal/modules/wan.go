@@ -12,6 +12,11 @@ import (
 // WANConfig is the editable WAN configuration: whichever interface
 // ubus.ActiveWANInterfaceName resolves as the active uplink, and its device.
 type WANConfig struct {
+	// Iface names the interface these settings belong to. With more than
+	// one uplink, which one that is changes with the active connection, and
+	// a form that silently follows it is a form that edits the wrong link.
+	// Read-only: the server decides, the panel shows it.
+	Iface    string `json:"iface,omitempty"`
 	Proto    string `json:"proto"` // dhcp | static | pppoe
 	Device   string `json:"device,omitempty"`
 	IPAddr   string `json:"ipaddr,omitempty"`
@@ -36,6 +41,7 @@ func wanUCI(key string) string {
 // returned; a non-empty Password sent back means 'keep the stored one').
 func ReadWANConfig() WANConfig {
 	return WANConfig{
+		Iface:    ubus.ActiveWANInterfaceName(),
 		Proto:    wanUCI("proto"),
 		Device:   wanUCI("device"),
 		IPAddr:   wanUCI("ipaddr"),
@@ -63,6 +69,7 @@ func ApplyWANConfig(cfg WANConfig) (WANConfig, error) {
 		_ = executor.Run(executor.Op{Kind: "initd", Args: []string{"network", "reload"}})
 	}
 	iface := ubus.ActiveWANInterfaceName()
+	cfg.Iface = iface
 	ops := []executor.Op{{Kind: "uci_set", Args: []string{"network." + iface + ".proto", cfg.Proto}}}
 	setIf := func(key, val string) {
 		if val == "" {

@@ -343,6 +343,7 @@ export default {
     allGood: "All good!",
     uptime: "Connected for {{s}} s",
     uptimeLabel: "Uptime",
+    editingIface: "Settings for {{iface}}, the connection in use",
     configTitle: "Connection settings",
     proto: "Protocol",
     protoDhcp: "DHCP",
