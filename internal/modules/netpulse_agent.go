@@ -509,8 +509,12 @@ func applyNetPulseAgent(p netpulsePaths) {
 		EnvFile:      p.env,
 		Version:      version,
 		Kind:         "netgrip",
-		OnStatus:     storeNetPulseStatus,
-		OnUpgrade:    netPulseUpgradeTrigger,
+		// The uplink policy this panel manages travels with the push, so
+		// the monitoring side shows the connection actually in use rather
+		// than the one holding the cheapest route.
+		MultiWan:  netpulseMultiWanHook,
+		OnStatus:  storeNetPulseStatus,
+		OnUpgrade: netPulseUpgradeTrigger,
 	}
 
 	ctx, cancel := context.WithCancel(base)
