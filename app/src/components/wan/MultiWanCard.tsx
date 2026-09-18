@@ -194,6 +194,7 @@ export function MultiWanCard({ probe, onChange, index = 2 }: {
         index={index}
         icon={Split}
         title={t("mwan.title")}
+        help="multiwan"
         action={
           probe && probe.multi_wan_possible && probe.installed ? (
             <Pill tone={probe.mode === "custom" ? "warn" : probe.mode === "off" ? "muted" : "accent"}>
