@@ -136,7 +136,11 @@ export function WanPage({ mwan, onMwanChange }: {
         )}
       </Card>
 
-      <Card index={1} icon={Save} title={t("wan.configTitle")}
+      <Card
+        index={1}
+        icon={Save}
+        title={t("wan.configTitle")}
+        eyebrow={cfg?.iface ? t("wan.editingIface", { iface: cfg.iface }) : undefined}
         action={
           !editing && cfg !== undefined ? (
             <Button variant="secondary" size="sm" icon={Pencil} onClick={() => setEditing(true)}>{t("wan.edit")}</Button>
