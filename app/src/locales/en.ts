@@ -986,6 +986,27 @@ export default {
     doneOff: "Done. The gadget network is off.",
     keyLabel: "Password",
   },
+  mwan: {
+    title: "Internet connections",
+    modeOff: "Not managed",
+    modeFailover: "Failover",
+    modeBalance: "Balanced",
+    modeCustom: "Set up elsewhere",
+    active: "Carrying traffic",
+    activeShare: "Carrying {{pct}}%",
+    standby: "Standby",
+    offline: "Disconnected",
+    failed: "Not reaching the internet",
+    primary: "Main",
+    metered: "Pay per use",
+    viaPort: "port {{port}}",
+    singleBody:
+      "This router has one internet connection. Plug in a second one — another line, or a mobile dongle — and it can take over automatically when this one drops.",
+    installPrompt:
+      "Two internet connections found. Install the multi-WAN manager to switch over automatically when one of them fails.",
+    foreignBanner:
+      "Multi-WAN is already set up outside NetGrip ({{sections}}), so it is shown here but not changed.",
+  },
   fwd: {
     thisRouter: "this router",
     external: "external",
