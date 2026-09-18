@@ -124,9 +124,11 @@ type MultiWanProbe struct {
 	ForeignSections  []string       `json:"foreign_sections"`
 	PrimaryIface     string         `json:"primary_iface,omitempty"`
 	ActivePolicy     string         `json:"active_policy,omitempty"`
-	DefaultTrack     []string       `json:"default_track"`
-	PackageID        string         `json:"package_id"`
-	ConfigPresent    bool           `json:"config_present"`
+	// Sticky: each device stays on one connection while balancing.
+	Sticky        bool     `json:"sticky"`
+	DefaultTrack  []string `json:"default_track"`
+	PackageID     string   `json:"package_id"`
+	ConfigPresent bool     `json:"config_present"`
 }
 
 // ---------------------------------------------------------------------------
@@ -341,6 +343,8 @@ type mwanConfig struct {
 	Ifaces map[string]mwanIface
 	// RulePolicies maps a rule section to the policy it invokes.
 	RulePolicies map[string]string
+	// Sticky: our own rule keeps each device on one connection.
+	Sticky bool
 	// All maps every section name to its type. `uci delete` fails on a
 	// missing entry and takes the whole apply down with it, so nothing is
 	// deleted without looking here first.
@@ -405,6 +409,9 @@ func readMwanConfig(show string) mwanConfig {
 		case "policy", "rule":
 			if sec.Type == "rule" {
 				cfg.RulePolicies[name] = sec.Option("use_policy")
+				if name == mwanRuleName {
+					cfg.Sticky = sec.Option("sticky") == "1"
+				}
 			}
 			if isOurs {
 				ours++
@@ -546,6 +553,7 @@ func buildMultiWanProbe(
 		return p
 	}
 	p.Mode = cfg.Mode
+	p.Sticky = cfg.Sticky
 	p.Managed = cfg.Managed
 	p.Foreign = len(cfg.Foreign) > 0
 	p.ForeignSections = cfg.Foreign
@@ -650,12 +658,16 @@ func ProbeMultiWAN() *MultiWanProbe {
 // MultiWanRequest is what the panel asks for. Weights and Balance only mean
 // anything in balance mode; Primary only in failover.
 type MultiWanRequest struct {
-	Mode           string              `json:"mode"`
-	Primary        string              `json:"primary"`
-	Weights        map[string]int      `json:"weights"`
-	Balance        map[string]bool     `json:"balance"`
-	Track          map[string][]string `json:"track"`
-	ConfirmForeign bool                `json:"confirm_foreign"`
+	Mode    string              `json:"mode"`
+	Primary string              `json:"primary"`
+	Weights map[string]int      `json:"weights"`
+	Balance map[string]bool     `json:"balance"`
+	Track   map[string][]string `json:"track"`
+	// Sticky keeps each device on the connection it started on. Unset
+	// means yes, which is what stops a video call dying mid-sentence;
+	// turning it off spreads every new connection by weight instead.
+	Sticky         *bool `json:"sticky"`
+	ConfirmForeign bool  `json:"confirm_foreign"`
 }
 
 // mwanPlan is the resolved intent: exactly which sections will exist
@@ -787,8 +799,10 @@ func buildMwanPlan(req MultiWanRequest, candidates []WanCandidate) (mwanPlan, er
 			return plan, fmt.Errorf("at least one connection has to carry traffic")
 		}
 		// Flows stay on the link they started on: alternating source
-		// addresses mid-session breaks logins and video calls.
-		plan.Sticky = true
+		// addresses mid-session breaks logins and video calls. It also
+		// means one device sees one connection for minutes at a time,
+		// which is worth being able to turn off.
+		plan.Sticky = req.Sticky == nil || *req.Sticky
 	}
 
 	for _, m := range plan.Members {

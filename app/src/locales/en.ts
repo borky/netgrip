@@ -866,7 +866,7 @@ export default {
     hint: {
       off: "Connections are left alone: whichever the router picks is the one that carries traffic.",
       failover: "One connection carries everything. If it stops reaching the internet, the next one takes over on its own, and takes it back when it recovers.",
-      balance: "Traffic is shared between the connections you choose. Each one keeps the sessions that started on it.",
+      balance: "Traffic is shared between the connections you choose, by the percentages you set. Each device stays on one of them at a time, so what you see from a single computer is one connection, not a mix.",
     },
     makePrimary: "Make this the main one",
     apply: "Apply",
@@ -877,6 +877,9 @@ export default {
     weightOff: "Only as backup",
     needOneBalance: "Pick at least one connection to carry traffic.",
     meteredWarn: "You have chosen a pay-per-use connection to carry everyday traffic. It will cost money.",
+    sticky: "Keep each device on one connection",
+    stickyOnHint: "Recommended. A device stays on the connection it started on for about ten minutes, so calls and logins survive. The shares below decide which one it lands on, not how often it moves.",
+    stickyOffHint: "Every new connection is shared out by the percentages below. Traffic is spread more evenly, but a site may see you change address mid-session and log you out.",
     tracking: "How a connection is tested",
     trackingHint: "Addresses this router pings through each connection to tell whether it really reaches the internet. Comma separated; leave empty for the defaults.",
     trackInvalid: "Enter up to four IPv4 addresses, separated by commas.",

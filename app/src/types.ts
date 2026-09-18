@@ -271,6 +271,7 @@ export interface MultiWanRequest {
   weights?: Record<string, number>;
   balance?: Record<string, boolean>;
   track?: Record<string, string[]>;
+  sticky?: boolean;
   confirm_foreign?: boolean;
 }
 
@@ -288,6 +289,8 @@ export interface MultiWanProbe {
   foreign_sections: string[];
   primary_iface?: string;
   active_policy?: string;
+  /** Each device stays on one connection while balancing. */
+  sticky: boolean;
   default_track: string[];
   package_id: string;
   config_present: boolean;
