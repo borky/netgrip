@@ -254,6 +254,11 @@ func (s *Server) handleSPA(w http.ResponseWriter, r *http.Request) {
 	if path != "" {
 		if f, err := dist.Open(path); err == nil {
 			f.Close()
+			// Built assets carry a content hash in their name, so a change
+			// produces a different URL: they can be cached forever.
+			if strings.HasPrefix(path, "assets/") {
+				w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+			}
 			http.FileServer(http.FS(dist)).ServeHTTP(w, r)
 			return
 		}
@@ -263,6 +268,11 @@ func (s *Server) handleSPA(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "frontend not embedded", http.StatusInternalServerError)
 		return
 	}
+	// index.html must never be cached: it is what names the hashed bundle.
+	// Served without this, a browser reuses the old copy after an upgrade
+	// and keeps loading the previous frontend against the new backend —
+	// which looks like a bug in whatever changed, not like a stale page.
+	w.Header().Set("Cache-Control", "no-cache, must-revalidate")
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Write(data)
 }
