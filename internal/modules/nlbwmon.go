@@ -226,9 +226,14 @@ func nlbwAggregate(rows []map[string]any, keyOf func(map[string]any) (string, st
 		}
 		u, ok := byKey[key]
 		if !ok {
-			u = &NlbwUsage{Key: key, IP: ip}
+			u = &NlbwUsage{Key: key}
 			byKey[key] = u
 			order = append(order, key)
+		}
+		// nlbw emits several rows per key and not all carry an address:
+		// keep the first non-empty one, or the row stays unlabelled.
+		if u.IP == "" {
+			u.IP = ip
 		}
 		u.Conns += nlbwInt(r, "conns")
 		u.DownBytes += nlbwInt(r, "rx_bytes")

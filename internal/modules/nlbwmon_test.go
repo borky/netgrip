@@ -39,7 +39,8 @@ func TestNlbwDevicesAggregateByMAC(t *testing.T) {
 	if got[0].Conns != 100 {
 		t.Fatalf("conns should add up: %+v", got[0])
 	}
-	// The IP is the one first seen for that MAC, not the last.
+	// The IP is the first non-empty one for that MAC, not simply the
+	// first: nlbw emits several rows per device and some carry none.
 	if got[0].IP != "192.0.2.11" {
 		t.Fatalf("ip: %+v", got[0])
 	}
@@ -78,5 +79,20 @@ func TestNlbwTopLimits(t *testing.T) {
 func TestNlbwParseRejectsGarbage(t *testing.T) {
 	if _, err := nlbwParse([]byte("nlbw: no database")); err == nil {
 		t.Fatal("expected an error")
+	}
+}
+
+// A device whose first row carries no address still gets one from a later
+// row, so the card can label it by IP instead of falling back to the MAC.
+func TestNlbwDeviceTakesFirstNonEmptyIP(t *testing.T) {
+	const doc = `{"columns":["mac","ip","conns","rx_bytes","rx_pkts","tx_bytes","tx_pkts"],
+	 "data":[["02:00:00:00:00:07","",3,10,1,5,1],
+	         ["02:00:00:00:00:07","192.0.2.77",4,20,1,5,1]]}`
+	got := nlbwTop(nlbwAggregate(rowsFrom(t, doc), deviceKey), 0)
+	if len(got) != 1 || got[0].IP != "192.0.2.77" {
+		t.Fatalf("ip: %+v", got)
+	}
+	if got[0].DownBytes != 30 {
+		t.Fatalf("bytes should still add up: %+v", got[0])
 	}
 }

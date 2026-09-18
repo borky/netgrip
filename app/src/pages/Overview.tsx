@@ -440,22 +440,30 @@ function TopConsumersCard({ clients, onNavigate }: { clients?: Client[]; onNavig
   const totalAll = chart?.series.reduce((acc, s) => acc + s.bytes[s.bytes.length - 1], 0) ?? 0;
 
   const clientTop = useMemo(() => {
-    if (chart || !clients) return null;
+    if (!clients) return null;
     const withBytes = clients.filter((c) => c.rx_bytes + c.tx_bytes > 0);
     if (withBytes.length === 0) return null;
     return [...withBytes].sort((a, b) => b.rx_bytes + b.tx_bytes - (a.rx_bytes + a.tx_bytes)).slice(0, 5);
-  }, [chart, clients]);
+  }, [clients]);
 
   /** Devices as nlbwmon accounts them, named from the client list when the
    *  MAC is one we know. Preferred over the wireless counters because it
    *  covers every client, not just the stations of this router. */
   const usageTop = useMemo(() => {
     if (!top?.devices?.length) return null;
-    const nameOf = new Map((clients ?? []).map((c) => [c.mac.toLowerCase(), c.name || c.ip || c.mac]));
+    // A client with nothing better carries its own MAC as its name, so a
+    // hit here can still be a MAC. Drop those: an address reads better.
+    const nameOf = new Map(
+      (clients ?? [])
+        .filter((c) => c.name && c.name.toLowerCase() !== c.mac.toLowerCase())
+        .map((c) => [c.mac.toLowerCase(), c.name]),
+    );
     const max = top.devices[0].down_bytes + top.devices[0].up_bytes || 1;
     return top.devices.slice(0, 5).map((d) => ({
       key: d.key,
-      label: nameOf.get(d.key.toLowerCase()) ?? d.ip ?? d.key,
+      // || and not ??: an empty ip must fall through to the MAC, and ??
+      // only catches null/undefined, which would leave the row blank.
+      label: nameOf.get(d.key.toLowerCase()) || d.ip || d.key,
       bytes: d.down_bytes + d.up_bytes,
       pct: ((d.down_bytes + d.up_bytes) / max) * 100,
     }));
@@ -469,12 +477,49 @@ function TopConsumersCard({ clients, onNavigate }: { clients?: Client[]; onNavig
       }))
     : null;
 
+  /** The device half of the card. nlbwmon covers every client; the
+   *  wireless counters only this router's own stations, so they are the
+   *  fallback for a router without nlbwmon. */
+  const deviceRows = useMemo(() => {
+    if (usageTop) return usageTop;
+    if (!clientTop) return null;
+    const max = clientTop[0].rx_bytes + clientTop[0].tx_bytes || 1;
+    return clientTop.map((c) => {
+      const bytes = c.rx_bytes + c.tx_bytes;
+      return { key: c.mac, label: c.name || c.mac, bytes, pct: (bytes / max) * 100 };
+    });
+  }, [usageTop, clientTop]);
+
+  const appRows = top?.apps?.length ? top.apps.slice(0, 6) : null;
+  const hasAnything = deviceRows || multiSeries || appRows;
+
   return (
     <Card index={3} className="md:col-span-12 order-7 md:order-none"
       title={oneLine(t("overview.topConsumers"))} icon={ChartColumn} iconTone="teal" help="dpi">
+      {/* Devices — the half the title promises and the port chart can never
+          show. nlbwmon covers wired clients and anything behind a switch;
+          the wireless counters only this router's own stations. */}
+      {deviceRows && (
+        <div className="space-y-2.5">
+          {deviceRows.map((d) => (
+            <div key={d.key}>
+              <div className="flex justify-between text-small mb-1">
+                <span className="font-medium truncate" translate="no">{d.label}</span>
+                <span className="text-muted" style={{ fontVariantNumeric: "tabular-nums" }}>{fmtBytes(d.bytes)}</span>
+              </div>
+              <div className="h-1.5 rounded-full bg-surface-2 overflow-hidden">
+                <div className="h-full rounded-full bg-accent transition-[width] duration-500" style={{ width: `${d.pct}%` }} />
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Apps — the conntrack series when there is one, otherwise the
+          protocols nlbwmon named. Both are kept: the series shows change
+          over time, nlbwmon shows the totals with recognisable names. */}
       {multiSeries ? (
-        <>
-          {/* Leyenda */}
+        <div className={deviceRows ? "mt-4 border-t border-border/50 pt-3" : ""}>
           <div className="flex flex-wrap items-center gap-x-4 gap-y-1 mb-2">
             {multiSeries.map((s) => (
               <span key={s.key} className="inline-flex items-center gap-1.5 text-caption">
@@ -485,7 +530,6 @@ function TopConsumersCard({ clients, onNavigate }: { clients?: Client[]; onNavig
           </div>
           <MultiSeriesChart series={multiSeries} xLabels={chart!.xLabels} height={220}
             ariaLabel={t("overview.topConsumers")} />
-          {/* Ranking compacto */}
           <div className="mt-4 grid gap-x-4 gap-y-2 sm:grid-cols-2">
             {chart!.series.map((s, i) => {
               const val = s.bytes[s.bytes.length - 1];
@@ -500,58 +544,26 @@ function TopConsumersCard({ clients, onNavigate }: { clients?: Client[]; onNavig
               );
             })}
           </div>
-        </>
-      ) : usageTop ? (
-        <>
-          <div className="space-y-2.5">
-            {usageTop.map((d) => (
-              <div key={d.key}>
-                <div className="flex justify-between text-small mb-1">
-                  <span className="font-medium truncate" translate="no">{d.label}</span>
-                  <span className="text-muted" style={{ fontVariantNumeric: "tabular-nums" }}>{fmtBytes(d.bytes)}</span>
-                </div>
-                <div className="h-1.5 rounded-full bg-surface-2 overflow-hidden">
-                  <div className="h-full rounded-full bg-accent transition-[width] duration-500" style={{ width: `${d.pct}%` }} />
-                </div>
+        </div>
+      ) : appRows ? (
+        <div className={deviceRows ? "mt-4 border-t border-border/50 pt-3" : ""}>
+          <div className="text-caption text-muted mb-2">{t("overview.byProtocol")}</div>
+          <div className="grid gap-x-4 gap-y-1.5 sm:grid-cols-2">
+            {appRows.map((a) => (
+              <div key={a.key} className="flex items-center gap-2 text-small">
+                <span className="flex-1 truncate font-medium">{a.key}</span>
+                <span className="text-muted" style={{ fontVariantNumeric: "tabular-nums" }}>
+                  {fmtBytes(a.down_bytes + a.up_bytes)}
+                </span>
               </div>
             ))}
           </div>
-          {top!.apps.length > 0 && (
-            <div className="mt-4 border-t border-border/50 pt-3">
-              <div className="text-caption text-muted mb-2">{t("overview.byProtocol")}</div>
-              <div className="grid gap-x-4 gap-y-1.5 sm:grid-cols-2">
-                {top!.apps.slice(0, 6).map((a) => (
-                  <div key={a.key} className="flex items-center gap-2 text-small">
-                    <span className="flex-1 truncate font-medium">{a.key}</span>
-                    <span className="text-muted" style={{ fontVariantNumeric: "tabular-nums" }}>
-                      {fmtBytes(a.down_bytes + a.up_bytes)}
-                    </span>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-          <p className="mt-3 text-caption text-faint">{t("overview.usagePeriod")}</p>
-        </>
-      ) : clientTop ? (
-        <div className="space-y-2.5">
-          {clientTop.map((c) => {
-            const bytes = c.rx_bytes + c.tx_bytes;
-            const max = clientTop[0].rx_bytes + clientTop[0].tx_bytes || 1;
-            return (
-              <div key={c.mac}>
-                <div className="flex justify-between text-small mb-1">
-                  <span className="font-medium truncate">{c.name || c.mac}</span>
-                  <span className="text-muted" style={{ fontVariantNumeric: "tabular-nums" }}>{fmtBytes(bytes)}</span>
-                </div>
-                <div className="h-1.5 rounded-full bg-surface-2 overflow-hidden">
-                  <div className="h-full rounded-full bg-accent transition-[width] duration-500" style={{ width: `${(bytes / max) * 100}%` }} />
-                </div>
-              </div>
-            );
-          })}
         </div>
-      ) : probe || clients ? (
+      ) : null}
+
+      {usageTop && <p className="mt-3 text-caption text-faint">{t("overview.usagePeriod")}</p>}
+
+      {!hasAnything && (probe || clients ? (
         <EmptyState small
           illustration={<IlluDevices size={120} />}
           title={t("overview.dpiEmpty")}
@@ -560,7 +572,7 @@ function TopConsumersCard({ clients, onNavigate }: { clients?: Client[]; onNavig
         />
       ) : (
         <SkeletonChart height={220} />
-      )}
+      ))}
     </Card>
   );
 }
