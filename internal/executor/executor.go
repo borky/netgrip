@@ -323,12 +323,36 @@ func Restore(config, content string) error {
 	return Run(Op{Kind: "uci_commit", Args: []string{config}})
 }
 
+// rcdDir holds the boot symlinks; a var so tests can point it elsewhere.
+var rcdDir = "/etc/rc.d"
+
+var reBootLink = regexp.MustCompile(`^S\d+(.+)$`)
+
 // ServiceEnabled reports whether an init.d service is enabled.
+//
+// Asking the init script costs about 160 ms, because `enabled` sources
+// OpenWrt's whole init framework before answering — and all it does then is
+// test for the service's boot symlink. Reading the directory instead gives
+// the same answer for nothing, which matters because this sits on polled
+// paths: two of these calls were most of the cost of listing the clients,
+// every three seconds.
+//
+// Falls back to the init script when there is no such directory, so this
+// still answers correctly off OpenWrt.
 func ServiceEnabled(name string) bool {
 	if !reService.MatchString(name) {
 		return false
 	}
-	return exec.Command("/etc/init.d/"+name, "enabled").Run() == nil
+	entries, err := os.ReadDir(rcdDir)
+	if err != nil {
+		return exec.Command("/etc/init.d/"+name, "enabled").Run() == nil
+	}
+	for _, e := range entries {
+		if m := reBootLink.FindStringSubmatch(e.Name()); m != nil && m[1] == name {
+			return true
+		}
+	}
+	return false
 }
 
 // ServiceRunning reports whether an init.d service is running.

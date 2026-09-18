@@ -348,21 +348,31 @@ type dhcpReservation struct {
 // entry's name and address.
 func dhcpReservations() map[string]dhcpReservation {
 	res := map[string]dhcpReservation{}
-	local, err := exec.Command("sh", "-c", "uci show dhcp | grep '=host' | cut -d. -f2 | cut -d= -f1").Output()
-	if err == nil && len(strings.Fields(string(local))) > 0 {
-		for _, section := range strings.Fields(string(local)) {
-			entry := dhcpReservation{
-				Name: uciGet("dhcp." + section + ".name"),
-				IP:   uciGet("dhcp." + section + ".ip"),
+	// One read of the whole config, parsed here. Listing the sections and
+	// then asking `uci get` for each name, address and MAC meant three
+	// forks per reservation — a quarter of a second on a router with a
+	// couple of dozen of them, on a listing that is polled every few
+	// seconds.
+	if out, err := exec.Command("uci", "show", "dhcp").Output(); err == nil {
+		for section, sec := range parseUCIShow(string(out), "dhcp") {
+			if sec.Type != "host" {
+				continue
 			}
-			// A list option comes back space separated; each MAC is its own key.
-			for _, mac := range strings.Fields(strings.ToLower(uciGet("dhcp." + section + ".mac"))) {
-				if mac != "" {
-					res[mac] = entry
+			_ = section
+			entry := dhcpReservation{Name: sec.Option("name"), IP: sec.Option("ip")}
+			// The MAC option can be a list (the GL firmware writes one),
+			// and `uci show` prints a list on a single line.
+			for _, raw := range sec.Options["mac"] {
+				for _, mac := range strings.Fields(strings.ToLower(strings.ReplaceAll(raw, "'", " "))) {
+					if mac != "" {
+						res[mac] = entry
+					}
 				}
 			}
 		}
-		return res
+		if len(res) > 0 {
+			return res
+		}
 	}
 	// Fallback: parse the gateway's /etc/config/dhcp host blocks.
 	out, err := gatewaySSH("cat /etc/config/dhcp")
@@ -417,24 +427,31 @@ func dhcpReservations() map[string]dhcpReservation {
 func blockedBands() (denied map[string]map[string]bool, avail map[string]bool) {
 	denied = map[string]map[string]bool{}
 	avail = map[string]bool{}
-	out, err := exec.Command("sh", "-c", "uci show wireless | grep '=wifi-iface' | cut -d. -f2 | cut -d= -f1").Output()
+	// One read of the whole config: asking `uci get` for the radio, the
+	// band, the filter mode and the list of each wireless interface meant
+	// four forks per interface, on a listing polled every few seconds.
+	out, err := exec.Command("uci", "show", "wireless").Output()
 	if err != nil {
 		return denied, avail
 	}
-	for _, section := range strings.Fields(string(out)) {
-		radio := uciGet("wireless." + section + ".device")
+	sections := parseUCIShow(string(out), "wireless")
+	for _, sec := range sections {
+		if sec.Type != "wifi-iface" {
+			continue
+		}
+		radio := sec.Option("device")
 		if radio == "" {
 			continue
 		}
-		band := uciGet("wireless." + radio + ".band")
+		band := sections[radio].Option("band")
 		if band == "" {
 			continue
 		}
 		avail[band] = true
-		if uciGet("wireless."+section+".macfilter") != "deny" {
+		if sec.Option("macfilter") != "deny" {
 			continue
 		}
-		for _, mac := range strings.Fields(strings.ToLower(uciGet("wireless." + section + ".maclist"))) {
+		for _, mac := range strings.Fields(strings.ToLower(strings.ReplaceAll(strings.Join(sec.Options["maclist"], " "), "'", " "))) {
 			if !reMac.MatchString(mac) {
 				continue
 			}
