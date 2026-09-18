@@ -347,6 +347,7 @@ export default {
     allGood: "¡Todo en orden!",
     uptime: "Conectada desde hace {{s}} s",
     uptimeLabel: "Tiempo conectado",
+    editingIface: "Ajustes de {{iface}}, la conexión en uso",
     configTitle: "Configuración de la conexión",
     proto: "Protocolo",
     protoDhcp: "DHCP",

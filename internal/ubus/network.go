@@ -107,6 +107,35 @@ func (s interfaceStatus) defaultRouteMetric() int {
 // section of its own, and callers use this name to read and write
 // network.<name>.
 func pickWanInterface(ifaces []interfaceStatus) (iface interfaceStatus, ok bool) {
+	return pickWanInterfacePreferring(ifaces, "")
+}
+
+// ActiveUplinkResolver, when set, names the uplink a policy manager is
+// steering traffic through. Under mwan3 the kernel's routes are left alone
+// and traffic is directed by marks instead, so the route table still points
+// at whichever uplink has the lowest metric while the traffic — and the
+// public address the world sees — goes somewhere else entirely. The modules
+// layer fills this in; nothing in this package knows what mwan3 is.
+var ActiveUplinkResolver func() string
+
+func preferredUplink() string {
+	if ActiveUplinkResolver == nil {
+		return ""
+	}
+	return ActiveUplinkResolver()
+}
+
+// pickWanInterfacePreferring is pickWanInterface with an answer supplied
+// from outside. A named uplink wins over the route table whenever it exists
+// and is up; everything else falls through to the metric comparison.
+func pickWanInterfacePreferring(ifaces []interfaceStatus, preferred string) (iface interfaceStatus, ok bool) {
+	if preferred != "" {
+		for _, i := range ifaces {
+			if i.Interface == preferred {
+				return withChildFacts(i, ifaces), true
+			}
+		}
+	}
 	best, bestMetric, found := interfaceStatus{}, math.MaxInt, false
 	for _, i := range ifaces {
 		if !i.Up || !i.hasDefaultRoute() {
@@ -127,6 +156,33 @@ func pickWanInterface(ifaces []interfaceStatus) (iface interfaceStatus, ok bool)
 	return interfaceStatus{}, false
 }
 
+// withChildFacts gives a parent interface whatever its runtime children
+// hold: a modem uplink keeps its address, route and DNS on a child that has
+// no configuration of its own.
+func withChildFacts(parent interfaceStatus, ifaces []interfaceStatus) interfaceStatus {
+	if parent.Dynamic || parent.L3Device == "" {
+		return parent
+	}
+	for _, c := range ifaces {
+		if !c.Dynamic || c.L3Device != parent.L3Device {
+			continue
+		}
+		if len(parent.IPv4) == 0 {
+			parent.IPv4 = c.IPv4
+		}
+		if len(parent.Route) == 0 {
+			parent.Route = c.Route
+		}
+		if len(parent.DNS) == 0 {
+			parent.DNS = c.DNS
+		}
+		if parent.Uptime == 0 {
+			parent.Uptime = c.Uptime
+		}
+	}
+	return parent
+}
+
 // parentOf maps a netifd-created child back to the interface that owns it,
 // matched on the L3 device they share, and merges what the child knows (its
 // address, route and DNS) into the parent, which has none of its own. A
@@ -139,30 +195,21 @@ func parentOf(child interfaceStatus, ifaces []interfaceStatus) interfaceStatus {
 		if p.Dynamic || p.Interface == child.Interface || p.L3Device != child.L3Device {
 			continue
 		}
-		merged := p
-		if len(merged.IPv4) == 0 {
-			merged.IPv4 = child.IPv4
-		}
-		if len(merged.Route) == 0 {
-			merged.Route = child.Route
-		}
-		if len(merged.DNS) == 0 {
-			merged.DNS = child.DNS
-		}
-		if merged.Uptime == 0 {
-			merged.Uptime = child.Uptime
-		}
-		return merged
+		return withChildFacts(p, ifaces)
 	}
 	return child
 }
 
 func buildWanStatus(raw []byte) (*WanStatus, error) {
+	return buildWanStatusPreferring(raw, "")
+}
+
+func buildWanStatusPreferring(raw []byte, preferred string) (*WanStatus, error) {
 	var dump interfaceDump
 	if err := json.Unmarshal(raw, &dump); err != nil {
 		return nil, err
 	}
-	iface, ok := pickWanInterface(dump.Interface)
+	iface, ok := pickWanInterfacePreferring(dump.Interface, preferred)
 	if !ok {
 		return &WanStatus{Present: false, IPv4: []string{}, DNS: []string{}}, nil
 	}
@@ -257,7 +304,7 @@ func GetWanStatus() (*WanStatus, error) {
 	if err != nil {
 		return &WanStatus{Present: false, IPv4: []string{}, DNS: []string{}}, nil
 	}
-	return buildWanStatus(raw)
+	return buildWanStatusPreferring(raw, preferredUplink())
 }
 
 // activeWANInterface runs the same dump+pick GetWanStatus uses, for callers
@@ -271,7 +318,7 @@ func activeWANInterface() (interfaceStatus, bool) {
 	if err := json.Unmarshal(raw, &dump); err != nil {
 		return interfaceStatus{}, false
 	}
-	return pickWanInterface(dump.Interface)
+	return pickWanInterfacePreferring(dump.Interface, preferredUplink())
 }
 
 // ActiveWANInterfaceName returns the UCI section name (network.<name>) of
@@ -288,6 +335,21 @@ func ActiveWANInterfaceName() string {
 		return iface.Interface
 	}
 	return "wan"
+}
+
+// ActiveWANL3Device returns the layer-3 device traffic actually leaves
+// through on the active uplink ("pppoe-isp", "wwan0"), which is the one to
+// attach shaping or counters to. ActiveWANDevice gives the physical port
+// underneath it instead, and on a PPPoE or modem uplink the two differ.
+func ActiveWANL3Device() string {
+	iface, ok := activeWANInterface()
+	if !ok {
+		return ""
+	}
+	if iface.L3Device != "" {
+		return iface.L3Device
+	}
+	return iface.Device
 }
 
 // ActiveWANDevice returns the raw device (e.g. "lan1", "eth1.7",
