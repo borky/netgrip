@@ -1,6 +1,9 @@
 export class UnauthorizedError extends Error {}
 
 export interface WANConfig {
+  /** Which interface these settings belong to. Read-only: with several
+   *  uplinks it follows the one in use, and the card says so. */
+  iface?: string;
   proto: "dhcp" | "static" | "pppoe";
   device?: string;
   ipaddr?: string;

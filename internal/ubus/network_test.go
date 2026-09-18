@@ -354,3 +354,44 @@ func TestParseInterfaceDumpKeepsUplinkFields(t *testing.T) {
 		t.Fatalf("child IPv4 = %v", child.IPv4)
 	}
 }
+
+// A policy manager can send traffic through an uplink that does not hold
+// the cheapest route. When it says so, that is the WAN: the address the
+// world sees is that one's, and showing the other is simply wrong.
+func TestPickWanInterfaceFollowsAnExternalAnswer(t *testing.T) {
+	var dump interfaceDump
+	if err := json.Unmarshal([]byte(dumpTwoUplinksByMetric), &dump); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	iface, ok := pickWanInterfacePreferring(dump.Interface, "backup")
+	if !ok || iface.Interface != "backup" {
+		t.Fatalf("picked %q, want the uplink the policy names", iface.Interface)
+	}
+	if iface.defaultGateway() != "198.51.100.1" {
+		t.Fatalf("gateway = %q, want the named uplink's", iface.defaultGateway())
+	}
+	// An answer naming something that is not there falls back to the route
+	// table rather than reporting no WAN at all.
+	if iface, ok := pickWanInterfacePreferring(dump.Interface, "gone"); !ok || iface.Interface != "fiber" {
+		t.Fatalf("picked %q, want the routed uplink as a fallback", iface.Interface)
+	}
+}
+
+// A modem uplink keeps its address on a runtime child, so naming the parent
+// has to bring those facts along or the card shows a blank connection.
+func TestPreferredModemUplinkCarriesItsChildsAddress(t *testing.T) {
+	var dump interfaceDump
+	if err := json.Unmarshal([]byte(dumpModemWithDynamicChild), &dump); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	status, err := buildWanStatusPreferring([]byte(dumpModemWithDynamicChild), "cell")
+	if err != nil {
+		t.Fatalf("buildWanStatus: %v", err)
+	}
+	if len(status.IPv4) != 1 || status.IPv4[0] != "192.0.2.77" {
+		t.Fatalf("IPv4 = %v, want the address traffic actually leaves from", status.IPv4)
+	}
+	if status.Gateway != "192.0.2.78" || len(status.DNS) != 1 {
+		t.Fatalf("status = %+v", status)
+	}
+}
