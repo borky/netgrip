@@ -14,11 +14,14 @@
 package modules
 
 import (
+	"fmt"
+	"os"
 	"os/exec"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gnacho/netgrip/internal/executor"
 	"github.com/gnacho/netgrip/internal/ubus"
@@ -330,6 +333,10 @@ type mwanConfig struct {
 	// Ifaces lists the interface sections, whether netgrip wrote them and
 	// what they track.
 	Ifaces map[string]mwanIface
+	// All maps every section name to its type. `uci delete` fails on a
+	// missing entry and takes the whole apply down with it, so nothing is
+	// deleted without looking here first.
+	All map[string]string
 }
 
 type mwanMember struct {
@@ -355,10 +362,12 @@ func readMwanConfig(show string) mwanConfig {
 		Members: map[string]mwanMember{},
 		Ifaces:  map[string]mwanIface{},
 		Foreign: []string{},
+		All:     map[string]string{},
 	}
 	ours, foreign := 0, 0
 	for name, sec := range parseUCIShow(show, mwanPkg) {
 		isOurs := strings.HasPrefix(name, mwanPrefix)
+		cfg.All[name] = sec.Type
 		switch sec.Type {
 		case "interface":
 			cfg.Ifaces[name] = mwanIface{
@@ -595,7 +604,7 @@ func wanCandidates() []WanCandidate {
 func ProbeMultiWAN() *MultiWanProbe {
 	candidates := wanCandidates()
 	installed := pkgInstalled(mwanPkg)
-	cfg := mwanConfig{Mode: MWModeOff, Members: map[string]mwanMember{}, Ifaces: map[string]mwanIface{}, Foreign: []string{}}
+	cfg := mwanConfig{Mode: MWModeOff, Members: map[string]mwanMember{}, Ifaces: map[string]mwanIface{}, Foreign: []string{}, All: map[string]string{}}
 	live := map[string]mwanLive{}
 	policy, shares := "", map[string]int{}
 	configPresent := false
@@ -615,4 +624,410 @@ func ProbeMultiWAN() *MultiWanProbe {
 	}
 	return buildMultiWanProbe(candidates, installed, installed && executor.ServiceEnabled(mwanPkg),
 		running, configPresent, cfg, live, policy, shares)
+}
+
+// ---------------------------------------------------------------------------
+// Writing: what the two modes mean in mwan3's own terms
+// ---------------------------------------------------------------------------
+
+// MultiWanRequest is what the panel asks for. Weights and Balance only mean
+// anything in balance mode; Primary only in failover.
+type MultiWanRequest struct {
+	Mode           string              `json:"mode"`
+	Primary        string              `json:"primary"`
+	Weights        map[string]int      `json:"weights"`
+	Balance        map[string]bool     `json:"balance"`
+	Track          map[string][]string `json:"track"`
+	ConfirmForeign bool                `json:"confirm_foreign"`
+}
+
+// mwanPlan is the resolved intent: exactly which sections will exist
+// afterwards. Building it is pure, so both modes can be asserted without a
+// router anywhere near them.
+type mwanPlan struct {
+	Mode    string
+	Ifaces  []mwanPlanIface
+	Members []mwanPlanMember
+	Sticky  bool
+}
+
+type mwanPlanIface struct {
+	Name  string
+	Track []string
+}
+
+type mwanPlanMember struct {
+	Iface  string
+	Metric int
+	Weight int
+}
+
+// Tracking probe timings. Five failed probes ten seconds apart before a link
+// is declared down: long enough that a PPPoE renegotiation does not trip a
+// failover, short enough that a real outage moves within a minute.
+const (
+	mwanTrackCount    = "1"
+	mwanTrackSize     = "56"
+	mwanTrackTTL      = "60"
+	mwanTrackTimeout  = "4"
+	mwanTrackInterval = "10"
+	mwanTrackFailInt  = "5"
+	mwanTrackRecInt   = "5"
+	mwanTrackDown     = "5"
+	mwanTrackUp       = "3"
+	mwanStickyTimeout = "600"
+)
+
+var reIPv4Only = regexp.MustCompile(`^(\d{1,3}\.){3}\d{1,3}$`)
+
+// buildMwanPlan validates the request against what the router actually has
+// and resolves it into sections. Returns an error the panel can show as-is.
+func buildMwanPlan(req MultiWanRequest, candidates []WanCandidate) (mwanPlan, error) {
+	plan := mwanPlan{Mode: req.Mode}
+	switch req.Mode {
+	case MWModeOff:
+		return plan, nil
+	case MWModeFailover, MWModeBalance:
+	default:
+		return plan, fmt.Errorf("unknown mode %q", req.Mode)
+	}
+	if len(candidates) < 2 {
+		return plan, fmt.Errorf("multi-WAN needs two internet connections; this router has %d", len(candidates))
+	}
+
+	byName := map[string]WanCandidate{}
+	order := []string{}
+	for _, c := range candidates {
+		byName[c.Name] = c
+		order = append(order, c.Name)
+	}
+	sort.Strings(order)
+
+	for name, ips := range req.Track {
+		if _, ok := byName[name]; !ok {
+			return plan, fmt.Errorf("%q is not an internet connection on this router", name)
+		}
+		if len(ips) > 4 {
+			return plan, fmt.Errorf("at most four tracking addresses per connection")
+		}
+		for _, ip := range ips {
+			if !reIPv4Only.MatchString(ip) {
+				return plan, fmt.Errorf("%q is not an IPv4 address", ip)
+			}
+		}
+	}
+
+	if req.Mode == MWModeFailover {
+		if req.Primary == "" {
+			return plan, fmt.Errorf("choose which connection is the main one")
+		}
+		if _, ok := byName[req.Primary]; !ok {
+			return plan, fmt.Errorf("%q is not an internet connection on this router", req.Primary)
+		}
+		// The main one first, then the rest as fallbacks in a stable order.
+		// Distinct metrics are what makes mwan3 treat them as an order of
+		// preference rather than a pool.
+		metric := 1
+		plan.Members = append(plan.Members, mwanPlanMember{Iface: req.Primary, Metric: metric, Weight: 1})
+		for _, name := range order {
+			if name == req.Primary {
+				continue
+			}
+			metric++
+			plan.Members = append(plan.Members, mwanPlanMember{Iface: name, Metric: metric, Weight: 1})
+		}
+	} else {
+		if req.Primary != "" {
+			return plan, fmt.Errorf("a main connection cannot be chosen while balancing")
+		}
+		included := 0
+		for _, name := range order {
+			c := byName[name]
+			// A metered link stays out of the pool unless it is asked for
+			// by name: balancing onto mobile data costs money.
+			use := !c.Metered
+			if v, ok := req.Balance[name]; ok {
+				use = v
+			}
+			weight := 1
+			if w, ok := req.Weights[name]; ok {
+				weight = w
+			}
+			if weight < 1 || weight > 10 {
+				return plan, fmt.Errorf("the share of %q must be between 1 and 10", name)
+			}
+			if use {
+				included++
+				plan.Members = append(plan.Members, mwanPlanMember{Iface: name, Metric: 1, Weight: weight})
+			} else {
+				// Kept as a fallback rather than dropped: a link excluded
+				// from the pool should still save the house when the pool
+				// goes down.
+				plan.Members = append(plan.Members, mwanPlanMember{Iface: name, Metric: 2, Weight: 1})
+			}
+		}
+		if included == 0 {
+			return plan, fmt.Errorf("at least one connection has to carry traffic")
+		}
+		// Flows stay on the link they started on: alternating source
+		// addresses mid-session breaks logins and video calls.
+		plan.Sticky = true
+	}
+
+	for _, m := range plan.Members {
+		c := byName[m.Iface]
+		track := c.Track
+		if v, ok := req.Track[m.Iface]; ok && len(v) > 0 {
+			track = v
+		}
+		if len(track) == 0 {
+			track = defaultTrackIPs
+		}
+		plan.Ifaces = append(plan.Ifaces, mwanPlanIface{Name: m.Iface, Track: track})
+	}
+	return plan, nil
+}
+
+// teardownOps removes what netgrip put in mwan3, newest reference first so a
+// half-applied state never leaves a policy pointing at a member that is
+// gone. Only sections that exist are deleted: `uci delete` fails on a
+// missing entry, and that failure would abort the whole apply.
+func teardownOps(cfg mwanConfig) []executor.Op {
+	ops := []executor.Op{}
+	del := func(name string) {
+		if _, ok := cfg.All[name]; ok {
+			ops = append(ops, executor.Op{Kind: "uci_delete", Args: []string{mwanPkg + "." + name}})
+		}
+	}
+	// Rules first (they are what actually steers traffic), then policies,
+	// then the members they name.
+	for _, name := range sortedNames(cfg.All, "rule") {
+		if strings.HasPrefix(name, mwanPrefix) {
+			del(name)
+		}
+	}
+	for _, name := range sortedNames(cfg.All, "policy") {
+		if strings.HasPrefix(name, mwanPrefix) {
+			del(name)
+		}
+	}
+	for _, name := range sortedNames(cfg.All, "member") {
+		if strings.HasPrefix(name, mwanPrefix) {
+			del(name)
+		}
+	}
+	return ops
+}
+
+func sortedNames(all map[string]string, typ string) []string {
+	out := []string{}
+	for name, t := range all {
+		if t == typ {
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// buildMwanOps turns a plan into the ops that realise it. Interface sections
+// are written in place rather than deleted and recreated: recreating one
+// makes mwan3 bring the interface up again on restart, and that is the one
+// thing that can drop a live connection.
+func buildMwanOps(plan mwanPlan, cfg mwanConfig) []executor.Op {
+	ops := teardownOps(cfg)
+	set := func(key, val string) {
+		ops = append(ops, executor.Op{Kind: "uci_set", Args: []string{mwanPkg + "." + key, val}})
+	}
+	addList := func(key, val string) {
+		ops = append(ops, executor.Op{Kind: "uci_add_list", Args: []string{mwanPkg + "." + key, val}})
+	}
+
+	if plan.Mode != MWModeOff {
+		// mwan3 needs a globals section to exist. Never touch an existing
+		// one: its mark mask is shared with the firewall.
+		if _, ok := cfg.All["globals"]; !ok {
+			set("globals", "globals")
+			set("globals.netgrip_created", "1")
+		}
+		for _, ifc := range plan.Ifaces {
+			base := ifc.Name
+			if cfg.All[base] != "interface" {
+				set(base, "interface")
+			}
+			set(base+".enabled", "1")
+			// Usable before the first probe lands, so applying this does
+			// not black out a working link for one tracking interval.
+			set(base+".initial_state", "online")
+			set(base+".family", "ipv4")
+			set(base+".track_method", "ping")
+			set(base+".reliability", "1")
+			set(base+".count", mwanTrackCount)
+			set(base+".size", mwanTrackSize)
+			set(base+".max_ttl", mwanTrackTTL)
+			set(base+".timeout", mwanTrackTimeout)
+			set(base+".interval", mwanTrackInterval)
+			set(base+".failure_interval", mwanTrackFailInt)
+			set(base+".recovery_interval", mwanTrackRecInt)
+			set(base+".down", mwanTrackDown)
+			set(base+".up", mwanTrackUp)
+			set(base+"."+mwanManagedOpt, "1")
+			if len(cfg.Ifaces[base].Track) > 0 {
+				ops = append(ops, executor.Op{Kind: "uci_delete", Args: []string{mwanPkg + "." + base + ".track_ip"}})
+			}
+			for _, ip := range ifc.Track {
+				addList(base+".track_ip", ip)
+			}
+		}
+		for _, m := range plan.Members {
+			name := mwanMemberPrefix + sanitizeUCIKey(m.Iface)
+			set(name, "member")
+			set(name+".interface", m.Iface)
+			set(name+".metric", strconv.Itoa(m.Metric))
+			set(name+".weight", strconv.Itoa(m.Weight))
+		}
+		set(mwanPolicyName, "policy")
+		for _, m := range plan.Members {
+			addList(mwanPolicyName+".use_member", mwanMemberPrefix+sanitizeUCIKey(m.Iface))
+		}
+		// Without a last resort mwan3 lets traffic leak out of the default
+		// route when every member is down, which looks like a working
+		// connection that silently ignores the policy.
+		set(mwanPolicyName+".last_resort", "unreachable")
+
+		set(mwanRuleName, "rule")
+		set(mwanRuleName+".dest_ip", "0.0.0.0/0")
+		set(mwanRuleName+".proto", "all")
+		if plan.Sticky {
+			set(mwanRuleName+".sticky", "1")
+			set(mwanRuleName+".sticky_timeout", mwanStickyTimeout)
+		} else {
+			set(mwanRuleName+".sticky", "0")
+		}
+		set(mwanRuleName+".use_policy", mwanPolicyName)
+	}
+
+	ops = append(ops, executor.Op{Kind: "uci_commit", Args: []string{mwanPkg}})
+	if plan.Mode == MWModeOff {
+		ops = append(ops,
+			executor.Op{Kind: "initd", Args: []string{mwanPkg, "stop"}},
+			executor.Op{Kind: "initd", Args: []string{mwanPkg, "disable"}},
+		)
+	} else {
+		ops = append(ops,
+			executor.Op{Kind: "initd", Args: []string{mwanPkg, "enable"}},
+			executor.Op{Kind: "initd", Args: []string{mwanPkg, "restart"}},
+		)
+	}
+	return ops
+}
+
+// ApplyMultiWAN puts the router into the requested mode.
+//
+// The sequence is the house one — gate, snapshot, apply, prove it worked,
+// roll back if it did not — with one addition that matters here: the proof
+// includes the internet still being reachable. Every other module can be
+// wrong and leave the user annoyed; this one can be wrong and leave the
+// house offline.
+func ApplyMultiWAN(req MultiWanRequest) (*MultiWanProbe, bool, error) {
+	probe := ProbeMultiWAN()
+	if !probe.Installed {
+		return probe, false, fmt.Errorf("the multi-WAN manager is not installed")
+	}
+	// A configuration set up elsewhere is never silently replaced.
+	if probe.Foreign && !req.ConfirmForeign {
+		return probe, false, fmt.Errorf("%s%s", errForeignPrefix, strings.Join(probe.ForeignSections, ", "))
+	}
+	if probe.Foreign && req.ConfirmForeign {
+		return probe, false, fmt.Errorf("taking over an existing multi-WAN setup is not supported yet")
+	}
+
+	plan, err := buildMwanPlan(req, probe.Candidates)
+	if err != nil {
+		return probe, false, err
+	}
+
+	show, _ := exec.Command("uci", "show", mwanPkg).Output()
+	cfg := readMwanConfig(string(show))
+
+	snap := ""
+	if _, err := os.Stat("/etc/config/" + mwanPkg); err == nil {
+		if s, err := executor.Snapshot(mwanPkg); err == nil {
+			snap = s
+		}
+	}
+	rollback := func() {
+		if snap != "" {
+			_ = executor.Restore(mwanPkg, snap)
+		}
+		_ = executor.Run(executor.Op{Kind: "initd", Args: []string{mwanPkg, "restart"}})
+	}
+
+	if err := executor.Apply(buildMwanOps(plan, cfg), nil); err != nil {
+		rollback()
+		return ProbeMultiWAN(), true, err
+	}
+
+	// mwan3 needs a moment to install its rules and run a first probe.
+	time.Sleep(mwanSettle)
+	after := ProbeMultiWAN()
+	if err := mwanHealthcheck(after, plan); err != nil {
+		rollback()
+		time.Sleep(time.Second)
+		return ProbeMultiWAN(), true, err
+	}
+	return after, false, nil
+}
+
+// errForeignPrefix is matched by the panel to offer the takeover dialog
+// rather than showing a bare error.
+const errForeignPrefix = "multiwan: configured outside netgrip: "
+
+// mwanSettle is one tracking interval plus a little: long enough for the
+// first probe to have landed before the result is judged.
+var mwanSettle = 6 * time.Second
+
+// mwanHealthcheck decides whether what was just applied is working. The
+// last check is the one that matters: a config that parses, loads and
+// leaves the house with no internet is a failed apply.
+func mwanHealthcheck(after *MultiWanProbe, plan mwanPlan) error {
+	if plan.Mode == MWModeOff {
+		if after.Mode != MWModeOff {
+			return fmt.Errorf("multi-WAN is still configured after turning it off")
+		}
+		return nil
+	}
+	if !after.Running {
+		return fmt.Errorf("the multi-WAN manager did not start")
+	}
+	if after.Mode != plan.Mode {
+		return fmt.Errorf("the router reports %q after applying %q", after.Mode, plan.Mode)
+	}
+	if st, err := ubus.GetWanStatus(); err == nil && st.Present && !st.Up {
+		return fmt.Errorf("the internet connection went down applying this")
+	}
+	for _, c := range after.Candidates {
+		if c.Active {
+			return nil
+		}
+	}
+	return fmt.Errorf("no connection is carrying traffic after applying this")
+}
+
+// SetMultiWANPrimary makes one uplink the main one. It re-runs the whole
+// failover path rather than patching two metrics: which link is primary is
+// encoded entirely in those metrics, rewriting them all is idempotent, and
+// it keeps one code path carrying the healthcheck and the rollback.
+func SetMultiWANPrimary(iface string) (*MultiWanProbe, bool, error) {
+	probe := ProbeMultiWAN()
+	if probe.Mode != MWModeFailover {
+		return probe, false, fmt.Errorf("a main connection can only be chosen in failover mode")
+	}
+	track := map[string][]string{}
+	for _, c := range probe.Candidates {
+		if len(c.Track) > 0 {
+			track[c.Name] = c.Track
+		}
+	}
+	return ApplyMultiWAN(MultiWanRequest{Mode: MWModeFailover, Primary: iface, Track: track})
 }

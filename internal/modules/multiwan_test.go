@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/gnacho/netgrip/internal/executor"
 	"github.com/gnacho/netgrip/internal/ubus"
 )
 
@@ -427,5 +428,244 @@ func TestTrackListSplitsAOneLineUciList(t *testing.T) {
 	}
 	if one := cfg.Ifaces["cell"].Track; len(one) != 1 || one[0] != "198.51.100.10" {
 		t.Fatalf("a single-value option must survive unchanged: %q", one)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Planning and op building
+// ---------------------------------------------------------------------------
+
+func planFor(t *testing.T, req MultiWanRequest) mwanPlan {
+	t.Helper()
+	plan, err := buildMwanPlan(req, classifyFixture(t))
+	if err != nil {
+		t.Fatalf("buildMwanPlan: %v", err)
+	}
+	return plan
+}
+
+func opKeys(ops []executor.Op) []string {
+	out := []string{}
+	for _, o := range ops {
+		out = append(out, o.Kind+" "+strings.Join(o.Args, " "))
+	}
+	return out
+}
+
+func hasOp(ops []executor.Op, want string) bool {
+	for _, o := range opKeys(ops) {
+		if o == want {
+			return true
+		}
+	}
+	return false
+}
+
+func TestFailoverPlanOrdersByPreference(t *testing.T) {
+	plan := planFor(t, MultiWanRequest{Mode: MWModeFailover, Primary: "cell"})
+	if len(plan.Members) != 2 {
+		t.Fatalf("members = %+v", plan.Members)
+	}
+	// Distinct metrics are what make mwan3 treat these as an order rather
+	// than a pool, and the chosen one has to come first.
+	if plan.Members[0].Iface != "cell" || plan.Members[0].Metric != 1 {
+		t.Fatalf("first member = %+v, want the chosen uplink at metric 1", plan.Members[0])
+	}
+	if plan.Members[1].Iface != "fiber" || plan.Members[1].Metric != 2 {
+		t.Fatalf("second member = %+v", plan.Members[1])
+	}
+	if plan.Sticky {
+		t.Fatal("failover has one link at a time; stickiness is meaningless")
+	}
+}
+
+func TestBalancePlanKeepsAMeteredLinkOutOfThePool(t *testing.T) {
+	plan := planFor(t, MultiWanRequest{Mode: MWModeBalance})
+	var pooled, fallback []string
+	for _, m := range plan.Members {
+		if m.Metric == 1 {
+			pooled = append(pooled, m.Iface)
+		} else {
+			fallback = append(fallback, m.Iface)
+		}
+	}
+	if len(pooled) != 1 || pooled[0] != "fiber" {
+		t.Fatalf("pooled = %v, want only the unmetered link by default", pooled)
+	}
+	// Excluded, not discarded: it should still save the house if the pool
+	// goes down.
+	if len(fallback) != 1 || fallback[0] != "cell" {
+		t.Fatalf("fallback = %v, want the metered link kept as a standby", fallback)
+	}
+	if !plan.Sticky {
+		t.Fatal("balanced traffic must stay on the link a flow started on")
+	}
+}
+
+func TestBalancePlanHonoursWeightsAndOptIn(t *testing.T) {
+	plan := planFor(t, MultiWanRequest{
+		Mode:    MWModeBalance,
+		Balance: map[string]bool{"cell": true},
+		Weights: map[string]int{"fiber": 4, "cell": 1},
+	})
+	got := map[string][2]int{}
+	for _, m := range plan.Members {
+		got[m.Iface] = [2]int{m.Metric, m.Weight}
+	}
+	if got["fiber"] != [2]int{1, 4} || got["cell"] != [2]int{1, 1} {
+		t.Fatalf("members = %v, want both pooled at 4:1", got)
+	}
+}
+
+func TestPlanRejectsWhatCannotWork(t *testing.T) {
+	cands := classifyFixture(t)
+	for name, tc := range map[string]MultiWanRequest{
+		"unknown mode":                {Mode: "bonding"},
+		"no main connection chosen":   {Mode: MWModeFailover},
+		"main connection unknown":     {Mode: MWModeFailover, Primary: "dsl"},
+		"main chosen while balancing": {Mode: MWModeBalance, Primary: "fiber"},
+		"nothing left to carry it":    {Mode: MWModeBalance, Balance: map[string]bool{"fiber": false, "cell": false}},
+		"share out of range":          {Mode: MWModeBalance, Weights: map[string]int{"fiber": 99}},
+		"tracking a non-address":      {Mode: MWModeFailover, Primary: "fiber", Track: map[string][]string{"fiber": {"not-an-ip"}}},
+		"too many tracking targets": {Mode: MWModeFailover, Primary: "fiber",
+			Track: map[string][]string{"fiber": {"192.0.2.1", "192.0.2.2", "192.0.2.3", "192.0.2.4", "192.0.2.5"}}},
+		"tracking an unknown link": {Mode: MWModeFailover, Primary: "fiber", Track: map[string][]string{"dsl": {"192.0.2.1"}}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := buildMwanPlan(tc, cands); err == nil {
+				t.Fatalf("%+v was accepted", tc)
+			}
+		})
+	}
+	// And one uplink is not multi-WAN at all.
+	if _, err := buildMwanPlan(MultiWanRequest{Mode: MWModeFailover, Primary: "fiber"}, cands[:1]); err == nil {
+		t.Fatal("failover with a single uplink was accepted")
+	}
+}
+
+func TestFailoverOpsWriteTheRightSections(t *testing.T) {
+	ops := buildMwanOps(planFor(t, MultiWanRequest{Mode: MWModeFailover, Primary: "fiber"}), readMwanConfig(""))
+	for _, want := range []string{
+		"uci_set mwan3.netgrip_member_fiber.metric 1",
+		"uci_set mwan3.netgrip_member_cell.metric 2",
+		"uci_set mwan3.netgrip_policy_default.last_resort unreachable",
+		"uci_add_list mwan3.netgrip_policy_default.use_member netgrip_member_fiber",
+		"uci_set mwan3.netgrip_rule_default.use_policy netgrip_policy_default",
+		"uci_set mwan3.netgrip_rule_default.dest_ip 0.0.0.0/0",
+		"uci_set mwan3.fiber.initial_state online",
+		"uci_set mwan3.fiber." + mwanManagedOpt + " 1",
+		"uci_add_list mwan3.fiber.track_ip 1.1.1.1",
+		"uci_commit mwan3",
+		"initd mwan3 restart",
+	} {
+		if !hasOp(ops, want) {
+			t.Fatalf("missing op %q in:\n%s", want, strings.Join(opKeys(ops), "\n"))
+		}
+	}
+}
+
+// The prefix is what tells netgrip's sections from anyone else's. It cannot
+// go on interface sections — mwan3 matches those to the network interface by
+// name — so those carry a marker instead, and everything else must carry the
+// prefix.
+func TestEverySectionWeInventIsPrefixed(t *testing.T) {
+	ops := buildMwanOps(planFor(t, MultiWanRequest{Mode: MWModeBalance}), readMwanConfig(""))
+	for _, o := range ops {
+		if o.Kind != "uci_set" || len(o.Args) != 2 {
+			continue
+		}
+		section := strings.SplitN(strings.TrimPrefix(o.Args[0], mwanPkg+"."), ".", 2)[0]
+		switch o.Args[1] {
+		case "member", "policy", "rule":
+			if !strings.HasPrefix(section, mwanPrefix) {
+				t.Fatalf("section %q of type %q is not prefixed", section, o.Args[1])
+			}
+		case "interface":
+			if strings.HasPrefix(section, mwanPrefix) {
+				t.Fatalf("interface section %q must keep the network's own name", section)
+			}
+		}
+	}
+}
+
+// Bouncing the network is the one thing that can strand the user behind a
+// PPPoE link, so no op may ever do it.
+func TestOpsNeverBounceTheNetwork(t *testing.T) {
+	for _, mode := range []MultiWanRequest{
+		{Mode: MWModeFailover, Primary: "fiber"},
+		{Mode: MWModeBalance},
+		{Mode: MWModeOff},
+	} {
+		plan, err := buildMwanPlan(mode, classifyFixture(t))
+		if err != nil {
+			t.Fatalf("%v: %v", mode.Mode, err)
+		}
+		for _, o := range buildMwanOps(plan, readMwanConfig(mwanShowForeign)) {
+			if o.Kind == "ifup" || o.Kind == "ifdown" {
+				t.Fatalf("%s: %v restarts an interface", mode.Mode, o)
+			}
+			if o.Kind == "initd" && o.Args[0] != mwanPkg {
+				t.Fatalf("%s: %v touches a service other than the manager", mode.Mode, o)
+			}
+		}
+	}
+}
+
+// Every op has to survive the executor's allowlist, or it fails at the point
+// of no return instead of here.
+func TestOpsPassTheExecutorAllowlist(t *testing.T) {
+	plan := planFor(t, MultiWanRequest{Mode: MWModeFailover, Primary: "fiber"})
+	for _, o := range buildMwanOps(plan, readMwanConfig(mwanShowForeign)) {
+		if err := executor.Validate(o); err != nil {
+			t.Fatalf("%v: %v", o, err)
+		}
+	}
+}
+
+// `uci delete` fails on an entry that is not there, and that failure aborts
+// the apply, so teardown only removes what exists and only what is ours.
+func TestTeardownRemovesOnlyOurSectionsThatExist(t *testing.T) {
+	show := `mwan3.fiber=interface
+mwan3.fiber.` + mwanManagedOpt + `='1'
+mwan3.` + mwanMemberPrefix + `fiber=member
+mwan3.` + mwanMemberPrefix + `fiber.interface='fiber'
+mwan3.` + mwanPolicyName + `=policy
+mwan3.` + mwanRuleName + `=rule
+mwan3.someone_elses=member
+mwan3.someone_elses.interface='fiber'
+`
+	ops := opKeys(teardownOps(readMwanConfig(show)))
+	want := []string{
+		"uci_delete mwan3." + mwanRuleName,
+		"uci_delete mwan3." + mwanPolicyName,
+		"uci_delete mwan3." + mwanMemberPrefix + "fiber",
+	}
+	if strings.Join(ops, "|") != strings.Join(want, "|") {
+		t.Fatalf("teardown = %v, want rules then policies then members, ours only", ops)
+	}
+	for _, o := range ops {
+		if strings.Contains(o, "someone_elses") || strings.Contains(o, "mwan3.fiber") {
+			t.Fatalf("teardown touched something it does not own: %q", o)
+		}
+	}
+}
+
+// Turning it off leaves mwan3 with nothing to do and stops the service.
+func TestOffTearsDownAndStopsTheService(t *testing.T) {
+	plan, err := buildMwanPlan(MultiWanRequest{Mode: MWModeOff}, classifyFixture(t))
+	if err != nil {
+		t.Fatalf("buildMwanPlan: %v", err)
+	}
+	ops := opKeys(buildMwanOps(plan, readMwanConfig(mwanShowForeign)))
+	last := strings.Join(ops[len(ops)-3:], "|")
+	if last != "uci_commit mwan3|initd mwan3 stop|initd mwan3 disable" {
+		t.Fatalf("tail = %v", ops)
+	}
+	for _, o := range ops {
+		if strings.Contains(o, "netgrip_policy") || strings.Contains(o, "netgrip_rule") {
+			if !strings.HasPrefix(o, "uci_delete") {
+				t.Fatalf("turning it off must not write policy or rules: %q", o)
+			}
+		}
 	}
 }
