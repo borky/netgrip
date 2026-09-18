@@ -244,6 +244,10 @@ export default {
       title: "What is a LAG?",
       body: "Several cables behaving as one faster, redundant link (LACP). Useful for NAS or server uplinks; both ends must support it.",
     },
+    multiwan: {
+      title: "Two internet connections",
+      body: "With a second connection the router can keep the house online when the first one fails. Failover uses one at a time and switches over on its own; balanced shares traffic between the ones you pick. Only IPv4 is managed here, and traffic shaping still applies to a single connection.",
+    },
     portforward: {
       title: "Opening ports to the Internet",
       body: "Lets something at home (NAS, camera, game server) be reachable from outside. Open only what you must: each rule is a door into your network.",
