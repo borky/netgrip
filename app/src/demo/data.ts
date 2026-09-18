@@ -212,6 +212,7 @@ export const demoMultiWan: T.MultiWanProbe = {
   managed: false,
   foreign: false,
   foreign_sections: [],
+  sticky: true,
   default_track: ["1.1.1.1", "9.9.9.9"],
   package_id: "mwan3",
   config_present: false,
