@@ -263,6 +263,17 @@ export interface WanCandidate {
   reason: string;
 }
 
+/** What the panel asks for. Weights and balance only mean anything while
+ *  balancing; primary only in failover. */
+export interface MultiWanRequest {
+  mode: string;
+  primary?: string;
+  weights?: Record<string, number>;
+  balance?: Record<string, boolean>;
+  track?: Record<string, string[]>;
+  confirm_foreign?: boolean;
+}
+
 export interface MultiWanProbe {
   applicable: boolean;
   candidates: WanCandidate[];
