@@ -159,7 +159,11 @@ export const demoApi: typeof api = {
   board: () => get(D.demoBoard),
   system: () => get(D.demoSystem),
   wan: () => get(D.demoWan),
-  wanConfig: async () => ({ proto: "dhcp", device: "wan", mtu: "1500" }),
+  wanConfig: async () => ({ iface: "wan", proto: "dhcp", device: "wan", mtu: "1500" }),
+  checkPublicIp: async () => {
+    await wait(600, 1200);
+    return { ip: "203.0.113.45", iface: "wan", source: "api.ipify.org", checked_at: Math.floor(Date.now() / 1000) };
+  },
   setWanConfig: async (cfg) => { await wait(300, 600); return cfg; },
   wireless: () => get(state.wireless),
   leases: () => get(D.demoLeases),

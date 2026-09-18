@@ -48,6 +48,7 @@ func New(rpcdURL, version string) *Server {
 	s.mux.HandleFunc("GET /api/wan", s.requireAuth(s.handleWan))
 	s.mux.HandleFunc("GET /api/wan/config", s.requireAuth(s.handleWanConfigGet))
 	s.mux.HandleFunc("POST /api/wan/config", s.requireAuth(s.handleWanConfigPost))
+	s.mux.HandleFunc("POST /api/wan/public-ip", s.requireAuth(s.handleWanPublicIP))
 	s.mux.HandleFunc("GET /api/multiwan", s.requireAuth(s.handleMultiWanGet))
 	s.mux.HandleFunc("POST /api/multiwan", s.requireAuth(s.handleMultiWanSet))
 	s.mux.HandleFunc("POST /api/multiwan/primary", s.requireAuth(s.handleMultiWanPrimary))
@@ -367,6 +368,18 @@ func (s *Server) handleWan(w http.ResponseWriter, _ *http.Request) {
 
 func (s *Server) handleWanConfigGet(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, modules.ReadWANConfig())
+}
+
+// handleWanPublicIP asks an outside service what address this router comes
+// from. A POST, not a GET: it leaves the network, and that should not
+// happen on a refresh.
+func (s *Server) handleWanPublicIP(w http.ResponseWriter, _ *http.Request) {
+	res, err := modules.CheckPublicIP()
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, res)
 }
 
 type multiWanPrimaryRequest struct {

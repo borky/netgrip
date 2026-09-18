@@ -16,6 +16,14 @@ export interface WANConfig {
   vlanid?: string;
 }
 
+/** The address the internet sees, fetched only when asked for. */
+export interface PublicIP {
+  ip: string;
+  iface: string;
+  source: string;
+  checked_at: number;
+}
+
 export type InstallPhase = "idle" | "updating" | "installing" | "done" | "error";
 
 export interface InstallJob {
@@ -81,6 +89,7 @@ const realApi = {
   system: () => request<import("./types").SystemInfo>("/api/system"),
   wan: () => request<import("./types").WanStatus>("/api/wan"),
   wanConfig: () => request<WANConfig>("/api/wan/config"),
+  checkPublicIp: () => request<PublicIP>("/api/wan/public-ip", { method: "POST" }),
   setWanConfig: (cfg: WANConfig) =>
     request<WANConfig>("/api/wan/config", {
       method: "POST",
