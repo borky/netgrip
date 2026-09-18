@@ -1412,6 +1412,7 @@ export default {
     summary: "Resumen",
     allGood: "Todo bien",
     someFail: "Hay avisos",
+    unknown: "sin confirmar",
     missingTools: "Herramientas no disponibles: {{tools}}",
     pingTitle: "Ping",
     pingDesc: "Mide la latencia y las pérdidas hacia un host.",
