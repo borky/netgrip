@@ -107,7 +107,16 @@ export function MultiWanCard({ probe, onChange, index = 2 }: {
   // the probe comes back and becomes the new starting point.
   useEffect(() => {
     if (!probe) return;
-    setMode(MODES.includes(probe.mode as Mode) ? (probe.mode as Mode) : "off");
+    // "custom" is not one of the choices. Landing on "off" would make the
+    // takeover button mean "delete what you have", so a setup we do not
+    // recognise starts from failover, which is what it almost always is.
+    setMode(
+      MODES.includes(probe.mode as Mode)
+        ? (probe.mode as Mode)
+        : probe.mode === "custom"
+          ? "failover"
+          : "off",
+    );
     setWeights(Object.fromEntries(probe.candidates.map((c) => [c.name, c.weight || 1])));
     setPool(Object.fromEntries(probe.candidates.map((c) => [c.name, probe.mode === "balance" ? c.balance : !c.metered])));
     setTrack(Object.fromEntries(probe.candidates.map((c) => [c.name, c.track.join(", ")])));
