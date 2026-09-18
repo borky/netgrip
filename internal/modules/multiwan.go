@@ -641,11 +641,27 @@ func ProbeMultiWAN() *MultiWanProbe {
 	}
 	running := installed && executor.ServiceRunning(mwanPkg)
 	if running {
-		if out, err := exec.Command(mwanPkg, "interfaces").Output(); err == nil {
-			live = parseMwanInterfaces(string(out))
-		}
-		if out, err := exec.Command(mwanPkg, "policies").Output(); err == nil {
-			policy, shares = parseMwanPolicies(string(out))
+		// The tracker's verdict and the split come from its state files
+		// and the member weights, not from `mwan3 interfaces` and
+		// `mwan3 policies`. Those two shell scripts walk the rule set and
+		// cost the best part of a second between them on this hardware,
+		// which is a lot to spend every time somebody opens the page —
+		// and they only report what is derived here anyway.
+		if _, online, ok := mwanLiveState(); ok {
+			for name := range cfg.Ifaces {
+				state := "offline"
+				if online[name] {
+					state = "online"
+				}
+				live[name] = mwanLive{Online: state, Tracking: "active"}
+			}
+			if active := pickMwanActive(cfg, online); active != "" {
+				policy = policyOfActiveRule(cfg)
+				shares = mwanShares(cfg, online)
+				if len(shares) == 0 {
+					shares = map[string]int{active: 100}
+				}
+			}
 		}
 	}
 	return buildMultiWanProbe(candidates, installed, installed && executor.ServiceEnabled(mwanPkg),
@@ -1176,6 +1192,25 @@ func mwanLiveState() (mwanConfig, map[string]bool, bool) {
 		}
 	}
 	return readMwanConfig(string(show)), online, true
+}
+
+// policyOfActiveRule names the policy a rule actually points at, which is
+// what `mwan3 policies` would print as the one in force.
+func policyOfActiveRule(cfg mwanConfig) string {
+	names := []string{}
+	for rule, policy := range cfg.RulePolicies {
+		if len(rule) > mwanMaxSectionLen || len(policy) > mwanMaxSectionLen {
+			continue
+		}
+		if cfg.All[policy] == "policy" {
+			names = append(names, policy)
+		}
+	}
+	if len(names) == 0 {
+		return ""
+	}
+	sort.Strings(names)
+	return names[0]
 }
 
 // mwanShares is how traffic divides between the uplinks, worked out the way
