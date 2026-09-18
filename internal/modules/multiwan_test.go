@@ -546,12 +546,12 @@ func TestPlanRejectsWhatCannotWork(t *testing.T) {
 func TestFailoverOpsWriteTheRightSections(t *testing.T) {
 	ops := buildMwanOps(planFor(t, MultiWanRequest{Mode: MWModeFailover, Primary: "fiber"}), readMwanConfig(""), false)
 	for _, want := range []string{
-		"uci_set mwan3.netgrip_member_fiber.metric 1",
-		"uci_set mwan3.netgrip_member_cell.metric 2",
-		"uci_set mwan3.netgrip_policy_default.last_resort unreachable",
-		"uci_add_list mwan3.netgrip_policy_default.use_member netgrip_member_fiber",
-		"uci_set mwan3.netgrip_rule_default.use_policy netgrip_policy_default",
-		"uci_set mwan3.netgrip_rule_default.dest_ip 0.0.0.0/0",
+		"uci_set mwan3." + mwanMemberPrefix + "fiber.metric 1",
+		"uci_set mwan3." + mwanMemberPrefix + "cell.metric 2",
+		"uci_set mwan3." + mwanPolicyName + ".last_resort unreachable",
+		"uci_add_list mwan3." + mwanPolicyName + ".use_member " + mwanMemberPrefix + "fiber",
+		"uci_set mwan3." + mwanRuleName + ".use_policy " + mwanPolicyName,
+		"uci_set mwan3." + mwanRuleName + ".dest_ip 0.0.0.0/0",
 		"uci_set mwan3.fiber.initial_state online",
 		"uci_set mwan3.fiber." + mwanManagedOpt + " 1",
 		"uci_add_list mwan3.fiber.track_ip 1.1.1.1",
@@ -662,7 +662,7 @@ func TestOffTearsDownAndStopsTheService(t *testing.T) {
 		t.Fatalf("tail = %v", ops)
 	}
 	for _, o := range ops {
-		if strings.Contains(o, "netgrip_policy") || strings.Contains(o, "netgrip_rule") {
+		if strings.Contains(o, mwanPolicyName) || strings.Contains(o, mwanRuleName) {
 			if !strings.HasPrefix(o, "uci_delete") {
 				t.Fatalf("turning it off must not write policy or rules: %q", o)
 			}
@@ -740,5 +740,69 @@ func TestTurningItOffRestoresWhatTheTakeoverDisabled(t *testing.T) {
 		if strings.HasPrefix(o, "uci_set mwan3.fiber.enabled") {
 			t.Fatalf("turning it off must not re-enable somebody else's section: %q", o)
 		}
+	}
+}
+
+// mwan3 drops a policy or rule whose section name is over 15 characters,
+// logs one warning and carries on. The config then reads correctly and
+// steers nothing, which is exactly what happened on a live router.
+func TestGeneratedSectionNamesFitMwanLimit(t *testing.T) {
+	for _, req := range []MultiWanRequest{
+		{Mode: MWModeFailover, Primary: "fiber"},
+		{Mode: MWModeBalance},
+	} {
+		plan, err := buildMwanPlan(req, classifyFixture(t))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, o := range buildMwanOps(plan, readMwanConfig(""), false) {
+			if o.Kind != "uci_set" || len(o.Args) != 2 {
+				continue
+			}
+			section := strings.SplitN(strings.TrimPrefix(o.Args[0], mwanPkg+"."), ".", 2)[0]
+			switch o.Args[1] {
+			case "policy", "rule":
+				if len(section) > mwanMaxSectionLen {
+					t.Fatalf("%s section %q is %d chars; mwan3 ignores anything over %d",
+						o.Args[1], section, len(section), mwanMaxSectionLen)
+				}
+			}
+		}
+	}
+}
+
+// A rule with no family is applied to IPv6 as well, where the catch-all
+// IPv4 destination is not a valid address and mwan3 rejects the rule.
+func TestCatchAllRuleIsPinnedToIPv4(t *testing.T) {
+	plan := planFor(t, MultiWanRequest{Mode: MWModeFailover, Primary: "fiber"})
+	ops := buildMwanOps(plan, readMwanConfig(""), false)
+	if !hasOp(ops, "uci_set mwan3."+mwanRuleName+".family ipv4") {
+		t.Fatalf("the catch-all rule must declare its family:\n%s", strings.Join(opKeys(ops), "\n"))
+	}
+}
+
+// Writing the config is not the same as mwan3 accepting it. The check that
+// matters is what it reports loading afterwards.
+func TestHealthcheckRejectsAConfigMwanDidNotLoad(t *testing.T) {
+	plan := planFor(t, MultiWanRequest{Mode: MWModeFailover, Primary: "fiber"})
+	loaded := func(policy string) *MultiWanProbe {
+		p := buildMultiWanProbe(classifyFixture(t), true, true, true, true,
+			readMwanConfig(`mwan3.`+mwanMemberPrefix+`fiber=member
+mwan3.`+mwanMemberPrefix+`fiber.interface='fiber'
+mwan3.`+mwanMemberPrefix+`fiber.metric='1'
+mwan3.`+mwanMemberPrefix+`cell=member
+mwan3.`+mwanMemberPrefix+`cell.interface='cell'
+mwan3.`+mwanMemberPrefix+`cell.metric='2'
+`), nil, policy, map[string]int{"fiber": 100})
+		return p
+	}
+	if err := mwanHealthcheck(loaded(""), plan); err == nil {
+		t.Fatal("a config the manager never loaded must not pass as applied")
+	}
+	if err := mwanHealthcheck(loaded("somebody_elses"), plan); err == nil {
+		t.Fatal("another policy being in force must not pass as applied")
+	}
+	if err := mwanHealthcheck(loaded(mwanPolicyName), plan); err != nil {
+		t.Fatalf("a loaded policy should pass: %v", err)
 	}
 }
