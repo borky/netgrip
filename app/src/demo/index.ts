@@ -521,6 +521,7 @@ export const demoApi: typeof api = {
     m.running = req.mode !== "off";
     m.enabled = m.running;
     m.primary_iface = req.mode === "failover" ? req.primary : undefined;
+    m.sticky = req.mode === "balance" ? req.sticky !== false : false;
     m.candidates = m.candidates.map((c) => {
       const pooled = req.mode === "balance" && (req.balance?.[c.name] ?? !c.metered);
       return {
