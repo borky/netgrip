@@ -987,6 +987,8 @@ export default {
     live: "EN VIVO",
     last24: "Últimas 24 horas",
     topConsumers: "Qué dispositivos y apps gastan más",
+    byProtocol: "Por protocolo",
+    usagePeriod: "Totales del periodo de contabilidad actual, según nlbwmon.",
     ports: "Puertos",
     mesh: "Cobertura inalambrica",
     devices: "Dispositivos conectados",

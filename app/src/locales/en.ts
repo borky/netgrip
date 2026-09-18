@@ -987,6 +987,8 @@ export default {
     live: "LIVE",
     last24: "Last 24 hours",
     topConsumers: "Which devices and apps use the most",
+    byProtocol: "By protocol",
+    usagePeriod: "Totals for the current accounting period, from nlbwmon.",
     ports: "Ports",
     mesh: "Mesh coverage",
     devices: "Connected devices",
