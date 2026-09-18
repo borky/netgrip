@@ -54,14 +54,19 @@ var defaultTrackIPs = []string{"1.1.1.1", "9.9.9.9"}
 // named exactly after the network interface, so those cannot be prefixed and
 // carry a marker option instead.
 const (
-	mwanPkg          = "mwan3"
-	mwanPrefix       = "netgrip_"
-	mwanMemberPrefix = "netgrip_member_"
-	mwanPolicyName   = "netgrip_policy_default"
-	mwanRuleName     = "netgrip_rule_default"
-	mwanManagedOpt   = "netgrip_managed"
-	mwanDisabledOpt  = "netgrip_disabled"
-	mwanWanMarker    = "netgrip_wan"
+	mwanPkg    = "mwan3"
+	mwanPrefix = "netgrip_"
+	// mwan3 silently drops a policy or rule whose section name is longer
+	// than 15 characters — it logs a warning and carries on without it, so
+	// the config looks right while nothing steers any traffic. Every name
+	// below stays inside that limit.
+	mwanMaxSectionLen = 15
+	mwanMemberPrefix  = "netgrip_m_"
+	mwanPolicyName    = "netgrip_pol"
+	mwanRuleName      = "netgrip_rule"
+	mwanManagedOpt    = "netgrip_managed"
+	mwanDisabledOpt   = "netgrip_disabled"
+	mwanWanMarker     = "netgrip_wan"
 )
 
 // Modes. "custom" is a config that works but is not one of the two shapes
@@ -923,6 +928,9 @@ func buildMwanOps(plan mwanPlan, cfg mwanConfig, takeover bool) []executor.Op {
 		set(mwanPolicyName+".last_resort", "unreachable")
 
 		set(mwanRuleName, "rule")
+		// Without a family the same rule is applied to IPv6, where
+		// 0.0.0.0/0 is not an address and mwan3 rejects it.
+		set(mwanRuleName+".family", "ipv4")
 		set(mwanRuleName+".dest_ip", "0.0.0.0/0")
 		set(mwanRuleName+".proto", "all")
 		if plan.Sticky {
@@ -1036,6 +1044,13 @@ func mwanHealthcheck(after *MultiWanProbe, plan mwanPlan) error {
 	}
 	if after.Mode != plan.Mode {
 		return fmt.Errorf("the router reports %q after applying %q", after.Mode, plan.Mode)
+	}
+	// The config being right is not the same as it being in force: mwan3
+	// drops sections it dislikes with nothing but a log line, leaving a
+	// configuration that reads correctly and steers nothing.
+	if after.ActivePolicy != mwanPolicyName {
+		return fmt.Errorf("the multi-WAN manager did not load the new rules (it is using %q)",
+			firstNonBlank(after.ActivePolicy, "none"))
 	}
 	if st, err := ubus.GetWanStatus(); err == nil && st.Present && !st.Up {
 		return fmt.Errorf("the internet connection went down applying this")
