@@ -350,7 +350,10 @@ type mwanMember struct {
 type mwanIface struct {
 	Enabled bool
 	Ours    bool
-	Track   []string
+	// Disabled: switched off by netgrip during a takeover, and therefore
+	// ours to switch back on when multi-WAN is turned off again.
+	Disabled bool
+	Track    []string
 }
 
 // readMwanConfig interprets `uci show mwan3`. The mode is inferred from the
@@ -371,9 +374,10 @@ func readMwanConfig(show string) mwanConfig {
 		switch sec.Type {
 		case "interface":
 			cfg.Ifaces[name] = mwanIface{
-				Enabled: sec.Option("enabled") != "0",
-				Ours:    sec.Option(mwanManagedOpt) == "1",
-				Track:   uciListParts(sec.Options["track_ip"]),
+				Enabled:  sec.Option("enabled") != "0",
+				Ours:     sec.Option(mwanManagedOpt) == "1",
+				Disabled: sec.Option(mwanDisabledOpt) == "1",
+				Track:    uciListParts(sec.Options["track_ip"]),
 			}
 		case "member":
 			m := mwanMember{Section: name, Interface: sec.Option("interface"), Ours: isOurs}
@@ -792,7 +796,7 @@ func buildMwanPlan(req MultiWanRequest, candidates []WanCandidate) (mwanPlan, er
 // half-applied state never leaves a policy pointing at a member that is
 // gone. Only sections that exist are deleted: `uci delete` fails on a
 // missing entry, and that failure would abort the whole apply.
-func teardownOps(cfg mwanConfig) []executor.Op {
+func teardownOps(cfg mwanConfig, takeover bool) []executor.Op {
 	ops := []executor.Op{}
 	del := func(name string) {
 		if _, ok := cfg.All[name]; ok {
@@ -801,19 +805,15 @@ func teardownOps(cfg mwanConfig) []executor.Op {
 	}
 	// Rules first (they are what actually steers traffic), then policies,
 	// then the members they name.
-	for _, name := range sortedNames(cfg.All, "rule") {
-		if strings.HasPrefix(name, mwanPrefix) {
-			del(name)
-		}
-	}
-	for _, name := range sortedNames(cfg.All, "policy") {
-		if strings.HasPrefix(name, mwanPrefix) {
-			del(name)
-		}
-	}
-	for _, name := range sortedNames(cfg.All, "member") {
-		if strings.HasPrefix(name, mwanPrefix) {
-			del(name)
+	for _, typ := range []string{"rule", "policy", "member"} {
+		for _, name := range sortedNames(cfg.All, typ) {
+			// Someone else's sections are only removed with consent. There
+			// is no gentler option for these three types: mwan3 has no
+			// "enabled" flag for them, and a second catch-all rule would
+			// race ours by evaluation order rather than being ignored.
+			if strings.HasPrefix(name, mwanPrefix) || takeover {
+				del(name)
+			}
 		}
 	}
 	return ops
@@ -834,13 +834,40 @@ func sortedNames(all map[string]string, typ string) []string {
 // are written in place rather than deleted and recreated: recreating one
 // makes mwan3 bring the interface up again on restart, and that is the one
 // thing that can drop a live connection.
-func buildMwanOps(plan mwanPlan, cfg mwanConfig) []executor.Op {
-	ops := teardownOps(cfg)
+func buildMwanOps(plan mwanPlan, cfg mwanConfig, takeover bool) []executor.Op {
+	ops := teardownOps(cfg, takeover)
 	set := func(key, val string) {
 		ops = append(ops, executor.Op{Kind: "uci_set", Args: []string{mwanPkg + "." + key, val}})
 	}
 	addList := func(key, val string) {
 		ops = append(ops, executor.Op{Kind: "uci_add_list", Args: []string{mwanPkg + "." + key, val}})
+	}
+
+	planned := map[string]bool{}
+	for _, ifc := range plan.Ifaces {
+		planned[ifc.Name] = true
+	}
+	// Interface sections nobody planned for - the IPv6 halves of these
+	// links, typically - are switched off rather than deleted, and marked
+	// so that turning multi-WAN off can switch them back on. Deleting them
+	// would throw away tracking settings netgrip never wrote.
+	if takeover && plan.Mode != MWModeOff {
+		for _, name := range sortedNames(cfg.All, "interface") {
+			if planned[name] || cfg.Ifaces[name].Disabled {
+				continue
+			}
+			set(name+".enabled", "0")
+			set(name+"."+mwanDisabledOpt, "1")
+		}
+	}
+	if plan.Mode == MWModeOff {
+		for _, name := range sortedNames(cfg.All, "interface") {
+			if !cfg.Ifaces[name].Disabled {
+				continue
+			}
+			set(name+".enabled", "1")
+			ops = append(ops, executor.Op{Kind: "uci_delete", Args: []string{mwanPkg + "." + name + "." + mwanDisabledOpt}})
+		}
 	}
 
 	if plan.Mode != MWModeOff {
@@ -938,9 +965,6 @@ func ApplyMultiWAN(req MultiWanRequest) (*MultiWanProbe, bool, error) {
 	if probe.Foreign && !req.ConfirmForeign {
 		return probe, false, fmt.Errorf("%s%s", errForeignPrefix, strings.Join(probe.ForeignSections, ", "))
 	}
-	if probe.Foreign && req.ConfirmForeign {
-		return probe, false, fmt.Errorf("taking over an existing multi-WAN setup is not supported yet")
-	}
 
 	plan, err := buildMwanPlan(req, probe.Candidates)
 	if err != nil {
@@ -949,6 +973,16 @@ func ApplyMultiWAN(req MultiWanRequest) (*MultiWanProbe, bool, error) {
 
 	show, _ := exec.Command("uci", "show", mwanPkg).Output()
 	cfg := readMwanConfig(string(show))
+
+	// Taking over deletes sections netgrip did not write, and mwan3 has no
+	// way to disable them instead. A full snapshot first is what makes that
+	// undoable from Tools afterwards, not just within this call.
+	takeover := probe.Foreign && req.ConfirmForeign
+	if takeover {
+		if _, err := CreateSnapshot(); err != nil {
+			return probe, false, fmt.Errorf("could not save a restore point first: %w", err)
+		}
+	}
 
 	snap := ""
 	if _, err := os.Stat("/etc/config/" + mwanPkg); err == nil {
@@ -963,7 +997,7 @@ func ApplyMultiWAN(req MultiWanRequest) (*MultiWanProbe, bool, error) {
 		_ = executor.Run(executor.Op{Kind: "initd", Args: []string{mwanPkg, "restart"}})
 	}
 
-	if err := executor.Apply(buildMwanOps(plan, cfg), nil); err != nil {
+	if err := executor.Apply(buildMwanOps(plan, cfg, takeover), nil); err != nil {
 		rollback()
 		return ProbeMultiWAN(), true, err
 	}
@@ -1029,5 +1063,5 @@ func SetMultiWANPrimary(iface string) (*MultiWanProbe, bool, error) {
 			track[c.Name] = c.Track
 		}
 	}
-	return ApplyMultiWAN(MultiWanRequest{Mode: MWModeFailover, Primary: iface, Track: track})
+	return ApplyMultiWAN(MultiWanRequest{Mode: MWModeFailover, Primary: iface, Track: track, ConfirmForeign: true})
 }

@@ -544,7 +544,7 @@ func TestPlanRejectsWhatCannotWork(t *testing.T) {
 }
 
 func TestFailoverOpsWriteTheRightSections(t *testing.T) {
-	ops := buildMwanOps(planFor(t, MultiWanRequest{Mode: MWModeFailover, Primary: "fiber"}), readMwanConfig(""))
+	ops := buildMwanOps(planFor(t, MultiWanRequest{Mode: MWModeFailover, Primary: "fiber"}), readMwanConfig(""), false)
 	for _, want := range []string{
 		"uci_set mwan3.netgrip_member_fiber.metric 1",
 		"uci_set mwan3.netgrip_member_cell.metric 2",
@@ -569,7 +569,7 @@ func TestFailoverOpsWriteTheRightSections(t *testing.T) {
 // name — so those carry a marker instead, and everything else must carry the
 // prefix.
 func TestEverySectionWeInventIsPrefixed(t *testing.T) {
-	ops := buildMwanOps(planFor(t, MultiWanRequest{Mode: MWModeBalance}), readMwanConfig(""))
+	ops := buildMwanOps(planFor(t, MultiWanRequest{Mode: MWModeBalance}), readMwanConfig(""), false)
 	for _, o := range ops {
 		if o.Kind != "uci_set" || len(o.Args) != 2 {
 			continue
@@ -600,7 +600,7 @@ func TestOpsNeverBounceTheNetwork(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%v: %v", mode.Mode, err)
 		}
-		for _, o := range buildMwanOps(plan, readMwanConfig(mwanShowForeign)) {
+		for _, o := range buildMwanOps(plan, readMwanConfig(mwanShowForeign), true) {
 			if o.Kind == "ifup" || o.Kind == "ifdown" {
 				t.Fatalf("%s: %v restarts an interface", mode.Mode, o)
 			}
@@ -615,7 +615,7 @@ func TestOpsNeverBounceTheNetwork(t *testing.T) {
 // of no return instead of here.
 func TestOpsPassTheExecutorAllowlist(t *testing.T) {
 	plan := planFor(t, MultiWanRequest{Mode: MWModeFailover, Primary: "fiber"})
-	for _, o := range buildMwanOps(plan, readMwanConfig(mwanShowForeign)) {
+	for _, o := range buildMwanOps(plan, readMwanConfig(mwanShowForeign), true) {
 		if err := executor.Validate(o); err != nil {
 			t.Fatalf("%v: %v", o, err)
 		}
@@ -634,7 +634,7 @@ mwan3.` + mwanRuleName + `=rule
 mwan3.someone_elses=member
 mwan3.someone_elses.interface='fiber'
 `
-	ops := opKeys(teardownOps(readMwanConfig(show)))
+	ops := opKeys(teardownOps(readMwanConfig(show), false))
 	want := []string{
 		"uci_delete mwan3." + mwanRuleName,
 		"uci_delete mwan3." + mwanPolicyName,
@@ -656,7 +656,7 @@ func TestOffTearsDownAndStopsTheService(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildMwanPlan: %v", err)
 	}
-	ops := opKeys(buildMwanOps(plan, readMwanConfig(mwanShowForeign)))
+	ops := opKeys(buildMwanOps(plan, readMwanConfig(mwanShowForeign), true))
 	last := strings.Join(ops[len(ops)-3:], "|")
 	if last != "uci_commit mwan3|initd mwan3 stop|initd mwan3 disable" {
 		t.Fatalf("tail = %v", ops)
@@ -666,6 +666,79 @@ func TestOffTearsDownAndStopsTheService(t *testing.T) {
 			if !strings.HasPrefix(o, "uci_delete") {
 				t.Fatalf("turning it off must not write policy or rules: %q", o)
 			}
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Taking over a setup somebody else wrote
+// ---------------------------------------------------------------------------
+
+// Without consent nothing of anyone else's is touched, whatever is asked.
+func TestTeardownLeavesForeignSectionsAloneByDefault(t *testing.T) {
+	ops := opKeys(teardownOps(readMwanConfig(mwanShowForeign), false))
+	if len(ops) != 0 {
+		t.Fatalf("teardown = %v, want nothing: none of that config is ours", ops)
+	}
+}
+
+func TestTakeoverRemovesTheOldRulesAndAdoptsTheInterfaces(t *testing.T) {
+	cfg := readMwanConfig(mwanShowForeign)
+	plan := planFor(t, MultiWanRequest{Mode: MWModeFailover, Primary: "fiber"})
+	ops := opKeys(buildMwanOps(plan, cfg, true))
+
+	// The old steering is removed: rule first, then policy, then members.
+	for _, want := range []string{
+		"uci_delete mwan3.default_v4",
+		"uci_delete mwan3.fiber_failover",
+		"uci_delete mwan3.fiber_m1",
+		"uci_delete mwan3.cell_m2",
+	} {
+		if !hasOp(buildMwanOps(plan, cfg, true), want) {
+			t.Fatalf("missing %q in:\n%s", want, strings.Join(ops, "\n"))
+		}
+	}
+	// The interface sections are rewritten in place, never recreated:
+	// recreating one makes mwan3 bring the interface up again.
+	for _, o := range ops {
+		if o == "uci_delete mwan3.fiber" || o == "uci_delete mwan3.cell" {
+			t.Fatalf("an interface section was deleted: %q", o)
+		}
+	}
+	if !hasOp(buildMwanOps(plan, cfg, true), "uci_set mwan3.fiber."+mwanManagedOpt+" 1") {
+		t.Fatal("an adopted interface section must be marked as ours")
+	}
+	// The IPv6 half is switched off rather than deleted, and marked so it
+	// can be switched back on later.
+	for _, want := range []string{
+		"uci_set mwan3.cell6.enabled 0",
+		"uci_set mwan3.cell6." + mwanDisabledOpt + " 1",
+	} {
+		if !hasOp(buildMwanOps(plan, cfg, true), want) {
+			t.Fatalf("missing %q", want)
+		}
+	}
+}
+
+func TestTurningItOffRestoresWhatTheTakeoverDisabled(t *testing.T) {
+	show := mwanShowForeign + "mwan3.cell6." + mwanDisabledOpt + "='1'\n"
+	plan, err := buildMwanPlan(MultiWanRequest{Mode: MWModeOff}, classifyFixture(t))
+	if err != nil {
+		t.Fatalf("buildMwanPlan: %v", err)
+	}
+	ops := buildMwanOps(plan, readMwanConfig(show), true)
+	for _, want := range []string{
+		"uci_set mwan3.cell6.enabled 1",
+		"uci_delete mwan3.cell6." + mwanDisabledOpt,
+	} {
+		if !hasOp(ops, want) {
+			t.Fatalf("missing %q in:\n%s", want, strings.Join(opKeys(ops), "\n"))
+		}
+	}
+	// A section netgrip never disabled is left exactly as it was.
+	for _, o := range opKeys(ops) {
+		if strings.HasPrefix(o, "uci_set mwan3.fiber.enabled") {
+			t.Fatalf("turning it off must not re-enable somebody else's section: %q", o)
 		}
 	}
 }
