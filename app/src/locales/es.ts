@@ -840,6 +840,27 @@ export default {
     doneOff: "Listo. La red de aparatos está apagada.",
     keyLabel: "Clave",
   },
+  mwan: {
+    title: "Conexiones a Internet",
+    modeOff: "Sin gestionar",
+    modeFailover: "Conmutación por error",
+    modeBalance: "Equilibrado",
+    modeCustom: "Configurado por otro medio",
+    active: "Lleva el tráfico",
+    activeShare: "Lleva el {{pct}}%",
+    standby: "En espera",
+    offline: "Desconectada",
+    failed: "No llega a Internet",
+    primary: "Principal",
+    metered: "De pago por uso",
+    viaPort: "puerto {{port}}",
+    singleBody:
+      "Este router tiene una conexión a Internet. Si conectas una segunda —otra línea o un módem móvil— puede tomar el relevo sola cuando esta se caiga.",
+    installPrompt:
+      "Hay dos conexiones a Internet. Instala el gestor multi-WAN para cambiar de una a otra automáticamente cuando falle alguna.",
+    foreignBanner:
+      "La multi-WAN ya está configurada fuera de NetGrip ({{sections}}); aquí se muestra, pero no se toca.",
+  },
   fwd: {
     thisRouter: "este router",
     external: "externa",

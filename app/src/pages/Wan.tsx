@@ -3,10 +3,11 @@ import { useTranslation } from "react-i18next";
 import { CloudOff, Globe, KeyRound, Pencil, Save } from "lucide-react";
 import { api } from "../api";
 import type { WANConfig } from "../api";
-import type { FwdProbe, WanStatus } from "../types";
+import type { FwdProbe, MultiWanProbe, WanStatus } from "../types";
 import {
   Banner, Button, Card, Field, Pill, SegmentedControl, SkeletonRows, useToast,
 } from "../components/ui";
+import { MultiWanCard } from "../components/wan/MultiWanCard";
 import { PortForwardCard } from "../components/ports/PortForwardCard";
 
 const PROTO = ["dhcp", "static", "pppoe"] as const;
@@ -47,9 +48,11 @@ function fmtDur(s: number): string {
 
 /** Página WAN (#243): estado de salida a Internet + configuración (lectura con
  *  Editar; el form no abre por defecto) + port-forwarding. */
-export function WanPage({ fwd, onFwdChange }: {
+export function WanPage({ fwd, onFwdChange, mwan }: {
   fwd?: FwdProbe;
   onFwdChange?: (p: FwdProbe) => void;
+  mwan?: MultiWanProbe;
+  onMwanChange?: (p: MultiWanProbe) => void;
 }) {
   const { t } = useTranslation();
   const { push } = useToast();
@@ -196,6 +199,8 @@ export function WanPage({ fwd, onFwdChange }: {
           </>
         )}
       </Card>
+
+      <MultiWanCard probe={mwan} index={2} />
 
       {fwd && onFwdChange && (
         <div className="md:col-span-2">
