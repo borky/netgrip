@@ -106,21 +106,33 @@ export function PortForwardCard({ probe, onChange }: {
                       :{r.src_dport}
                     </span>
                     <ArrowRight size={14} className="text-faint shrink-0" aria-hidden="true" />
-                    <span className="font-mono text-small">{r.dest_ip}:{r.dest_port}</span>
+                    {/* A forward lands on a host; an input rule ends on the
+                        router itself and has no destination to show. */}
+                    <span className="font-mono text-small">
+                      {r.kind === "input" ? t("fwd.thisRouter") : `${r.dest_ip}:${r.dest_port}`}
+                    </span>
                     <span className="font-mono text-caption text-muted uppercase bg-surface-2 border border-border rounded-sm px-1.5 py-0.5">
                       {r.proto}
                     </span>
                     <span className="flex-1" />
                     <Pill tone="ok">{t("fwd.active")}</Pill>
-                    <button
-                      type="button"
-                      onClick={() => setToDelete(r)}
-                      disabled={busy}
-                      aria-label={`${t("fwd.delete")} ${ruleName(t, r)}`}
-                      className="text-faint hover:text-danger transition-colors duration-[var(--dur-fast)] ring-focus rounded-sm p-1"
-                    >
-                      <Trash2 size={16} />
-                    </button>
+                    {/* Only what NetGrip created is removable from here;
+                        anything set up elsewhere is shown, not touched. */}
+                    {r.managed === false ? (
+                      <span title={t("fwd.externalHint")}>
+                        <Pill tone="muted">{t("fwd.external")}</Pill>
+                      </span>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => setToDelete(r)}
+                        disabled={busy}
+                        aria-label={`${t("fwd.delete")} ${ruleName(t, r)}`}
+                        className="text-faint hover:text-danger transition-colors duration-[var(--dur-fast)] ring-focus rounded-sm p-1"
+                      >
+                        <Trash2 size={16} />
+                      </button>
+                    )}
                   </div>
                 ))}
               </div>
