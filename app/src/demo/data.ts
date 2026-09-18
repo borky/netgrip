@@ -616,6 +616,12 @@ export const demoSelfTest: T.SelfTestResult = {
   dns: true,
   ntp: true,
   all_ok: true,
+  checks: [
+    { key: "gateway" as const, ok: true, detail: "198.51.100.1 replies" },
+    { key: "wan" as const, ok: true, detail: "link up" },
+    { key: "dns" as const, ok: true, detail: "openwrt.org resolved" },
+    { key: "ntp" as const, ok: true, detail: "a time daemon is running" },
+  ],
   tools: { ping: true, traceroute: true, nslookup: true, dig: false },
 };
 

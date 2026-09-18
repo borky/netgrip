@@ -27,13 +27,28 @@ type DiagnosticsTools struct {
 	Dig        bool `json:"dig"`
 }
 
+// SelfTestCheck is one line of the self-test, with the reason behind it.
+// A red dot that does not say what was tried, or what came back, leaves the
+// reader no better off than before running the test.
+type SelfTestCheck struct {
+	Key string `json:"key"` // gateway | wan | dns | ntp
+	OK  bool   `json:"ok"`
+	// Info marks something that could not be proven but is not a fault.
+	// The clearest case is a provider that does not answer pings on the
+	// other end of the link: unreachable by ICMP, perfectly fine in use.
+	Info   bool   `json:"info,omitempty"`
+	Detail string `json:"detail,omitempty"`
+}
+
 type SelfTestResult struct {
-	Gateway bool             `json:"gateway"`
-	Wan     bool             `json:"wan"`
-	DNS     bool             `json:"dns"`
-	NTP     bool             `json:"ntp"`
-	AllOk   bool             `json:"all_ok"`
-	Tools   DiagnosticsTools `json:"tools"`
+	Gateway bool `json:"gateway"`
+	Wan     bool `json:"wan"`
+	DNS     bool `json:"dns"`
+	NTP     bool `json:"ntp"`
+	AllOk   bool `json:"all_ok"`
+	// Checks carries the same results with their reasons, in display order.
+	Checks []SelfTestCheck  `json:"checks"`
+	Tools  DiagnosticsTools `json:"tools"`
 }
 
 type PingSample struct {
@@ -425,15 +440,64 @@ func RunSelfTest() *SelfTestResult {
 			Dig:        toolAvailable("dig"),
 		},
 	}
+	wanDetail, gwDetail, gwAddr := "no WAN interface", "", ""
 	if wan, err := ubus.GetWanStatus(); err == nil {
 		res.Wan = wan.Present && wan.Up
-		if wan.Gateway != "" {
-			res.Gateway = pingOnce(wan.Gateway)
+		switch {
+		case !wan.Present:
+			wanDetail = "no WAN interface (access point mode)"
+		case wan.Up:
+			wanDetail = "link up"
+		default:
+			wanDetail = "link down"
+		}
+		gwAddr = wan.Gateway
+		if gwAddr != "" {
+			res.Gateway = pingOnce(gwAddr)
 		}
 	}
 	res.DNS = dnsResolves("openwrt.org")
 	res.NTP = ntpRunning()
-	res.AllOk = res.Gateway && res.Wan && res.DNS && res.NTP
+
+	// The gateway is the one check that fails on a healthy connection.
+	// Plenty of providers drop ICMP aimed at their end of the link, so a
+	// silent gateway means nothing on its own: if the link is up and names
+	// resolve, traffic is demonstrably crossing it. Say so instead of
+	// painting the whole test red.
+	gwInfo := false
+	switch {
+	case gwAddr == "":
+		gwInfo, gwDetail = true, "no gateway to test"
+	case res.Gateway:
+		gwDetail = gwAddr + " replies"
+	case res.Wan && res.DNS:
+		gwInfo = true
+		gwDetail = gwAddr + " does not answer pings, but the link is up and names resolve — many providers filter this"
+	default:
+		gwDetail = gwAddr + " does not answer pings"
+	}
+
+	dnsDetail := "openwrt.org resolved"
+	if !res.DNS {
+		dnsDetail = "could not resolve openwrt.org"
+	}
+	ntpDetail := "a time daemon is running"
+	if !res.NTP {
+		ntpDetail = "no time daemon is running"
+	}
+
+	res.Checks = []SelfTestCheck{
+		{Key: "gateway", OK: res.Gateway, Info: gwInfo, Detail: gwDetail},
+		{Key: "wan", OK: res.Wan, Detail: wanDetail},
+		{Key: "dns", OK: res.DNS, Detail: dnsDetail},
+		{Key: "ntp", OK: res.NTP, Detail: ntpDetail},
+	}
+	res.AllOk = true
+	for _, c := range res.Checks {
+		if !c.OK && !c.Info {
+			res.AllOk = false
+		}
+	}
 	return res
 }
 
