@@ -21,6 +21,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gnacho/netgrip/internal/executor"
@@ -338,6 +339,8 @@ type mwanConfig struct {
 	// Ifaces lists the interface sections, whether netgrip wrote them and
 	// what they track.
 	Ifaces map[string]mwanIface
+	// RulePolicies maps a rule section to the policy it invokes.
+	RulePolicies map[string]string
 	// All maps every section name to its type. `uci delete` fails on a
 	// missing entry and takes the whole apply down with it, so nothing is
 	// deleted without looking here first.
@@ -366,11 +369,12 @@ type mwanIface struct {
 // itself honestly instead of claiming whatever netgrip last wrote.
 func readMwanConfig(show string) mwanConfig {
 	cfg := mwanConfig{
-		Mode:    MWModeOff,
-		Members: map[string]mwanMember{},
-		Ifaces:  map[string]mwanIface{},
-		Foreign: []string{},
-		All:     map[string]string{},
+		Mode:         MWModeOff,
+		Members:      map[string]mwanMember{},
+		Ifaces:       map[string]mwanIface{},
+		Foreign:      []string{},
+		All:          map[string]string{},
+		RulePolicies: map[string]string{},
 	}
 	ours, foreign := 0, 0
 	for name, sec := range parseUCIShow(show, mwanPkg) {
@@ -399,6 +403,9 @@ func readMwanConfig(show string) mwanConfig {
 				cfg.Foreign = append(cfg.Foreign, name)
 			}
 		case "policy", "rule":
+			if sec.Type == "rule" {
+				cfg.RulePolicies[name] = sec.Option("use_policy")
+			}
 			if isOurs {
 				ours++
 			} else {
@@ -613,7 +620,8 @@ func wanCandidates() []WanCandidate {
 func ProbeMultiWAN() *MultiWanProbe {
 	candidates := wanCandidates()
 	installed := pkgInstalled(mwanPkg)
-	cfg := mwanConfig{Mode: MWModeOff, Members: map[string]mwanMember{}, Ifaces: map[string]mwanIface{}, Foreign: []string{}, All: map[string]string{}}
+	cfg := mwanConfig{Mode: MWModeOff, Members: map[string]mwanMember{}, Ifaces: map[string]mwanIface{},
+		Foreign: []string{}, All: map[string]string{}, RulePolicies: map[string]string{}}
 	live := map[string]mwanLive{}
 	policy, shares := "", map[string]int{}
 	configPresent := false
@@ -1079,4 +1087,104 @@ func SetMultiWANPrimary(iface string) (*MultiWanProbe, bool, error) {
 		}
 	}
 	return ApplyMultiWAN(MultiWanRequest{Mode: MWModeFailover, Primary: iface, Track: track, ConfirmForeign: true})
+}
+
+// ---------------------------------------------------------------------------
+// Which uplink is actually carrying traffic
+// ---------------------------------------------------------------------------
+
+// mwan3 steers with packet marks and leaves the kernel's default routes
+// untouched, so every part of the panel that asks "which uplink is the WAN"
+// gets the wrong answer the moment a policy sends traffic somewhere else:
+// the address shown is the one nobody is using. This is where the honest
+// answer comes from, and it is wired into the ubus layer at startup so the
+// WAN card, the settings form, the port list and the rest all follow it.
+func init() { ubus.ActiveUplinkResolver = MwanActiveUplink }
+
+const (
+	mwanRunDir     = "/var/run/" + mwanPkg
+	mwanStateDir   = mwanRunDir + "/iface_state"
+	mwanConfigFile = "/etc/config/" + mwanPkg
+)
+
+// mwanActive caches the answer: it is asked for on every probe, and while
+// each ingredient is only a file read, there are several of them.
+var mwanActive struct {
+	mu   sync.Mutex
+	at   time.Time
+	name string
+}
+
+var mwanActiveTTL = 2 * time.Second
+
+// MwanActiveUplink names the uplink mwan3 is currently steering traffic
+// through, or "" when it is not steering at all — not installed, not
+// running, or configured in a way it refused to load.
+func MwanActiveUplink() string {
+	mwanActive.mu.Lock()
+	defer mwanActive.mu.Unlock()
+	if time.Since(mwanActive.at) < mwanActiveTTL {
+		return mwanActive.name
+	}
+	mwanActive.at = time.Now()
+	mwanActive.name = ""
+
+	if _, err := os.Stat(mwanStateDir); err != nil {
+		return ""
+	}
+	show, err := exec.Command("uci", "show", mwanPkg).Output()
+	if err != nil {
+		return ""
+	}
+	cfg := readMwanConfig(string(show))
+	online := map[string]bool{}
+	entries, err := os.ReadDir(mwanStateDir)
+	if err != nil {
+		return ""
+	}
+	for _, e := range entries {
+		b, err := os.ReadFile(mwanStateDir + "/" + e.Name())
+		if err == nil && strings.TrimSpace(string(b)) == "online" {
+			online[e.Name()] = true
+		}
+	}
+	mwanActive.name = pickMwanActive(cfg, online)
+	return mwanActive.name
+}
+
+// pickMwanActive works out which member is carrying traffic from the config
+// and the tracker's verdict on each link, the same way mwan3 does: only the
+// lowest metric group with something online is used, and within it the
+// heaviest member carries the most.
+//
+// It returns "" when no rule can actually be steering anything — an
+// unreferenced policy, or one mwan3 will have refused for its name being too
+// long. A config that looks right but was never loaded must not be believed.
+func pickMwanActive(cfg mwanConfig, online map[string]bool) string {
+	steering := false
+	for name, policy := range cfg.RulePolicies {
+		if len(name) > mwanMaxSectionLen || len(policy) > mwanMaxSectionLen {
+			continue
+		}
+		if cfg.All[policy] == "policy" {
+			steering = true
+			break
+		}
+	}
+	if !steering {
+		return ""
+	}
+	best, bestMetric, bestWeight := "", 0, 0
+	for _, m := range cfg.Members {
+		if m.Interface == "" || !online[m.Interface] {
+			continue
+		}
+		switch {
+		case best == "", m.Metric < bestMetric,
+			m.Metric == bestMetric && m.Weight > bestWeight,
+			m.Metric == bestMetric && m.Weight == bestWeight && m.Interface < best:
+			best, bestMetric, bestWeight = m.Interface, m.Metric, m.Weight
+		}
+	}
+	return best
 }
