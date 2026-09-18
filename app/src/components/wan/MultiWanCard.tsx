@@ -101,6 +101,7 @@ export function MultiWanCard({ probe, onChange, index = 2 }: {
   const [pool, setPool] = useState<Record<string, boolean>>({});
   const [track, setTrack] = useState<Record<string, string>>({});
   const [confirming, setConfirming] = useState(false);
+  const [takingOver, setTakingOver] = useState(false);
 
   // The form follows the router until the user touches it; after an apply
   // the probe comes back and becomes the new starting point.
@@ -145,9 +146,11 @@ export function MultiWanCard({ probe, onChange, index = 2 }: {
     });
   };
 
-  const applyCurrent = () => {
+  const applyCurrent = (confirmForeign = false) => {
     setConfirming(false);
+    setTakingOver(false);
     apply({
+      confirm_foreign: confirmForeign,
       mode,
       // Turning failover on should not move the house onto another line:
       // the connection already carrying traffic stays the main one unless
@@ -179,6 +182,9 @@ export function MultiWanCard({ probe, onChange, index = 2 }: {
   };
   const dirty = !!probe && mode !== probe.mode;
   const configurable = !!probe && probe.multi_wan_possible && probe.installed && !probe.foreign;
+  // A setup written elsewhere is shown as it is until the user hands it
+  // over; there is no halfway state where netgrip owns some of it.
+  const foreign = !!probe && probe.multi_wan_possible && probe.installed && probe.foreign;
   // A pool of nothing would take the house offline the moment it applied.
   const emptyPool = mode === "balance" && !Object.values(pool).some(Boolean);
 
@@ -244,8 +250,16 @@ export function MultiWanCard({ probe, onChange, index = 2 }: {
               </div>
             )}
 
-            {probe.multi_wan_possible && probe.installed && probe.foreign && (
-              <Banner tone="warn" className="mt-3">
+            {foreign && (
+              <Banner
+                tone="warn"
+                className="mt-3"
+                action={
+                  <Button size="sm" variant="secondary" disabled={busy} onClick={() => setTakingOver(true)}>
+                    {t("mwan.foreignTake")}
+                  </Button>
+                }
+              >
                 {t("mwan.foreignBanner", { sections: probe.foreign_sections.join(", ") })}
               </Banner>
             )}
@@ -346,10 +360,20 @@ export function MultiWanCard({ probe, onChange, index = 2 }: {
       <ConfirmDialog
         open={confirming}
         onClose={() => setConfirming(false)}
-        onConfirm={applyCurrent}
+        onConfirm={() => applyCurrent(false)}
         title={t("mwan.switchTitle", { mode: t(modeKey[mode]) })}
         consequence={t("mwan.switchConsequence")}
         confirmLabel={t("mwan.switchConfirm")}
+        busy={busy}
+      />
+
+      <ConfirmDialog
+        open={takingOver}
+        onClose={() => setTakingOver(false)}
+        onConfirm={() => applyCurrent(true)}
+        title={t("mwan.foreignTitle")}
+        consequence={t("mwan.foreignConsequence", { sections: probe?.foreign_sections.join(", ") ?? "" })}
+        confirmLabel={t("mwan.foreignConfirm")}
         busy={busy}
       />
     </>
