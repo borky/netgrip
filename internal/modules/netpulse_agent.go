@@ -515,6 +515,11 @@ func applyNetPulseAgent(p netpulsePaths) {
 		Version:        version,
 		Kind:           "netgrip",
 		SelfMQTT:       netPulseSelfMQTT,
+		// The uplink policy this panel manages travels with the push, so
+		// the monitoring side shows the connection actually in use rather
+		// than the one holding the cheapest route.
+		MultiWan:       netpulseMultiWanHook,
+		OnStatus:       storeNetPulseStatus,
 		OnUpgrade:      netPulseUpgradeTrigger,
 		OnConfigBackup: netPulseConfigBackupTrigger,
 	}
