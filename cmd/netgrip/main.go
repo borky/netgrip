@@ -24,6 +24,7 @@ func main() {
 	useTLS := flag.Bool("https", false, "serve the panel over HTTPS on the listen port")
 	tlsCert := flag.String("https-cert", "", "certificate to serve with -https (default: the panel's own, else uhttpd's)")
 	tlsKey := flag.String("https-key", "", "private key to serve with -https (default: the panel's own, else uhttpd's)")
+	updateRepo := flag.String("update-repo", "", "GitHub owner/name to check for releases (default: upstream; env NETGRIP_UPDATE_REPO)")
 	flag.Parse()
 	if *showVersion {
 		fmt.Println(version)
@@ -46,6 +47,18 @@ func main() {
 	// pre-HTTPS init forever and its UCI https toggle stayed a no-op
 	// (#544). No-op off-router (guarded by /etc/openwrt_release).
 	modules.SyncInitScriptAtBoot(version)
+
+	// Where this build looks for its own updates. A binary that is not
+	// upstream's must not offer to replace itself with upstream's asset, which
+	// would silently undo whatever it added. The flag wins over the
+	// environment so a service file can set one and an operator override it.
+	repo := *updateRepo
+	if repo == "" {
+		repo = os.Getenv("NETGRIP_UPDATE_REPO")
+	}
+	if repo != "" {
+		modules.SetUpdateRepo(repo)
+	}
 
 	// The flag always has a value (its default), so only treat it as an
 	// explicit override when it differs from the default endpoint.
