@@ -16,9 +16,50 @@ import (
 )
 
 const (
-	githubRepo = "gnacho/netgrip"
-	tmpPath    = "/tmp/netgrip.update"
+	// defaultUpdateRepo is where releases come from unless the build is told
+	// otherwise. Upstream is the default, so nothing changes for a normal
+	// install.
+	defaultUpdateRepo = "gnacho/netgrip"
+	tmpPath           = "/tmp/netgrip.update"
 )
+
+// updateRepo is the "owner/name" the updater asks for releases.
+//
+// A build that is not upstream's - a patched binary, a distribution with its
+// own packaging, a fork - must not offer to replace itself with upstream's
+// asset: accepting that update silently removes whatever the build added.
+// SetUpdateRepo lets the binary be pointed at the releases it actually came
+// from, the way the monitoring server already allows through GITHUB_REPO.
+var updateRepo = defaultUpdateRepo
+
+// SetUpdateRepo points the updater at "owner/name". An empty or malformed
+// value leaves the default in place rather than producing a URL that 404s on
+// every check.
+func SetUpdateRepo(repo string) {
+	repo = strings.Trim(strings.TrimSpace(repo), "/")
+	if repo == "" {
+		return
+	}
+	owner, name, ok := strings.Cut(repo, "/")
+	if !ok || owner == "" || name == "" || strings.Contains(name, "/") {
+		log.Printf("netgrip: ignoring update repo %q, expected owner/name", repo)
+		return
+	}
+	updateRepo = repo
+}
+
+// UpdateRepo is where this build looks for releases.
+func UpdateRepo() string { return updateRepo }
+
+// releasesAPIURL is the latest-release endpoint for the configured repo.
+// Built per call rather than once at startup, so SetUpdateRepo works whenever
+// it is called.
+func releasesAPIURL() string {
+	if githubAPIURL != "" {
+		return githubAPIURL
+	}
+	return "https://api.github.com/repos/" + updateRepo + "/releases/latest"
+}
 
 // binaryAssetName is the release asset for this build's architecture, so an
 // unsupported arch (e.g. mipsel before #236) never matches an existing asset
@@ -43,9 +84,9 @@ func binaryAssetName() string {
 	return "netgrip-linux-" + arch
 }
 
-// Overridable in tests.
+// Overridable in tests: when set, it wins over the configured repo.
 var (
-	githubAPIURL   = "https://api.github.com/repos/" + githubRepo + "/releases/latest"
+	githubAPIURL   = ""
 	runSelfUpdateF = runSelfUpdate
 )
 
@@ -118,7 +159,7 @@ func CheckSelfUpdate(currentVersion string) *SelfUpdateCheck {
 	}
 
 	client := &http.Client{Timeout: 10 * time.Second}
-	req, err := http.NewRequest("GET", githubAPIURL, nil)
+	req, err := http.NewRequest("GET", releasesAPIURL(), nil)
 	if err != nil {
 		return result
 	}

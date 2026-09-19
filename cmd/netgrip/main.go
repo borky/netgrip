@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 
 	"github.com/gnacho/netgrip/internal/auth"
@@ -19,10 +20,23 @@ func main() {
 	showVersion := flag.Bool("version", false, "print version and exit")
 	port := flag.Int("port", 8090, "listen port")
 	rpcdURL := flag.String("rpcd-url", auth.DefaultRPCdURL, "rpcd JSON-RPC endpoint used for login validation")
+	updateRepo := flag.String("update-repo", "", "GitHub owner/name to check for releases (default: upstream; env NETGRIP_UPDATE_REPO)")
 	flag.Parse()
 	if *showVersion {
 		fmt.Println(version)
 		return
+	}
+
+	// Where this build looks for its own updates. A binary that is not
+	// upstream's must not offer to replace itself with upstream's asset, which
+	// would silently undo whatever it added. The flag wins over the
+	// environment so a service file can set one and an operator override it.
+	repo := *updateRepo
+	if repo == "" {
+		repo = os.Getenv("NETGRIP_UPDATE_REPO")
+	}
+	if repo != "" {
+		modules.SetUpdateRepo(repo)
 	}
 
 	// The flag always has a value (its default), so only treat it as an
