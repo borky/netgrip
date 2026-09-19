@@ -2,13 +2,14 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { TFunction } from "i18next";
 import {
-  Activity, ArrowDown, ArrowUp, Cable, ChartColumn, CloudOff, Globe, HardDrive,
+  Activity, ArrowDown, ArrowUp, Cable, ChartColumn, CloudOff, Cpu, Globe, HardDrive,
   History, MemoryStick, ShieldCheck, Smartphone,
 } from "lucide-react";
 import { api, isDemo } from "../api";
 import type {
   Board, Client, DPIProbe, DriftProbe, EthPort, HistoryEntry,
   IfaceCounters, ModeProbe, SystemInfo, WanStatus,
+  CPUProbe,
   NlbwmonTop,
 } from "../types";
 import type { HealthScore } from "../hooks/useHealthScore";
@@ -114,12 +115,137 @@ function InternetCard({ wan, mode }: { wan?: WanStatus; mode?: ModeProbe }) {
   );
 }
 
+/* ══════════════ CPU: por núcleo, no en promedio ══════════════ */
+
+/** 3225023 -> "3.2M": a dropped-packet count only needs its order of
+ *  magnitude to tell the story. */
+function fmtCount(n: number): string {
+  if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`;
+  if (n >= 1e3) return `${(n / 1e3).toFixed(1)}k`;
+  return String(n);
+}
+
+/**
+ * What the CPU is doing, core by core.
+ *
+ * A single average is the wrong number on a router: receive processing is
+ * pinned to whichever core takes the NIC interrupt, so the box can be at
+ * its routing ceiling with one core saturated and three idle. The card
+ * leads with the busiest core, and shows the two counters that say whether
+ * the network path is keeping up — packets dropped for lack of backlog,
+ * and softirq budget exhaustions.
+ */
+function CpuCard() {
+  const { t } = useTranslation();
+  const [cpu, setCpu] = useState<CPUProbe>();
+
+  useEffect(() => {
+    const load = () => api.cpu().then(setCpu).catch(() => {});
+    load();
+    const id = setInterval(load, 5000);
+    return () => clearInterval(id);
+  }, []);
+
+  const ready = cpu && !cpu.warming && cpu.cores.length > 0;
+  // Only worth showing when something is actually being lost now.
+  const losing = (cpu?.cores ?? []).filter((c) => c.dropped_rate > 0 || c.squeezed_rate > 0);
+
+  return (
+    <Card index={1} id="cpu" className="md:col-span-4 order-5 md:order-none"
+      title={oneLine(t("overview.cpu"))} icon={Cpu} iconTone="muted" help="cpu"
+      action={cpu?.governor ? <Pill tone="muted">{cpu.governor}</Pill> : undefined}>
+      {!ready ? <SkeletonRows rows={3} /> : (
+        <>
+          <div className="flex items-center gap-4">
+            <Gauge value={Math.round(cpu!.busiest_pct)} size="sm" mode="consumption"
+              ariaLabel={`${t("overview.cpuBusiest")} ${cpu!.busiest_pct}%`} />
+            <div className="min-w-0">
+              <p className="stat-md">{cpu!.busiest_pct}%</p>
+              <p className="text-caption text-muted mt-1">
+                {t("overview.cpuBusiest")} · {t("overview.cpuAverage", { pct: cpu!.usage_pct })}
+              </p>
+            </div>
+          </div>
+
+          {/* Per core: the imbalance is the point. */}
+          <div className="mt-3 space-y-1.5">
+            {cpu!.cores.map((c) => (
+              <div key={c.idx} className="flex items-center gap-2 text-caption">
+                <span className="w-10 shrink-0 text-muted">{t("overview.cpuCore", { n: c.idx })}</span>
+                <div className="h-1.5 flex-1 rounded-full bg-surface-2 overflow-hidden">
+                  <div
+                    className={`h-full rounded-full transition-[width] duration-500 ${
+                      c.usage_pct >= 85 ? "bg-danger" : c.usage_pct >= 60 ? "bg-warn" : "bg-accent"
+                    }`}
+                    style={{ width: `${Math.min(100, c.usage_pct)}%` }}
+                  />
+                </div>
+                <span className="w-10 text-right text-muted" style={{ fontVariantNumeric: "tabular-nums" }}>
+                  {Math.round(c.usage_pct)}%
+                </span>
+                {c.freq_mhz ? (
+                  <span className="w-16 text-right text-faint" style={{ fontVariantNumeric: "tabular-nums" }}>
+                    {c.freq_mhz} MHz
+                  </span>
+                ) : null}
+                {/* Drops since boot. Not an alarm — the banner covers what
+                    is happening now — but the record of a core that has
+                    been the bottleneck is worth seeing. */}
+                {c.dropped > 0 ? (
+                  <span className="w-20 text-right text-warn" style={{ fontVariantNumeric: "tabular-nums" }}
+                    title={t("overview.cpuDroppedTotal", { n: c.dropped.toLocaleString() })}>
+                    {fmtCount(c.dropped)} ↓
+                  </span>
+                ) : <span className="w-20" />}
+              </div>
+            ))}
+          </div>
+
+          <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1 text-caption text-muted">
+            {cpu!.load.length > 0 && (
+              <span>{t("overview.load")}: {cpu!.load.map((l) => l.toFixed(2)).join(" · ")}</span>
+            )}
+            {cpu!.temp_c != null && (
+              <span title={cpu!.temp_source}>
+                {Math.round(cpu!.temp_c)} °C{cpu!.temp_source ? ` (${cpu!.temp_source})` : ""}
+              </span>
+            )}
+          </div>
+
+          {/* Packets the kernel threw away because a core could not keep
+              up. Shown only while it is happening. */}
+          {losing.length > 0 && (
+            <Banner tone="warn" className="mt-3">
+              {t("overview.cpuDropping", {
+                cores: losing.map((c) => c.idx).join(", "),
+                pps: Math.round(losing.reduce((a, c) => a + c.dropped_rate, 0)),
+              })}
+            </Banner>
+          )}
+
+          {cpu!.procs.length > 0 && (
+            <div className="mt-3 border-t border-border/50 pt-2.5">
+              <div className="text-caption text-muted mb-1.5">{t("overview.cpuTop")}</div>
+              {cpu!.procs.map((pr) => (
+                <div key={pr.pid} className="flex items-center gap-2 text-caption">
+                  <span className="flex-1 truncate font-medium" translate="no">{pr.name}</span>
+                  <span className="text-muted" style={{ fontVariantNumeric: "tabular-nums" }}>{pr.usage_pct}%</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </>
+      )}
+    </Card>
+  );
+}
+
 function MemoryCard({ system }: { system?: SystemInfo }) {
   const { t } = useTranslation();
   const used = system ? system.memory.total - system.memory.available : 0;
   const pct = system ? Math.round((used / system.memory.total) * 100) : 0;
   return (
-    <Card index={1} id="recursos" className="md:col-span-4 order-5 md:order-none"
+    <Card index={1} id="recursos" className="md:col-span-4 order-6 md:order-none"
       title={oneLine(t("overview.memory"))} icon={MemoryStick} iconTone="muted" help="memory">
       {!system ? <SkeletonRows rows={2} /> : (
         <div className="flex items-center gap-4">
@@ -141,7 +267,7 @@ function FlashCard({ system }: { system?: SystemInfo }) {
   const freePct = system ? Math.round((system.root.free / system.root.total) * 100) : 0;
   const tone = freePct <= 10 ? "danger" : freePct <= 20 ? "warn" : "ok";
   return (
-    <Card index={1} className="md:col-span-4 order-6 md:order-none"
+    <Card index={1} className="md:col-span-4 order-7 md:order-none"
       title={oneLine(t("overview.flash"))} icon={HardDrive} help="flash">
       {!system ? <SkeletonRows rows={2} /> : (
         <div className="flex items-center gap-4">
@@ -494,7 +620,7 @@ function TopConsumersCard({ clients, onNavigate }: { clients?: Client[]; onNavig
   const hasAnything = deviceRows || multiSeries || appRows;
 
   return (
-    <Card index={3} className="md:col-span-12 order-7 md:order-none"
+    <Card index={3} className="md:col-span-8 order-8 md:order-none"
       title={oneLine(t("overview.topConsumers"))} icon={ChartColumn} iconTone="teal" help="dpi">
       {/* Devices — the half the title promises and the port chart can never
           show. nlbwmon covers wired clients and anything behind a switch;
@@ -788,10 +914,14 @@ export function Overview({ board, system, wan, ethports, drift, onDriftChange, i
   return (
     <div className="grid grid-cols-1 md:grid-cols-12 gap-[var(--card-gap)]">
       <HealthHero health={health} board={board} system={system} onNavigate={onNavigate} />
+      {/* El enlace y su tráfico en vivo: 4 + 8 = una fila completa. */}
       {!isSwitch && <InternetCard wan={wan} mode={mode} />}
+      <LiveTrafficCard />
+      {/* Recursos del equipo, los tres juntos: 4 + 4 + 4. */}
+      <CpuCard />
       <MemoryCard system={system} />
       <FlashCard system={system} />
-      <LiveTrafficCard />
+      {/* Consumo a lo largo del tiempo: histórico 4 + quién gasta 8. */}
       <HistoryCard />
       {!isSwitch && <TopConsumersCard clients={clients} onNavigate={onNavigate} />}
       <PortsCard ports={ethports} onNavigate={onNavigate} />
