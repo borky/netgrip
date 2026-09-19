@@ -1,0 +1,128 @@
+name: fork-release
+
+# Publishes this fork's own release binaries.
+#
+# Why a separate workflow instead of the upstream one: this branch carries
+# commits that need the monitoring agent's unreleased payload fields, so the
+# build needs both repositories and a Go workspace. Upstream's packaging
+# workflow knows nothing about that and would fail here. Keeping ours in its
+# own file means upstream's copy is never edited, so it never conflicts on a
+# sync — disable it once in the Actions tab instead.
+#
+# The asset names matter: self-update downloads netgrip-linux-<arch>, where
+# arch is armv7 for 32-bit arm (see binaryAssetName in selfupdate.go). Get a
+# name wrong and the update is silently never offered.
+#
+# OpenWrt .ipk/.apk packages are deliberately not built here. This fork is
+# installed by copying the binary; add the SDK jobs from upstream's workflow
+# if that changes.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release tag (e.g. v1.0.0)'
+        required: true
+
+concurrency:
+  group: fork-release-${{ inputs.version || github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: armv7
+            goarch: arm
+          - arch: arm64
+            goarch: arm64
+          - arch: amd64
+            goarch: amd64
+          - arch: mipsle
+            goarch: mipsle
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: netgrip
+
+      # The agent module: this branch reports the panel port and the uplink
+      # policy through payload fields that are not in a released
+      # netpulse/agent yet. A workspace keeps go.mod byte-identical to
+      # upstream's, so the file never conflicts on a sync.
+      - uses: actions/checkout@v4
+        with:
+          repository: borky/netpulse
+          ref: develop
+          path: netpulse
+
+      - name: Resolve release tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create release if missing
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        working-directory: netgrip
+        run: gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --generate-notes
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: netgrip/app/package-lock.json
+
+      # The binary embeds internal/server/dist, so the frontend has to exist
+      # before the Go build. Vite writes outside the app root and will not
+      # empty that directory itself, so clear it: stale asset sets from an
+      # earlier build would otherwise be embedded alongside the new one.
+      - name: Build frontend
+        working-directory: netgrip
+        run: |
+          rm -rf internal/server/dist
+          npm ci --prefix app --no-audit --no-fund
+          npm run build --prefix app
+          test -f internal/server/dist/index.html
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache-dependency-path: netgrip/go.sum
+
+      - name: Cross-compile (${{ matrix.arch }})
+        working-directory: netgrip
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          go work init . ../netpulse/agent
+          # armv7 needs GOARM=7; mips needs soft-float. Each variable is
+          # ignored by the architectures it does not apply to.
+          if [ "${{ matrix.goarch }}" = "arm" ]; then
+            export GOARM=7
+          else
+            export GOMIPS=softfloat
+          fi
+          GOOS=linux GOARCH=${{ matrix.goarch }} CGO_ENABLED=0 go build \
+            -ldflags "-s -w -X main.version=${TAG}" \
+            -o "/tmp/netgrip-linux-${{ matrix.arch }}" ./cmd/netgrip
+          file "/tmp/netgrip-linux-${{ matrix.arch }}"
+
+      - name: Upload the asset self-update looks for
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        working-directory: netgrip
+        run: gh release upload "$TAG" "/tmp/netgrip-linux-${{ matrix.arch }}" --clobber
