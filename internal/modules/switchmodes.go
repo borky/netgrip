@@ -160,10 +160,11 @@ func applySegmentedHome(uplink string) error {
 	for vid, members := range vlanAssign {
 		secName := "netgrip_vlan_" + vid
 		ops = append(ops, executor.Op{Kind: "uci_set", Args: []string{"network." + secName, "bridge-vlan"}})
-		ops = append(ops, executor.Op{Kind: "uci_set", Args: []string{"network." + secName + ".device", "br-lan"}})
+		ops = append(ops, executor.Op{Kind: "uci_set", Args: []string{"network." + secName + ".device", LANBridge()}})
 		ops = append(ops, executor.Op{Kind: "uci_set", Args: []string{"network." + secName + ".vlan", vid}})
 		for _, p := range members {
-			ops = append(ops, executor.Op{Kind: "uci_add_list", Args: []string{"network." + secName + ".ports", p}})
+			ops = append(ops, executor.Op{Kind: "uci_add_list", Args: []string{"network." + secName + ".ports",
+				formatVlanPort(VLANPort{Port: p, PVID: true})}})
 		}
 		ops = append(ops, executor.Op{Kind: "uci_add_list", Args: []string{"network." + secName + ".ports", uplink + ":t"}})
 	}

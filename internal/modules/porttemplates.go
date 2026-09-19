@@ -163,12 +163,9 @@ func ApplyPortTemplate(req PortTemplateApply) error {
 	for _, port := range req.Ports {
 		for _, vlan := range tpl.VLANs {
 			vidStr := fmt.Sprintf("%d", vlan.VID)
-			portVal := port
-			if vlan.Tagged {
-				portVal = port + ":t"
-			}
+			portVal := formatVlanPort(VLANPort{Port: port, Tagged: vlan.Tagged, PVID: !vlan.Tagged})
 			// Find the bridge-vlan section for this VID
-			section := findVLANSection(vlan.VID)
+			section := findVLANSectionByVID(vlan.VID)
 			if section != "" {
 				executor.Run(executor.Op{Kind: "uci_add_list", Args: []string{"network." + section + ".ports", portVal}})
 			} else {
@@ -178,7 +175,7 @@ func ApplyPortTemplate(req PortTemplateApply) error {
 				if err == nil {
 					newSec := strings.TrimSpace(string(out))
 					executor.Apply([]executor.Op{
-						{Kind: "uci_set", Args: []string{"network." + newSec + ".device", "br-lan"}},
+						{Kind: "uci_set", Args: []string{"network." + newSec + ".device", LANBridge()}},
 						{Kind: "uci_set", Args: []string{"network." + newSec + ".vlan", vidStr}},
 						{Kind: "uci_add_list", Args: []string{"network." + newSec + ".ports", portVal}},
 					}, nil)

@@ -32,8 +32,8 @@ func ProbeMode() *ModeProbe {
 		HasWifi:       hasWifiRadios(),
 		PortCount:     len(bridgePortList()),
 	}
-	out, err := exec.Command("ip", "-o", "link", "show", "wan").Output()
-	if err == nil && strings.Contains(string(out), "master br-lan") {
+	out, err := exec.Command("ip", "-o", "link", "show", wanPortName()).Output()
+	if err == nil && strings.Contains(string(out), "master "+LANBridge()) {
 		p.WanInBridge = true
 	}
 	switch {
@@ -121,10 +121,15 @@ func SetMode(target string) (*ModeProbe, bool, error) {
 	return after, false, nil
 }
 
-// routerAlive checks the router is still on the network after a mode change:
-// br-lan must be up and carry an IPv4 address.
+// routerAlive checks the router is still on the network after a mode
+// change: the LAN's own L3 device must carry an IPv4. That device is the
+// bridge on simple setups but a VLAN sub-interface of it (br-lan.10) under
+// 802.1Q filtering, where the bridge itself holds no address - checking
+// the bridge there reports a healthy router as dead and triggers a
+// needless rollback.
 func routerAlive() bool {
-	resolved, err := exec.Command("sh", "-c", "ip -4 -o addr show br-lan | grep -q 'inet '").Output()
+	resolved, err := exec.Command("sh", "-c",
+		"ip -4 -o addr show "+LANDevice()+" | grep -q 'inet '").Output()
 	return err == nil || len(resolved) > 0
 }
 
@@ -140,12 +145,22 @@ func modeOps(target string, probe *ModeProbe) ([]executor.Op, error) {
 		ops = append(ops, executor.Op{Kind: "uci_del_list", Args: []string{key, value}})
 	}
 
+	// The bridge is not always the first device section, nor always named
+	// br-lan, and the WAN port is not always named "wan" - all three are
+	// resolved so a renamed bridge or board-specific port name does not
+	// send these writes at the wrong section.
+	bridgeSec := BridgeDeviceSection()
+	if bridgeSec == "" {
+		bridgeSec = "@device[0]"
+	}
+	wanPort := wanPortName()
+
 	if target == "router" {
 		// Gate: restore WAN as a real interface (DHCP client), pull it out of
 		// the LAN bridge, and enable dnsmasq + firewall.
-		del("network.@device[0].ports", "wan")
+		del("network."+bridgeSec+".ports", wanPort)
 		set("network.wan", "interface")
-		set("network.wan.device", "wan")
+		set("network.wan.device", wanPort)
 		set("network.wan.proto", "dhcp")
 		ops = append(ops,
 			executor.Op{Kind: "initd", Args: []string{"dnsmasq", "enable"}},
@@ -157,8 +172,8 @@ func modeOps(target string, probe *ModeProbe) ([]executor.Op, error) {
 		// Drop the WAN interface and merge the WAN port back into the bridge;
 		// the lan becomes a DHCP client of the new gateway.
 		ops = append(ops, executor.Op{Kind: "uci_delete", Args: []string{"network.wan"}})
-		add("network.@device[0].ports", "wan")
-		set("network.lan.device", "br-lan")
+		add("network."+bridgeSec+".ports", wanPort)
+		set("network.lan.device", LANBridge())
 		if uciGet("network.lan.proto") == "static" {
 			set("network.lan.proto", "dhcp")
 		}

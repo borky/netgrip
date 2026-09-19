@@ -123,13 +123,27 @@ func ListClients(requesterIP string) []Client {
 				wifiPorts[iface.Ifname] = true
 			}
 		}
-		for port, macs := range bridgeFdb() {
+		fdb := bridgeFdb()
+		// Ports in a stable order, one row per device: a MAC learned on two
+		// ports would otherwise land on whichever port the map happened to
+		// yield first and flip between refreshes.
+		fdbPorts := make([]string, 0, len(fdb))
+		for port := range fdb {
+			fdbPorts = append(fdbPorts, port)
+		}
+		sort.Strings(fdbPorts)
+		cableBlk := cableBlockedSet()
+		seenWired := map[string]bool{}
+		for _, port := range fdbPorts {
 			if wifiPorts[port] {
 				continue
 			}
-			cableBlk := cableBlockedSet()
-			for _, mac := range macs {
+			for _, mac := range fdb[port] {
 				mac = strings.ToLower(mac)
+				if seenWired[mac] {
+					continue
+				}
+				seenWired[mac] = true
 				c := Client{MAC: mac, Type: "cable", Iface: port, Blocked: len(denied[mac]) > 0 || cableBlk[mac]}
 				fillIdentity(&c, mac, requesterIP, leaseSource, byMac, arp)
 				c.Reserved = reserved[mac]
