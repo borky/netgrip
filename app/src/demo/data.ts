@@ -355,6 +355,25 @@ export const demoLag: T.LAGProbe = {
   free_ports: ["wan", "lan1", "lan2"],
 };
 
+/** Top consumers for the demo: devices by MAC and protocols, the shape
+ *  nlbwmon reports on a real router. */
+export const demoNlbwmonTop = {
+  devices: [
+    { key: "aa:bb:cc:00:11:01", ip: "192.168.1.31", conns: 4210, down_bytes: 48_300_000_000, up_bytes: 3_100_000_000 },
+    { key: "aa:bb:cc:00:11:02", ip: "192.168.1.42", conns: 1880, down_bytes: 21_700_000_000, up_bytes: 1_450_000_000 },
+    { key: "aa:bb:cc:00:11:03", ip: "192.168.1.55", conns: 940, down_bytes: 8_900_000_000, up_bytes: 640_000_000 },
+    { key: "aa:bb:cc:00:11:04", ip: "192.168.1.60", conns: 510, down_bytes: 3_200_000_000, up_bytes: 290_000_000 },
+    { key: "aa:bb:cc:00:11:05", ip: "192.168.1.77", conns: 260, down_bytes: 900_000_000, up_bytes: 120_000_000 },
+  ],
+  apps: [
+    { key: "HTTPS", conns: 9100, down_bytes: 52_000_000_000, up_bytes: 4_100_000_000 },
+    { key: "QUIC", conns: 2400, down_bytes: 18_400_000_000, up_bytes: 1_200_000_000 },
+    { key: "HTTP", conns: 1500, down_bytes: 6_800_000_000, up_bytes: 410_000_000 },
+    { key: "DNS", conns: 8600, down_bytes: 14_000_000, up_bytes: 12_000_000 },
+    { key: "other", conns: 3200, down_bytes: 2_300_000_000, up_bytes: 800_000_000 },
+  ],
+};
+
 export const demoNlbwmon: T.NlbwmonProbe = {
   installed: true,
   running: true,

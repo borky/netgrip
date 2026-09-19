@@ -352,6 +352,7 @@ export const demoApi: typeof api = {
     return write(state.iot);
   },
   nlbwmon: () => get(state.nlbwmon),
+  nlbwmonTop: () => get(D.demoNlbwmonTop),
   setNlbwmon: async (cfg) => write({ ...state.nlbwmon, ...cfg, running: cfg.enabled ?? state.nlbwmon.running }),
   firewall: () => get(state.firewall),
   addFirewallRule: async (rule) => {
