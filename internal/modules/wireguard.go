@@ -400,8 +400,8 @@ func enableWG(snapNetwork, snapFirewall string) (*WGProbe, bool, error) {
 	//      which gives clients lan/wan access via the zone forwardings)
 	if executor.ServiceEnabled("firewall") {
 		src := "lan"
-		if uciSectionExists("network.wan") {
-			src = "wan"
+		if hasUplink() {
+			src = internetZone()
 		}
 		set("firewall."+wgFirewallRule, "rule")
 		set("firewall."+wgFirewallRule+".name", "Allow-netgrip-WireGuard")
