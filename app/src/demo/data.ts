@@ -339,10 +339,21 @@ export const demoDriftWarn: T.DriftProbe = {
 export const demoVlans: T.VLANProbe = {
   applicable: true,
   bridge: "br-lan",
-  vlans: [{ vid: 1, name: "lan", device: "br-lan", ports: [
-    { port: "wan", tagged: false }, { port: "lan1", tagged: false }, { port: "lan2", tagged: false },
-    { port: "lan3", tagged: false }, { port: "lan4", tagged: false },
-  ], default: true }],
+  vlans: [
+    { vid: 1, name: "lan", device: "br-lan", ports: [
+      { port: "wan", tagged: false }, { port: "lan1", tagged: false },
+      { port: "lan3", tagged: false }, { port: "lan4", tagged: false },
+    ], default: true },
+    { vid: 10, name: "iot", device: "br-lan", ports: [
+      { port: "lan2", tagged: false }, { port: "lan4", tagged: true },
+    ], default: false },
+    { vid: 20, name: "guest", device: "br-lan", ports: [
+      { port: "lan2", tagged: false }, { port: "lan4", tagged: true },
+    ], default: false },
+    { vid: 30, name: "servers", device: "br-lan", ports: [
+      { port: "lan3", tagged: true }, { port: "lan4", tagged: true },
+    ], default: false },
+  ],
   ports: ["wan", "lan1", "lan2", "lan3", "lan4"],
 };
 
@@ -355,8 +366,6 @@ export const demoLag: T.LAGProbe = {
   free_ports: ["wan", "lan1", "lan2"],
 };
 
-/** Top consumers for the demo: devices by MAC and protocols, the shape
- *  nlbwmon reports on a real router. */
 /** A four-core router with the NIC interrupt pinned to one core: the shape
  *  the card exists to make visible. */
 export const demoCpu = {
@@ -380,6 +389,8 @@ export const demoCpu = {
   warming: false,
 };
 
+/** Top consumers for the demo: devices by MAC and protocols, the shape
+ *  nlbwmon reports on a real router. */
 export const demoNlbwmonTop = {
   devices: [
     { key: "aa:bb:cc:00:11:01", ip: "192.168.1.31", conns: 4210, down_bytes: 48_300_000_000, up_bytes: 3_100_000_000 },
