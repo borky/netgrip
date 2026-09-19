@@ -140,6 +140,7 @@ func New(rpcdURL, version string) *Server {
 	s.mux.HandleFunc("GET /api/https", s.requireAuth(s.handleHTTPSGet))
 	s.mux.HandleFunc("POST /api/https", s.requireAuth(s.handleHTTPSEnable))
 	s.mux.HandleFunc("POST /api/wol", s.requireAuth(s.handleWoL))
+	s.mux.HandleFunc("GET /api/cpu", s.requireAuth(s.handleCPUGet))
 	s.mux.HandleFunc("GET /api/nlbwmon", s.requireAuth(s.handleNlbwmonGet))
 	s.mux.HandleFunc("GET /api/nlbwmon/top", s.requireAuth(s.handleNlbwmonTopGet))
 	s.mux.HandleFunc("POST /api/nlbwmon", s.requireAuth(s.handleNlbwmonSet))
@@ -249,6 +250,11 @@ func (s *Server) handleSPA(w http.ResponseWriter, r *http.Request) {
 	if path != "" {
 		if f, err := dist.Open(path); err == nil {
 			f.Close()
+			// Built assets carry a content hash in their name, so a change
+			// produces a different URL: they can be cached forever.
+			if strings.HasPrefix(path, "assets/") {
+				w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+			}
 			http.FileServer(http.FS(dist)).ServeHTTP(w, r)
 			return
 		}
@@ -258,6 +264,11 @@ func (s *Server) handleSPA(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "frontend not embedded", http.StatusInternalServerError)
 		return
 	}
+	// index.html must never be cached: it is what names the hashed bundle.
+	// Served without this, a browser reuses the old copy after an upgrade
+	// and keeps loading the previous frontend against the new backend —
+	// which looks like a bug in whatever changed, not like a stale page.
+	w.Header().Set("Cache-Control", "no-cache, must-revalidate")
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Write(data)
 }
@@ -1198,7 +1209,9 @@ func (s *Server) handleEthPorts(w http.ResponseWriter, _ *http.Request) {
 func (s *Server) handleUsteer(w http.ResponseWriter, _ *http.Request) {
 	aps, err := modules.UsteerNetwork()
 	if err != nil {
-		writeError(w, http.StatusBadGateway, err.Error())
+		// usteer isn't installed on most routers; that's not a gateway
+		// failure, just an empty mesh view.
+		writeJSON(w, map[string]any{"aps": []modules.UsteerAP{}})
 		return
 	}
 	writeJSON(w, map[string]any{"aps": aps})
@@ -1646,6 +1659,12 @@ func (s *Server) handleWoL(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]string{"status": "sent"})
+}
+
+// handleCPUGet: per-core load, clock, temperature and the packet-drop
+// counters. Cheap enough to poll: only /proc and /sys reads.
+func (s *Server) handleCPUGet(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, modules.ProbeCPU())
 }
 
 func (s *Server) handleNlbwmonGet(w http.ResponseWriter, _ *http.Request) {
