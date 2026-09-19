@@ -2,12 +2,14 @@ package modules
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
 	"regexp"
 	"strconv"
 	"strings"
 
 	"github.com/gnacho/netgrip/internal/executor"
+	"github.com/gnacho/netgrip/internal/ubus"
 )
 
 const fwdPrefix = "netgrip_fwd_"
@@ -20,6 +22,16 @@ type FwdRule struct {
 	DestIP   string `json:"dest_ip"`
 	DestPort string `json:"dest_port"`
 	Proto    string `json:"proto"`
+	// Kind tells the two ways in which something is reachable from the
+	// Internet apart: "forward" is a DNAT redirect to a host on the LAN,
+	// "input" is a port on the ROUTER itself (a VPN listener, an exposed
+	// admin page). Only forwards were ever listed, so a WireGuard port was
+	// invisible here.
+	Kind string `json:"kind"`
+	// Managed: this rule was created by NetGrip and can be removed here.
+	// Anything set up in LuCI or by hand is listed read-only: hiding it
+	// would be worse than not offering to delete it.
+	Managed bool `json:"managed"`
 }
 
 // FwdProbe is the read-only port forwarding state.
@@ -34,19 +46,101 @@ var (
 	reFwdSection = regexp.MustCompile(`^` + fwdPrefix + `[a-z0-9_]+$`)
 )
 
-// ProbeFwd reads the port forwarding state.
+// firewallSections lists the UCI section names of a firewall type
+// ("redirect", "rule", "zone").
+func firewallSections(kind string) []string {
+	out, err := exec.Command("sh", "-c",
+		"uci show firewall | grep '="+kind+"$' | cut -d. -f2 | cut -d= -f1").Output()
+	if err != nil {
+		return nil
+	}
+	return strings.Fields(string(out))
+}
+
+// internetZones names the firewall zones that face the Internet: the ones
+// carrying the network of the active uplink.
+//
+// Resolved, not assumed. The zone is not always called "wan" and "has NAT"
+// is not the test either: a VPN zone masquerades too, and traffic arriving
+// through the tunnel is not traffic arriving from the Internet. Falls back
+// to the conventional name when the uplink cannot be resolved, so a router
+// with the WAN down still reports something sensible.
+func internetZones() map[string]bool {
+	wanNet := ubus.ActiveWANInterfaceName()
+	zones := map[string]bool{}
+	for _, section := range firewallSections("zone") {
+		base := "firewall." + section
+		name := uciGet(base + ".name")
+		if name == "" {
+			continue
+		}
+		for _, n := range strings.Fields(uciGet(base + ".network")) {
+			if n == wanNet {
+				zones[name] = true
+			}
+		}
+	}
+	if len(zones) == 0 {
+		zones["wan"] = true
+	}
+	return zones
+}
+
+// stockRuleNames are the rules the firmware ships with, read from the
+// read-only factory config. DHCP renew, ISAKMP and the ICMP rules accept
+// traffic from the Internet on every OpenWrt install: listing them as
+// "things you opened" would bury the one rule that somebody did open.
+// Nothing is hardcoded — if /rom is not there, nothing is treated as stock.
+func stockRuleNames() map[string]bool {
+	b, err := os.ReadFile("/rom/etc/config/firewall")
+	if err != nil {
+		return map[string]bool{}
+	}
+	return parseStockNames(string(b))
+}
+
+// parseStockNames pulls the `option name` values out of a UCI config.
+func parseStockNames(config string) map[string]bool {
+	names := map[string]bool{}
+	for _, line := range strings.Split(config, "\n") {
+		f := strings.Fields(line)
+		if len(f) >= 3 && f[0] == "option" && f[1] == "name" {
+			if n := strings.Trim(f[2], "'\""); n != "" {
+				names[n] = true
+			}
+		}
+	}
+	return names
+}
+
+// ProbeFwd reads what is reachable from the Internet.
+//
+// It used to list only redirects whose section name carried NetGrip's own
+// prefix, so a port forward created in LuCI did not exist as far as this
+// card was concerned — and it never looked at input rules at all, which is
+// how a VPN listener is opened. Both cases reported "nothing is open to the
+// Internet", the one answer a firewall page must never get wrong.
 func ProbeFwd() *FwdProbe {
 	p := &FwdProbe{
 		HasWan:   uciSectionExists("network.wan"),
 		Firewall: executor.ServiceEnabled("firewall"),
 		Rules:    []FwdRule{},
 	}
-	out, err := exec.Command("sh", "-c", "uci show firewall | grep '=redirect' | cut -d. -f2 | cut -d= -f1 | grep '^"+fwdPrefix+"'").Output()
-	if err != nil {
-		return p
-	}
-	for _, section := range strings.Fields(string(out)) {
+	wanZones := internetZones()
+	stock := stockRuleNames()
+
+	// DNAT redirects: a port on the router handed to a host on the LAN.
+	// Only those coming FROM the Internet — a redirect from an internal
+	// zone is something else entirely (forcing local DNS, say), and
+	// counting it as an exposure would be alarming and wrong.
+	for _, section := range firewallSections("redirect") {
 		base := "firewall." + section
+		if uciGet(base+".enabled") == "0" || !wanZones[uciGet(base+".src")] {
+			continue
+		}
+		if t := uciGet(base + ".target"); t != "" && t != "DNAT" {
+			continue
+		}
 		p.Rules = append(p.Rules, FwdRule{
 			Section:  section,
 			Name:     uciGet(base + ".name"),
@@ -54,6 +148,35 @@ func ProbeFwd() *FwdProbe {
 			DestIP:   uciGet(base + ".dest_ip"),
 			DestPort: uciGet(base + ".dest_port"),
 			Proto:    uciGet(base + ".proto"),
+			Kind:     "forward",
+			Managed:  reFwdSection.MatchString(section),
+		})
+	}
+
+	// Input rules: a port open on the router itself. No dest zone means the
+	// traffic ends here; with a dest it is a forward between zones, which
+	// is a different question. A rule with no port is a protocol allowance
+	// (ping, ESP), not an open port.
+	for _, section := range firewallSections("rule") {
+		base := "firewall." + section
+		if uciGet(base+".enabled") == "0" || uciGet(base+".target") != "ACCEPT" {
+			continue
+		}
+		if !wanZones[uciGet(base+".src")] || uciGet(base+".dest") != "" {
+			continue
+		}
+		port := uciGet(base + ".dest_port")
+		name := uciGet(base + ".name")
+		if port == "" || stock[name] {
+			continue
+		}
+		p.Rules = append(p.Rules, FwdRule{
+			Section:  section,
+			Name:     name,
+			SrcDport: port,
+			Proto:    uciGet(base + ".proto"),
+			Kind:     "input",
+			Managed:  reFwdSection.MatchString(section),
 		})
 	}
 	return p

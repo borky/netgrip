@@ -841,6 +841,9 @@ export default {
     keyLabel: "Password",
   },
   fwd: {
+    thisRouter: "this router",
+    external: "external",
+    externalHint: "Created outside NetGrip (LuCI or by hand). Shown here, edited there.",
     title: "Port forwarding",
     noWan: "Only applies on the gateway (needs WAN and firewall)",
     empty: "No rules yet",
