@@ -141,6 +141,7 @@ func New(rpcdURL, version string) *Server {
 	s.mux.HandleFunc("POST /api/https", s.requireAuth(s.handleHTTPSEnable))
 	s.mux.HandleFunc("POST /api/wol", s.requireAuth(s.handleWoL))
 	s.mux.HandleFunc("GET /api/nlbwmon", s.requireAuth(s.handleNlbwmonGet))
+	s.mux.HandleFunc("GET /api/nlbwmon/top", s.requireAuth(s.handleNlbwmonTopGet))
 	s.mux.HandleFunc("POST /api/nlbwmon", s.requireAuth(s.handleNlbwmonSet))
 	s.mux.HandleFunc("GET /api/firewall", s.requireAuth(s.handleFirewallGet))
 	s.mux.HandleFunc("POST /api/firewall", s.requireAuth(s.handleFirewallAddRule))
@@ -1649,6 +1650,20 @@ func (s *Server) handleWoL(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleNlbwmonGet(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, modules.ProbeNlbwmon())
+}
+
+// handleNlbwmonTopGet: who used the most, by device and by protocol.
+//
+// The only per-device accounting a gateway has. The wireless counters in
+// Client cover just the stations associated to this router, so on a gateway
+// whose clients sit behind a switch they are always empty; nlbwmon sees
+// every flow. Empty lists when it is not installed — the UI then falls back
+// to what it showed before.
+func (s *Server) handleNlbwmonTopGet(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, map[string]any{
+		"devices": modules.NlbwmonTopDevices(8),
+		"apps":    modules.NlbwmonTopApps(8),
+	})
 }
 
 func (s *Server) handleNlbwmonSet(w http.ResponseWriter, r *http.Request) {
