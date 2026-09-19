@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -86,6 +87,58 @@ func internetZones() map[string]bool {
 	return zones
 }
 
+// internetZone names the one firewall zone to attach a rule to when the rule
+// is about traffic arriving from the Internet. internetZones answers the
+// reading question ("which zones face outwards"); this answers the writing
+// one, where exactly one name has to be chosen.
+//
+// A rule written against a zone the uplink is not in is accepted by UCI,
+// reloaded without complaint and never matches anything - a forward that
+// silently forwards nothing. Picking the lowest name keeps the choice stable
+// across calls when a router has several outward zones, so repeated writes do
+// not shuffle between them.
+func internetZone() string {
+	return pickInternetZone(internetZones())
+}
+
+// pickInternetZone chooses one name out of the outward-facing set.
+func pickInternetZone(zones map[string]bool) string {
+	names := make([]string, 0, len(zones))
+	for name, ok := range zones {
+		if ok && name != "" {
+			names = append(names, name)
+		}
+	}
+	if len(names) == 0 {
+		return "wan"
+	}
+	sort.Strings(names)
+	return names[0]
+}
+
+// uplinkNetwork names the network the internet arrives on, for the options
+// that take an interface rather than a zone (ddns's ip_network). Falls back
+// to the conventional name, so a router with the uplink down keeps writing
+// what it wrote before.
+func uplinkNetwork() string {
+	if n := ubus.ActiveWANInterfaceName(); n != "" {
+		return n
+	}
+	return "wan"
+}
+
+// hasUplink reports whether this router has an internet uplink at all,
+// which decides whether the features that need one offer themselves.
+//
+// Asking whether a section named "wan" exists answers a different question:
+// a router whose uplink is PPPoE named after the provider has no such
+// section and looked like it had no internet, while one whose idle cellular
+// modem happens to be called "wan" looked like it had. Either the live
+// uplink resolves, or the conventional section is there.
+func hasUplink() bool {
+	return ubus.ActiveWANInterfaceName() != "" || uciSectionExists("network.wan")
+}
+
 // stockRuleNames are the rules the firmware ships with, read from the
 // read-only factory config. DHCP renew, ISAKMP and the ICMP rules accept
 // traffic from the Internet on every OpenWrt install: listing them as
@@ -122,7 +175,7 @@ func parseStockNames(config string) map[string]bool {
 // Internet", the one answer a firewall page must never get wrong.
 func ProbeFwd() *FwdProbe {
 	p := &FwdProbe{
-		HasWan:   uciSectionExists("network.wan"),
+		HasWan:   hasUplink(),
 		Firewall: executor.ServiceEnabled("firewall"),
 		Rules:    []FwdRule{},
 	}
@@ -227,7 +280,7 @@ func AddFwdRule(srcDport, destIP, destPort, proto string) (*FwdProbe, bool, erro
 	ops := []executor.Op{
 		{Kind: "uci_set", Args: []string{base, "redirect"}},
 		{Kind: "uci_set", Args: []string{base + ".name", "netgrip-fwd-" + srcDport}},
-		{Kind: "uci_set", Args: []string{base + ".src", "wan"}},
+		{Kind: "uci_set", Args: []string{base + ".src", internetZone()}},
 		{Kind: "uci_set", Args: []string{base + ".src_dport", srcDport}},
 		{Kind: "uci_set", Args: []string{base + ".dest", "lan"}},
 		{Kind: "uci_set", Args: []string{base + ".dest_ip", destIP}},

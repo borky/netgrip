@@ -276,8 +276,8 @@ func enableOVPN(rollback func()) (*OVPNProbe, bool, error) {
 		set("network.vpn0.device", "tun0")
 		ops = append(ops, executor.Op{Kind: "uci_commit", Args: []string{"network"}})
 		src := "lan"
-		if uciSectionExists("network.wan") {
-			src = "wan"
+		if hasUplink() {
+			src = internetZone()
 		}
 		set("firewall."+ovpnFwRule, "rule")
 		set("firewall."+ovpnFwRule+".name", "Allow-netgrip-OpenVPN")

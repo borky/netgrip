@@ -26,7 +26,7 @@ type ModeProbe struct {
 // ProbeMode detects the router mode and hardware class.
 func ProbeMode() *ModeProbe {
 	p := &ModeProbe{
-		WanConfigured: uciSectionExists("network.wan"),
+		WanConfigured: hasUplink(),
 		DnsmasqOn:     executor.ServiceEnabled("dnsmasq"),
 		FirewallOn:    executor.ServiceEnabled("firewall"),
 		HasWifi:       hasWifiRadios(),
