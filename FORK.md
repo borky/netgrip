@@ -54,6 +54,23 @@ These would go upstream tomorrow if they could:
 | Reporting the panel port and the uplink policy to the monitoring agent | Needs `PanelPort` and `MultiWan` in a released `netpulse/agent`. Only builds with the local `go.work` until then. |
 | The multi-WAN half of the fork-per-item performance work | The file it touches is not upstream yet (see the open multi-WAN PR). |
 
+## The identifying-data hooks
+
+`.git/hooks/pre-commit` scans the staged diff and `.git/hooks/commit-msg`
+scans the message, both against the patterns in
+`~/.claude/no-identifying-data.txt` — addresses from the LAN, hardware and
+host names, credentials, personal identifiers. A match blocks the commit and
+names the pattern that fired.
+
+Hooks are not versioned, so **a fresh clone has no protection until they are
+reinstalled**. Copy `no-identifying-data.py`, `pre-commit` and `commit-msg`
+into the new clone's `.git/hooks/` and mark them executable. The pattern file
+stays outside every repository on purpose: a list of what you want hidden is
+itself a description of your network.
+
+A missing pattern file warns instead of blocking, so a clone on another
+machine can still commit. `git commit --no-verify` overrides once, deliberately.
+
 ## Building
 
 The agent-reporting commits need the monitoring repo checked out beside this
