@@ -47,7 +47,7 @@ func ProbeIPv6() *IPv6Probe {
 		HasWan:         hasUplink(),
 	}
 	if p.HasWan {
-		p.WanIPv6 = uciGet("network.wan.ipv6")
+		p.WanIPv6 = uciGet("network." + uplinkNetwork() + ".ipv6")
 	}
 	raOff := p.RaMode == "disabled" || p.RaMode == ""
 	dhcpv6Off := p.Dhcpv6Mode == "disabled" || p.Dhcpv6Mode == ""

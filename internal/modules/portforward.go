@@ -133,10 +133,14 @@ func uplinkNetwork() string {
 // Asking whether a section named "wan" exists answers a different question:
 // a router whose uplink is PPPoE named after the provider has no such
 // section and looked like it had no internet, while one whose idle cellular
-// modem happens to be called "wan" looked like it had. Either the live
-// uplink resolves, or the conventional section is there.
+// modem happens to be called "wan" looked like it had. Asking whether the
+// RESOLVED uplink's section exists answers it: the resolver falls back to
+// the conventional name when nothing qualifies, so a pure access point
+// (no default route, no wan section) reports false, a renamed uplink
+// reports its own section, and a router whose uplink is merely down still
+// has the section and reports true.
 func hasUplink() bool {
-	return ubus.ActiveWANInterfaceName() != "" || uciSectionExists("network.wan")
+	return uciSectionExists("network." + ubus.ActiveWANInterfaceName())
 }
 
 // stockRuleNames are the rules the firmware ships with, read from the
