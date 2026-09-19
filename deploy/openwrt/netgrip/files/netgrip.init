@@ -13,6 +13,11 @@ start_service() {
 	local port
 	port=$(uci -q get netgrip.main.port 2>/dev/null)
 	[ -n "$port" ] || port=8090
+	# Where this build looks for its own releases. Unset means upstream, so
+	# a normal install needs nothing here; a packaged or patched build sets
+	# it to the releases it was actually built from.
+	local update_repo
+	update_repo=$(uci -q get netgrip.main.update_repo 2>/dev/null)
 	procd_open_instance
 	# HTTPS for the panel itself. Off unless asked for: an upgrade must not
 	# change anybody's URL. netgrip.main.https and the https_cert/https_key
@@ -28,9 +33,12 @@ start_service() {
 	# arguments, and that also splits a certificate path containing a space,
 	# which loses the flag its argument without a word of complaint.
 	set --
+	if [ -n "$update_repo" ]; then
+		set -- -update-repo "$update_repo"
+	fi
 	case "$https" in
 		1|on|true|yes)
-			set -- -https
+			set -- "$@" -https
 			if [ -n "$https_cert" ]; then
 				set -- "$@" -https-cert "$https_cert"
 			fi
