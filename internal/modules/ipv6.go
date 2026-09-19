@@ -44,7 +44,7 @@ func ProbeIPv6() *IPv6Probe {
 		RaMode:         uciGet("dhcp.lan.ra"),
 		Dhcpv6Mode:     uciGet("dhcp.lan.dhcpv6"),
 		DnsmasqRunning: executor.ServiceRunning("dnsmasq"),
-		HasWan:         uciSectionExists("network.wan"),
+		HasWan:         hasUplink(),
 	}
 	if p.HasWan {
 		p.WanIPv6 = uciGet("network.wan.ipv6")
@@ -99,8 +99,8 @@ func ipv6Ops(enable bool) []executor.Op {
 	}
 	if enable {
 		set("network.lan.ipv6", "1")
-		if uciSectionExists("network.wan") {
-			set("network.wan.ipv6", "1")
+		if n := uplinkNetwork(); uciSectionExists("network." + n) {
+			set("network."+n+".ipv6", "1")
 		}
 		set("dhcp.lan.ra", "server")
 		set("dhcp.lan.dhcpv6", "server")
@@ -113,8 +113,8 @@ func ipv6Ops(enable bool) []executor.Op {
 		)
 	} else {
 		set("network.lan.ipv6", "0")
-		if uciSectionExists("network.wan") {
-			set("network.wan.ipv6", "0")
+		if n := uplinkNetwork(); uciSectionExists("network." + n) {
+			set("network."+n+".ipv6", "0")
 		}
 		set("dhcp.lan.ra", "disabled")
 		set("dhcp.lan.dhcpv6", "disabled")

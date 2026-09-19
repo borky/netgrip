@@ -358,9 +358,9 @@ func ddnsEntryOps(cfg DDNSConfig, section string, hadConfig bool) ([]executor.Op
 	if cfg.LookupHost != "" {
 		set(base+".lookup_host", cfg.LookupHost)
 	}
-	if uciSectionExists("network.wan") {
+	if hasUplink() {
 		set(base+".ip_source", "network")
-		set(base+".ip_network", "wan")
+		set(base+".ip_network", uplinkNetwork())
 	} else {
 		set(base+".ip_source", "web")
 		set(base+".ip_url", "http://checkip.dyndns.org")
