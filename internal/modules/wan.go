@@ -6,9 +6,11 @@ import (
 	"strings"
 
 	"github.com/gnacho/netgrip/internal/executor"
+	"github.com/gnacho/netgrip/internal/ubus"
 )
 
-// WANConfig is the editable WAN (network.wan + its device) configuration.
+// WANConfig is the editable WAN configuration: whichever interface
+// ubus.ActiveWANInterfaceName resolves as the active uplink, and its device.
 type WANConfig struct {
 	Proto    string `json:"proto"` // dhcp | static | pppoe
 	Device   string `json:"device,omitempty"`
@@ -23,7 +25,7 @@ type WANConfig struct {
 }
 
 func wanUCI(key string) string {
-	out, err := exec.Command("uci", "-q", "get", "network.wan."+key).Output()
+	out, err := exec.Command("uci", "-q", "get", "network."+ubus.ActiveWANInterfaceName()+"."+key).Output()
 	if err != nil {
 		return ""
 	}
@@ -60,12 +62,13 @@ func ApplyWANConfig(cfg WANConfig) (WANConfig, error) {
 		_ = executor.Restore("network", snap)
 		_ = executor.Run(executor.Op{Kind: "initd", Args: []string{"network", "reload"}})
 	}
-	ops := []executor.Op{{Kind: "uci_set", Args: []string{"network.wan.proto", cfg.Proto}}}
+	iface := ubus.ActiveWANInterfaceName()
+	ops := []executor.Op{{Kind: "uci_set", Args: []string{"network." + iface + ".proto", cfg.Proto}}}
 	setIf := func(key, val string) {
 		if val == "" {
 			return
 		}
-		ops = append(ops, executor.Op{Kind: "uci_set", Args: []string{"network.wan." + key, val}})
+		ops = append(ops, executor.Op{Kind: "uci_set", Args: []string{"network." + iface + "." + key, val}})
 	}
 	setIf("device", cfg.Device)
 	setIf("ipaddr", cfg.IPAddr)

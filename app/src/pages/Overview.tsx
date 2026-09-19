@@ -104,7 +104,7 @@ function InternetCard({ wan, mode }: { wan?: WanStatus; mode?: ModeProbe }) {
           {!wan.up && <Banner tone="danger" className="mb-2">{t("overview.wanDown")}</Banner>}
           <KeyValue items={[
             { label: t("wan.gateway"), value: wan.gateway ?? "—", mono: true },
-            { label: t("wan.dns"), value: wan.dns.join("  ") || "—", mono: true },
+            { label: t("wan.dns"), value: (wan.dns ?? []).join("  ") || "—", mono: true },
             ...(wan.up ? [{ label: t("system.uptime"), value: t("overview.wanSince", { time: fmtUptime(t, wan.uptime) }) }] : []),
           ]} />
         </>
@@ -513,8 +513,7 @@ function PortsCard({ ports, onNavigate }: { ports?: EthPort[]; onNavigate: (p: s
   const [selected, setSelected] = useState<string>();
 
   const sorted = useMemo(() => !ports ? [] : [...ports].sort((a, b) => {
-    if (a.name === "wan") return -1;
-    if (b.name === "wan") return 1;
+    if (a.wan !== b.wan) return a.wan ? -1 : 1;
     return a.name.localeCompare(b.name, undefined, { numeric: true });
   }), [ports]);
 

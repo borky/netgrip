@@ -522,6 +522,8 @@ export interface DriftProbe {
 export interface VLANPort {
   port: string;
   tagged: boolean;
+  /** Port's ingress VLAN (the "*" in UCI's "lan2:u*"); round-tripped untouched. */
+  pvid?: boolean;
 }
 
 export interface VLAN {
