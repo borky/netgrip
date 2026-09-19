@@ -127,7 +127,7 @@ func pingWANOps(accept bool) []executor.Op {
 			return []executor.Op{
 				{Kind: "uci_set", Args: []string{"firewall." + remotePingIdx, "rule"}},
 				{Kind: "uci_set", Args: []string{"firewall." + remotePingIdx + ".name", "Allow-Ping"}},
-				{Kind: "uci_set", Args: []string{"firewall." + remotePingIdx + ".src", "wan"}},
+				{Kind: "uci_set", Args: []string{"firewall." + remotePingIdx + ".src", internetZone()}},
 				{Kind: "uci_set", Args: []string{"firewall." + remotePingIdx + ".proto", "icmp"}},
 				{Kind: "uci_set", Args: []string{"firewall." + remotePingIdx + ".icmp_type", "echo-request"}},
 				{Kind: "uci_set", Args: []string{"firewall." + remotePingIdx + ".target", "ACCEPT"}},
@@ -164,7 +164,7 @@ func remoteRuleOps(kind string, accept bool) []executor.Op {
 	return []executor.Op{
 		{Kind: "uci_set", Args: []string{"firewall." + idx, "rule"}},
 		{Kind: "uci_set", Args: []string{"firewall." + idx + ".name", "netgrip-remote-" + kind}},
-		{Kind: "uci_set", Args: []string{"firewall." + idx + ".src", "wan"}},
+		{Kind: "uci_set", Args: []string{"firewall." + idx + ".src", internetZone()}},
 		{Kind: "uci_set", Args: []string{"firewall." + idx + ".proto", proto}},
 		{Kind: "uci_set", Args: []string{"firewall." + idx + ".dest_port", port}},
 		{Kind: "uci_set", Args: []string{"firewall." + idx + ".target", target}},

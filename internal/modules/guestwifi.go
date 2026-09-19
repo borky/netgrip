@@ -39,7 +39,7 @@ type GuestProbe struct {
 // ProbeGuest reads the guest network state.
 func ProbeGuest() *GuestProbe {
 	p := &GuestProbe{
-		Gateway: uciSectionExists("network.wan") && executor.ServiceEnabled("firewall"),
+		Gateway: hasUplink() && executor.ServiceEnabled("firewall"),
 		Ifaces:  []string{},
 	}
 	if !p.Gateway {
@@ -158,7 +158,7 @@ func guestOps(cfg GuestConfig) ([]executor.Op, error) {
 			ops = append(ops, executor.Op{Kind: "uci_add_list", Args: []string{"firewall." + guestZoneName + ".network", "guest"}})
 			set("firewall."+guestFwdName, "forwarding")
 			set("firewall."+guestFwdName+".src", "guest")
-			set("firewall."+guestFwdName+".dest", "wan")
+			set("firewall."+guestFwdName+".dest", internetZone())
 		}
 
 		devices := guestRadios(cfg.Band)
