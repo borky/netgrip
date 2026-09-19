@@ -240,8 +240,16 @@ func BounceLink(iface string) (*LinkBounceResult, error) {
 }
 
 func bridgePorts() map[string]bool {
+	return bridgePortsOf(LANBridge())
+}
+
+// bridgePortsOf lists the member ports of a bridge. The bridge name comes
+// from the config rather than a hardcoded "br-lan": renaming the bridge
+// used to make every port-based probe (VLANs, PoE, storm control, MAC ACL)
+// come up empty.
+func bridgePortsOf(bridge string) map[string]bool {
 	ports := map[string]bool{}
-	entries, err := os.ReadDir("/sys/class/net/br-lan/brif")
+	entries, err := os.ReadDir("/sys/class/net/" + bridge + "/brif")
 	if err != nil {
 		return ports
 	}
@@ -312,7 +320,7 @@ type IGMPProbe struct {
 }
 
 func ProbeIGMP() *IGMPProbe {
-	data, err := os.ReadFile("/sys/class/net/br-lan/bridge/multicast_snooping")
+	data, err := os.ReadFile("/sys/class/net/" + LANBridge() + "/bridge/multicast_snooping")
 	if err != nil {
 		return &IGMPProbe{Applicable: false}
 	}
@@ -331,7 +339,7 @@ func SetIGMP(enabled bool) (*IGMPProbe, error) {
 	if enabled {
 		val = "1"
 	}
-	if err := os.WriteFile("/sys/class/net/br-lan/bridge/multicast_snooping", []byte(val), 0644); err != nil {
+	if err := os.WriteFile("/sys/class/net/"+LANBridge()+"/bridge/multicast_snooping", []byte(val), 0644); err != nil {
 		return nil, fmt.Errorf("write igmp: %w", err)
 	}
 	return ProbeIGMP(), nil
