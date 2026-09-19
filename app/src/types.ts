@@ -887,12 +887,24 @@ export interface DiagnosticsTools {
   dig: boolean;
 }
 
+/** One line of the self-test with the reason behind it. `info` marks
+ *  something that could not be proven but is not a fault — a provider that
+ *  does not answer pings is the usual case. */
+export interface SelfTestCheck {
+  key: "gateway" | "wan" | "dns" | "ntp";
+  ok: boolean;
+  info?: boolean;
+  detail?: string;
+}
+
 export interface SelfTestResult {
   gateway: boolean;
   wan: boolean;
   dns: boolean;
   ntp: boolean;
   all_ok: boolean;
+  /** The same results with their reasons, in display order. */
+  checks: SelfTestCheck[];
   tools: DiagnosticsTools;
 }
 
