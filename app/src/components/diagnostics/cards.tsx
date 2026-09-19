@@ -48,17 +48,19 @@ export function SelfTestCard({ onResult }: { onResult: (r: SelfTestResult) => vo
 
   useEffect(() => { run(); /* eslint-disable-line react-hooks/exhaustive-deps */ }, []);
 
-  const checks: { key: string; ok: boolean }[] = result
-    ? [
-        { key: t("diagnostics.gateway"), ok: result.gateway },
-        { key: t("diagnostics.wan"), ok: result.wan },
-        { key: t("diagnostics.dns"), ok: result.dns },
-        { key: t("diagnostics.ntp"), ok: result.ntp },
-      ]
-    : [];
+  // The checks come from the server with the reason for each one.
+  const checks = result?.checks ?? [];
 
+  // A missing binary only matters when nothing else does its job. nslookup
+  // and dig are alternatives — the lookup tries nslookup and falls back to
+  // dig — so listing whichever is absent announced a fault on a router
+  // where DNS diagnostics work perfectly.
   const missingTools = result
-    ? (["traceroute", "nslookup", "dig"] as const).filter((k) => !result.tools[k])
+    ? [
+        ...(result.tools.ping ? [] : ["ping"]),
+        ...(result.tools.traceroute ? [] : ["traceroute"]),
+        ...(result.tools.nslookup || result.tools.dig ? [] : ["nslookup"]),
+      ]
     : [];
 
   return (
@@ -73,10 +75,19 @@ export function SelfTestCard({ onResult }: { onResult: (r: SelfTestResult) => vo
       {result && !error && (
         <div className="mt-3 flex flex-col gap-2">
           {checks.map((c) => (
-            <div key={c.key} className="flex items-center gap-2">
-              <StatusDot tone={c.ok ? "ok" : "danger"} label={c.ok ? t("diagnostics.ok") : t("diagnostics.fail")} />
-              <span className="text-small">{c.key}</span>
-              {c.key === t("diagnostics.ntp") && <span className="text-caption text-faint">{t("diagnostics.ntpApprox")}</span>}
+            <div key={c.key} className="flex items-start gap-2">
+              {/* Amber, not red, for something merely unproven: a provider
+                  that ignores pings is not a fault to chase. */}
+              <StatusDot
+                tone={c.ok ? "ok" : c.info ? "warn" : "danger"}
+                label={c.ok ? t("diagnostics.ok") : c.info ? t("diagnostics.unknown") : t("diagnostics.fail")}
+              />
+              <div className="min-w-0">
+                <span className="text-small">{t(`diagnostics.${c.key}`)}</span>
+                {/* The reason, always: a dot on its own says nothing. */}
+                {c.detail && <div className="text-caption text-muted">{c.detail}</div>}
+                {c.key === "ntp" && <div className="text-caption text-faint">{t("diagnostics.ntpApprox")}</div>}
+              </div>
             </div>
           ))}
           <div className="mt-1">

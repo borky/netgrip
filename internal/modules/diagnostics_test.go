@@ -205,3 +205,38 @@ func TestRunDiagnosticsInvalidHost(t *testing.T) {
 		t.Fatal("expected error for invalid port")
 	}
 }
+
+// A provider that drops ICMP on its end of the link is the common case, and
+// it used to turn a working connection red with no explanation.
+func TestSelfTestChecksCarryTheirReason(t *testing.T) {
+	res := RunSelfTest()
+	if len(res.Checks) != 4 {
+		t.Fatalf("expected one entry per check: %+v", res.Checks)
+	}
+	seen := map[string]SelfTestCheck{}
+	for _, c := range res.Checks {
+		if c.Detail == "" {
+			t.Errorf("%s has no reason attached", c.Key)
+		}
+		seen[c.Key] = c
+	}
+	for _, k := range []string{"gateway", "wan", "dns", "ntp"} {
+		if _, ok := seen[k]; !ok {
+			t.Errorf("missing check %q", k)
+		}
+	}
+	// all_ok ignores what is merely unproven, and never ignores a failure.
+	want := true
+	for _, c := range res.Checks {
+		if !c.OK && !c.Info {
+			want = false
+		}
+	}
+	if res.AllOk != want {
+		t.Errorf("all_ok=%v, want %v for %+v", res.AllOk, want, res.Checks)
+	}
+	// The legacy booleans still mirror the checks, for anything reading them.
+	if seen["dns"].OK != res.DNS || seen["wan"].OK != res.Wan {
+		t.Errorf("the flat fields drifted from the checks: %+v", res)
+	}
+}
