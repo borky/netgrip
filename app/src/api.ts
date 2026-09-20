@@ -249,7 +249,14 @@ const realApi = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({}),
     }),
-  dns: () => request<import("./types").DNSConfig>("/api/dns"),
+  dns: () =>
+    request<import("./types").DNSConfig>("/api/dns"),
+  adguardAction: (action: "start" | "stop") =>
+    request<import("./types").ModuleResult<import("./types").DNSConfig>>("/api/dns/adguard/action", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action }),
+    }),
   setDns: (opts: { rebind_protection?: boolean; override_dns?: boolean; dns_vpn?: boolean }) =>
     request<import("./types").ModuleResult<import("./types").DNSConfig>>("/api/dns", {
       method: "POST",
@@ -782,6 +789,52 @@ const realApi = {
     }),
   deleteLanService: (id: string) =>
     request<void>(`/api/lanservices?id=${encodeURIComponent(id)}`, { method: "DELETE" }),
+
+  // banIP (#351)
+  banip: () =>
+    request<import("./types").BanipProbe>("/api/banip"),
+  banipAction: (action: string) =>
+    request<import("./types").ModuleResult<import("./types").BanipProbe>>("/api/banip/action", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action }),
+    }),
+  banipSetFeeds: (cfg: import("./types").BanipFeedsConfig) =>
+    request<import("./types").ModuleResult<import("./types").BanipProbe>>("/api/banip/feeds", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(cfg),
+    }),
+  banipInstall: () =>
+    request<import("./types").BanipProbe>("/api/banip/install", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ confirm: true }),
+    }),
+  banipUninstall: () =>
+    request<import("./types").BanipProbe>("/api/banip/uninstall", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ confirm: true }),
+    }),
+  banipStatus: () =>
+    request<import("./types").BanipStatus>("/api/banip/status"),
+  banipSearch: (ip: string) =>
+    request<import("./types").BanipSearchResult>(`/api/banip/search?ip=${encodeURIComponent(ip)}`),
+  banipList: (list: "allowlist" | "blocklist") =>
+    request<{ entries: string[] }>(`/api/banip/${list}`),
+  banipListAdd: (list: "allowlist" | "blocklist", entry: string) =>
+    request<import("./types").ModuleResult<import("./types").BanipProbe>>(`/api/banip/${list}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ entry }),
+    }),
+  banipListRemove: (list: "allowlist" | "blocklist", entry: string) =>
+    request<import("./types").ModuleResult<import("./types").BanipProbe>>(`/api/banip/${list}`, {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ entry }),
+    }),
 
 };
 

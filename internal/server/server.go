@@ -64,6 +64,19 @@ func New(rpcdURL, version string) *Server {
 	s.mux.HandleFunc("POST /api/ddns", s.requireAuth(s.handleDDNSSet))
 	s.mux.HandleFunc("DELETE /api/ddns", s.requireAuth(s.handleDDNSDelete))
 	s.mux.HandleFunc("POST /api/ddns/force", s.requireAuth(s.handleDDNSForce))
+	s.mux.HandleFunc("GET /api/banip", s.requireAuth(s.handleBanipGet))
+	s.mux.HandleFunc("POST /api/banip/action", s.requireAuth(s.handleBanipAction))
+	s.mux.HandleFunc("POST /api/banip/feeds", s.requireAuth(s.handleBanipFeeds))
+	s.mux.HandleFunc("POST /api/banip/install", s.requireAuth(s.handleBanipInstall))
+	s.mux.HandleFunc("POST /api/banip/uninstall", s.requireAuth(s.handleBanipUninstall))
+	s.mux.HandleFunc("GET /api/banip/status", s.requireAuth(s.handleBanipStatus))
+	s.mux.HandleFunc("GET /api/banip/search", s.requireAuth(s.handleBanipSearch))
+	s.mux.HandleFunc("GET /api/banip/allowlist", s.requireAuth(s.handleBanipListGet))
+	s.mux.HandleFunc("POST /api/banip/allowlist", s.requireAuth(s.handleBanipListAdd))
+	s.mux.HandleFunc("DELETE /api/banip/allowlist", s.requireAuth(s.handleBanipListDelete))
+	s.mux.HandleFunc("GET /api/banip/blocklist", s.requireAuth(s.handleBanipListGet))
+	s.mux.HandleFunc("POST /api/banip/blocklist", s.requireAuth(s.handleBanipListAdd))
+	s.mux.HandleFunc("DELETE /api/banip/blocklist", s.requireAuth(s.handleBanipListDelete))
 	s.mux.HandleFunc("GET /api/sqm", s.requireAuth(s.handleSQMGet))
 	s.mux.HandleFunc("POST /api/sqm", s.requireAuth(s.handleSQMSet))
 	s.mux.HandleFunc("POST /api/sqm/test", s.requireAuth(s.handleBufferbloatTest))
@@ -110,6 +123,7 @@ func New(rpcdURL, version string) *Server {
 	s.mux.HandleFunc("POST /api/lan/reservations/clear", s.requireAuth(s.handleReservationsClear))
 	s.mux.HandleFunc("GET /api/dns", s.requireAuth(s.handleDNSGet))
 	s.mux.HandleFunc("POST /api/dns", s.requireAuth(s.handleDNSSet))
+	s.mux.HandleFunc("POST /api/dns/adguard/action", s.requireAuth(s.handleAdGuardAction))
 	s.mux.HandleFunc("POST /api/dns/hosts", s.requireAuth(s.handleDNSHostsSet))
 	s.mux.HandleFunc("GET /api/netdev", s.requireAuth(s.handleNetDev))
 	s.mux.HandleFunc("GET /api/ethports", s.requireAuth(s.handleEthPorts))
@@ -623,6 +637,125 @@ func (s *Server) handleDDNSForce(w http.ResponseWriter, r *http.Request) {
 	}
 	probe, err := modules.ForceDDNSUpdate(req.Section)
 	writeModuleResult(w, probe, false, err)
+}
+
+func (s *Server) handleBanipGet(w http.ResponseWriter, _ *http.Request) {
+	// Cached (TTL 3s): the probe forks several commands and the UI loads
+	// it on page open; mutations invalidate the cache.
+	writeJSON(w, modules.ProbeBanIPCached())
+}
+
+type banipActionRequest struct {
+	Action string `json:"action"`
+}
+
+func (s *Server) handleBanipAction(w http.ResponseWriter, r *http.Request) {
+	var req banipActionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	probe, rolledBack, err := modules.BanipAction(req.Action)
+	writeModuleResult(w, probe, rolledBack, err)
+}
+
+func (s *Server) handleBanipFeeds(w http.ResponseWriter, r *http.Request) {
+	var cfg modules.BanipFeedsConfig
+	if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	probe, rolledBack, err := modules.SetBanipFeeds(cfg)
+	writeModuleResult(w, probe, rolledBack, err)
+}
+
+type banipInstallRequest struct {
+	Confirm bool `json:"confirm"`
+}
+
+func (s *Server) handleBanipInstall(w http.ResponseWriter, r *http.Request) {
+	var req banipInstallRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	probe, err := modules.InstallBanip(req.Confirm)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, probe)
+}
+
+func (s *Server) handleBanipUninstall(w http.ResponseWriter, r *http.Request) {
+	var req banipInstallRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	probe, err := modules.UninstallBanip(req.Confirm)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, probe)
+}
+
+func (s *Server) handleBanipStatus(w http.ResponseWriter, _ *http.Request) {
+	// Cached (TTL 2s, shared invalidation with the full probe): the status
+	// feeds the Services card and the progressive page paint.
+	writeJSON(w, modules.ProbeBanipStatusCached())
+}
+
+func (s *Server) handleBanipSearch(w http.ResponseWriter, r *http.Request) {
+	res, err := modules.SearchBanipIP(r.URL.Query().Get("ip"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, res)
+}
+
+// banipListRequest targets one local list. The list name is taken from the
+// URL path (allowlist|blocklist), never from the request body.
+type banipListRequest struct {
+	Entry string `json:"entry"`
+}
+
+func banipListName(r *http.Request) string {
+	if strings.HasSuffix(r.URL.Path, "/allowlist") {
+		return "allowlist"
+	}
+	return "blocklist"
+}
+
+func (s *Server) handleBanipListGet(w http.ResponseWriter, r *http.Request) {
+	entries, err := modules.BanipListEntries(banipListName(r))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, map[string]any{"entries": entries})
+}
+
+func (s *Server) handleBanipListAdd(w http.ResponseWriter, r *http.Request) {
+	var req banipListRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	probe, rolledBack, err := modules.SetBanipListEntry(banipListName(r), req.Entry, false)
+	writeModuleResult(w, probe, rolledBack, err)
+}
+
+func (s *Server) handleBanipListDelete(w http.ResponseWriter, r *http.Request) {
+	var req banipListRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	probe, rolledBack, err := modules.SetBanipListEntry(banipListName(r), req.Entry, true)
+	writeModuleResult(w, probe, rolledBack, err)
 }
 
 func (s *Server) handleSQMGet(w http.ResponseWriter, _ *http.Request) {
@@ -1170,6 +1303,18 @@ type dnsSetRequest struct {
 	RebindProtect *bool `json:"rebind_protection,omitempty"`
 	OverrideDNS   *bool `json:"override_dns,omitempty"`
 	DnsVpn        *bool `json:"dns_vpn,omitempty"`
+}
+
+func (s *Server) handleAdGuardAction(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Action string `json:"action"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	probe, rolledBack, err := modules.AdGuardAction(req.Action)
+	writeModuleResult(w, probe, rolledBack, err)
 }
 
 func (s *Server) handleDNSSet(w http.ResponseWriter, r *http.Request) {
