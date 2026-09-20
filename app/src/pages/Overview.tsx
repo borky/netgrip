@@ -150,8 +150,7 @@ function CpuCard() {
   return (
     <Card index={1} id="cpu" className="md:col-span-4 order-5 md:order-none"
       title={oneLine(t("overview.cpu"))} icon={Cpu} iconTone="muted" help="cpu"
-      onExpand={() => setDetail(true)} expandLabel={t("overview.cpuExpand")}
-      action={cpu?.governor ? <Pill tone="muted">{cpu.governor}</Pill> : undefined}>
+      onExpand={() => setDetail(true)} expandLabel={t("overview.cpuExpand")}>
       {!ready ? <SkeletonRows rows={1} /> : (
         <>
           <div className="flex items-center gap-4">
