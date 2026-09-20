@@ -381,7 +381,6 @@ export const demoCpu = {
   usage_pct: 31.1,
   busiest_pct: 88.1,
   load: [1.42, 1.18, 0.95],
-  governor: "performance",
   temp_c: 53,
   temp_source: "ath10k_hwmon",
   procs: [

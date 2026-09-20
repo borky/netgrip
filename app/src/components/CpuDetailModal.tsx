@@ -74,7 +74,6 @@ export function CpuDetailModal({ open, onClose }: { open: boolean; onClose: () =
                 {Math.round(cpu!.temp_c)} °C{cpu!.temp_source ? ` (${cpu!.temp_source})` : ""}
               </span>
             )}
-            {cpu!.governor && <span>{cpu!.governor}</span>}
           </div>
 
           {cpu!.procs.length > 0 && (

@@ -614,7 +614,6 @@ export interface CPUProbe {
    *  average does not. */
   busiest_pct: number;
   load: number[];
-  governor?: string;
   temp_c?: number;
   /** Which chip the reading came from: a board may expose no CPU sensor,
    *  and a WiFi radio idles warmer than a SoC. */
