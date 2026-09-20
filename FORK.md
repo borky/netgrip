@@ -41,9 +41,14 @@ only then tag.
 
 | patch | why it is not upstream |
 |---|---|
-| Update source defaults to this fork (`netgrip.init`) | The mechanism is upstream; only the default is ours. One line, deliberately. |
+| Configurable update source, defaulting to this fork (`selfupdate.go`, `cmd/netgrip/main.go`, `netgrip.init`) | Offered as gnacho/netgrip#345 and **declined**: upstream ties self-update to its own releases on purpose, and would rather a non-upstream build switched self-update off than carry a config surface for a case it does not have. Permanent fork patch, and the one this fork cannot do without — without it, accepting an update replaces this build with upstream's binary. |
 | Manual NetPulse pairing card shown (`app/src/pages/System.tsx`) | Upstream hides it on purpose. We need it: the monitoring server is on another subnet, so the LAN-broadcast discovery can never find it. |
 | `.gitignore` for local build outputs and `go.work` | Only relevant to this working style. |
+
+Upstream said it would reconsider "if a real downstream with its own release
+channel ever shows up". This fork now is one (`.github/workflows/fork-release.yml`
+publishes the assets self-update looks for), so the case is worth making again
+before assuming the patch is permanent.
 
 ## Waiting on upstream, not fork-only
 
