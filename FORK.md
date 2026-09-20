@@ -41,14 +41,15 @@ only then tag.
 
 | patch | why it is not upstream |
 |---|---|
-| Configurable update source, defaulting to this fork (`selfupdate.go`, `cmd/netgrip/main.go`, `netgrip.init`) | Offered as gnacho/netgrip#345 and **declined**: upstream ties self-update to its own releases on purpose, and would rather a non-upstream build switched self-update off than carry a config surface for a case it does not have. Permanent fork patch, and the one this fork cannot do without — without it, accepting an update replaces this build with upstream's binary. |
+| Configurable update source, defaulting to this fork (`selfupdate.go`, `cmd/netgrip/main.go`, `netgrip.init`) | Offered as gnacho/netgrip#345 and **declined**: upstream ties self-update to its own releases on purpose and would rather a non-upstream build switched self-update off than carry a config surface for a case it does not have. Kept anyway, for a narrower reason than the PR claimed: this fork is built from source and keeps the scheduler off (`netgrip.selfupdate.enabled='0'`), but that flag only governs the **scheduler** — `POST /api/selfupdate` applies an update without consulting it, so the panel would still offer upstream's release (a source build reports version `dev`, which compares as older than any tag) and one click would replace it. The patch removes the false "update available" and makes that click harmless. |
 | Manual NetPulse pairing card shown (`app/src/pages/System.tsx`) | Upstream hides it on purpose. We need it: the monitoring server is on another subnet, so the LAN-broadcast discovery can never find it. |
 | `.gitignore` for local build outputs and `go.work` | Only relevant to this working style. |
 
 Upstream said it would reconsider "if a real downstream with its own release
-channel ever shows up". This fork now is one (`.github/workflows/fork-release.yml`
-publishes the assets self-update looks for), so the case is worth making again
-before assuming the patch is permanent.
+channel ever shows up". Not worth pursuing while this fork is built from
+source for its own devices: there is no release channel to keep current, and
+`fork-release.yml` exists for the day there is. Revisit if the fork gets
+users who install binaries rather than build them.
 
 ## Waiting on upstream, not fork-only
 
