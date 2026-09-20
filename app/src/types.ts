@@ -361,6 +361,8 @@ export interface DNSConfig {
   override_dns: boolean;
   dns_vpn: boolean;
   adguard_active: boolean;
+  adguard_installed: boolean;
+  adguard_running: boolean;
   hosts: HostEntry[];
 }
 
@@ -651,6 +653,97 @@ export interface NlbwmonConfig {
   generations?: number;
   commit_interval?: number;
   prealloc_days?: number;
+}
+
+// banIP (#351). banIP owns its nft table; NetGrip reads UCI + init.d only.
+export interface BanipFeed {
+  name: string;
+  enabled: boolean;
+  /** "in" | "out" | "inout" override; "" = feed default */
+  direction: "" | "in" | "out" | "inout";
+  /** true when the feed exists in the local catalog (banip.feeds / custom) */
+  in_catalog: boolean;
+  /** catalog defaults, attached by the backend for configured feeds too */
+  chain?: "" | "in" | "out" | "inout";
+  ipv6?: boolean;
+}
+
+/** One feed available in the local catalog, not yet configured in UCI. */
+export interface BanipCatalogFeed {
+  name: string;
+  descr: string;
+  /** default direction from the catalog: "in" | "out" | "inout"; "" = unspecified */
+  chain: "" | "in" | "out" | "inout";
+  ipv6: boolean;
+  custom: boolean;
+}
+
+export interface BanipSetStat {
+  name: string;
+  elements: number;
+  packets_in: number;
+  packets_out: number;
+  local_allow: boolean;
+  local_block: boolean;
+}
+
+export interface BanipDos {
+  syn_packets: number;
+  udp_packets: number;
+  icmp_packets: number;
+  invalid_ct_packets: number;
+  invalid_tcp_packets: number;
+  syn_limit: number;
+  udp_limit: number;
+  icmp_limit: number;
+}
+
+export interface BanipReport {
+  parsed: boolean;
+  timestamp: string;
+  sets: BanipSetStat[];
+  total_ips: number;
+  packets_in: number;
+  packets_out: number;
+  auto_allow: number;
+  auto_block: number;
+  dos: BanipDos;
+}
+
+export interface BanipProbe {
+  installed: boolean;
+  enabled: boolean;
+  running: boolean;
+  nft_count: boolean;
+  applicable: boolean;
+  version: string;
+  mem_available_mb: number;
+  feeds: BanipFeed[];
+  /** available feeds not configured in UCI (from banip.feeds / custom.feeds) */
+  catalog: BanipCatalogFeed[];
+  report?: BanipReport;
+  allowlist: string[];
+  blocklist: string[];
+}
+
+export interface BanipFeedsConfig {
+  feeds: BanipFeed[];
+  enabled?: boolean;
+  nft_count?: boolean;
+}
+
+export interface BanipSearchResult {
+  ip: string;
+  found: boolean;
+  sets: string[];
+}
+
+/** Lightweight banIP status for the Services overview card (no report/lists). */
+export interface BanipStatus {
+  installed: boolean;
+  enabled: boolean;
+  running: boolean;
+  applicable: boolean;
 }
 
 export interface FWZone {
