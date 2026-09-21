@@ -244,6 +244,7 @@ export interface GuestProbe {
   active: boolean;
   ssid: string;
   subnet: string;
+  isolate: boolean;
   ifaces: string[];
   clients: number;
   gl_conflict: boolean;
@@ -360,12 +361,18 @@ export interface DNSConfig {
   rebind_protection: boolean;
   override_dns: boolean;
   dns_vpn: boolean;
+  force_dns: boolean;
   adguard_active: boolean;
   adguard_installed: boolean;
   adguard_running: boolean;
   adguard_protection: boolean;
   adguard_has_backup: boolean;
   adguard_dns_port?: number;
+  /** DoH (#364): active upstreams, current list (capped at 8) and the
+   *  provider presets the UI offers (backend single source of truth). */
+  doh_enabled: boolean;
+  doh_upstreams: string[];
+  doh_providers: { id: string; url: string }[];
   hosts: HostEntry[];
 }
 
