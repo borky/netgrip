@@ -126,6 +126,7 @@ func New(rpcdURL, version string) *Server {
 	s.mux.HandleFunc("POST /api/dns", s.requireAuth(s.handleDNSSet))
 	s.mux.HandleFunc("POST /api/dns/adguard/action", s.requireAuth(s.handleAdGuardAction))
 	s.mux.HandleFunc("POST /api/dns/adguard/protection", s.requireAuth(s.handleAdGuardProtection))
+	s.mux.HandleFunc("POST /api/dns/doh/action", s.requireAuth(s.handleAdGuardDoH))
 	s.mux.HandleFunc("POST /api/dns/hosts", s.requireAuth(s.handleDNSHostsSet))
 	s.mux.HandleFunc("GET /api/netdev", s.requireAuth(s.handleNetDev))
 	s.mux.HandleFunc("GET /api/ethports", s.requireAuth(s.handleEthPorts))
@@ -1343,6 +1344,7 @@ type dnsSetRequest struct {
 	RebindProtect *bool `json:"rebind_protection,omitempty"`
 	OverrideDNS   *bool `json:"override_dns,omitempty"`
 	DnsVpn        *bool `json:"dns_vpn,omitempty"`
+	ForceDNS      *bool `json:"force_dns,omitempty"`
 }
 
 func (s *Server) handleAdGuardAction(w http.ResponseWriter, r *http.Request) {
@@ -1374,13 +1376,26 @@ func (s *Server) handleAdGuardProtection(w http.ResponseWriter, r *http.Request)
 	writeModuleResult(w, probe, rolledBack, err)
 }
 
+func (s *Server) handleAdGuardDoH(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Action    string   `json:"action"`
+		Upstreams []string `json:"upstreams"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	probe, rolledBack, err := modules.AdGuardDoH(req.Action, req.Upstreams)
+	writeModuleResult(w, probe, rolledBack, err)
+}
+
 func (s *Server) handleDNSSet(w http.ResponseWriter, r *http.Request) {
 	var req dnsSetRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid json")
 		return
 	}
-	probe, rolledBack, err := modules.SetDNS(req.RebindProtect, req.OverrideDNS, req.DnsVpn)
+	probe, rolledBack, err := modules.SetDNS(req.RebindProtect, req.OverrideDNS, req.DnsVpn, req.ForceDNS)
 	writeModuleResult(w, probe, rolledBack, err)
 }
 
