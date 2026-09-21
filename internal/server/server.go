@@ -74,6 +74,7 @@ func New(rpcdURL, version string) *Server {
 	s.mux.HandleFunc("POST /api/banip/install", s.requireAuth(s.handleBanipInstall))
 	s.mux.HandleFunc("POST /api/banip/uninstall", s.requireAuth(s.handleBanipUninstall))
 	s.mux.HandleFunc("GET /api/banip/status", s.requireAuth(s.handleBanipStatus))
+	s.mux.HandleFunc("POST /api/banip/dismiss-ram-warning", s.requireAuth(s.handleBanipDismissRamWarning))
 	s.mux.HandleFunc("GET /api/banip/search", s.requireAuth(s.handleBanipSearch))
 	s.mux.HandleFunc("GET /api/banip/allowlist", s.requireAuth(s.handleBanipListGet))
 	s.mux.HandleFunc("POST /api/banip/allowlist", s.requireAuth(s.handleBanipListAdd))
@@ -128,6 +129,8 @@ func New(rpcdURL, version string) *Server {
 	s.mux.HandleFunc("GET /api/dns", s.requireAuth(s.handleDNSGet))
 	s.mux.HandleFunc("POST /api/dns", s.requireAuth(s.handleDNSSet))
 	s.mux.HandleFunc("POST /api/dns/adguard/action", s.requireAuth(s.handleAdGuardAction))
+	s.mux.HandleFunc("POST /api/dns/adguard/protection", s.requireAuth(s.handleAdGuardProtection))
+	s.mux.HandleFunc("POST /api/dns/doh/action", s.requireAuth(s.handleAdGuardDoH))
 	s.mux.HandleFunc("POST /api/dns/hosts", s.requireAuth(s.handleDNSHostsSet))
 	s.mux.HandleFunc("GET /api/netdev", s.requireAuth(s.handleNetDev))
 	s.mux.HandleFunc("GET /api/ethports", s.requireAuth(s.handleEthPorts))
@@ -760,6 +763,18 @@ func (s *Server) handleBanipStatus(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, modules.ProbeBanipStatusCached())
 }
 
+// handleBanipDismissRamWarning persists the dismiss of the current low-RAM
+// warning and answers with the updated probe, so the UI can drop the banner
+// without a reload.
+func (s *Server) handleBanipDismissRamWarning(w http.ResponseWriter, _ *http.Request) {
+	probe, err := modules.BanipDismissRamWarning()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, probe)
+}
+
 func (s *Server) handleBanipSearch(w http.ResponseWriter, r *http.Request) {
 	res, err := modules.SearchBanipIP(r.URL.Query().Get("ip"))
 	if err != nil {
@@ -1377,6 +1392,7 @@ type dnsSetRequest struct {
 	RebindProtect *bool `json:"rebind_protection,omitempty"`
 	OverrideDNS   *bool `json:"override_dns,omitempty"`
 	DnsVpn        *bool `json:"dns_vpn,omitempty"`
+	ForceDNS      *bool `json:"force_dns,omitempty"`
 }
 
 func (s *Server) handleAdGuardAction(w http.ResponseWriter, r *http.Request) {
@@ -1391,13 +1407,43 @@ func (s *Server) handleAdGuardAction(w http.ResponseWriter, r *http.Request) {
 	writeModuleResult(w, probe, rolledBack, err)
 }
 
+func (s *Server) handleAdGuardProtection(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Enable  bool `json:"enable"`
+		Confirm bool `json:"confirm"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if !req.Confirm {
+		writeError(w, http.StatusBadRequest, "confirmation required")
+		return
+	}
+	probe, rolledBack, err := modules.AdGuardProtection(req.Enable)
+	writeModuleResult(w, probe, rolledBack, err)
+}
+
+func (s *Server) handleAdGuardDoH(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Action    string   `json:"action"`
+		Upstreams []string `json:"upstreams"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	probe, rolledBack, err := modules.AdGuardDoH(req.Action, req.Upstreams)
+	writeModuleResult(w, probe, rolledBack, err)
+}
+
 func (s *Server) handleDNSSet(w http.ResponseWriter, r *http.Request) {
 	var req dnsSetRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid json")
 		return
 	}
-	probe, rolledBack, err := modules.SetDNS(req.RebindProtect, req.OverrideDNS, req.DnsVpn)
+	probe, rolledBack, err := modules.SetDNS(req.RebindProtect, req.OverrideDNS, req.DnsVpn, req.ForceDNS)
 	writeModuleResult(w, probe, rolledBack, err)
 }
 

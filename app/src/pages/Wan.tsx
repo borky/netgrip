@@ -8,6 +8,8 @@ import {
   Banner, Button, Card, Field, Pill, SegmentedControl, SkeletonRows, useToast,
 } from "../components/ui";
 import { MultiWanCard } from "../components/wan/MultiWanCard";
+import { ModeCard } from "../components/system/ModeCard";
+import { useLabs } from "../hooks/useLabs";
 
 const PROTO = ["dhcp", "static", "pppoe"] as const;
 const PROTO_KEY: Record<string, string> = {
@@ -68,6 +70,7 @@ export function WanPage({ mwan, onMwanChange }: {
 }) {
   const { t } = useTranslation();
   const { push } = useToast();
+  const { labs } = useLabs();
   const [status, setStatus] = useState<WanStatus>();
   const [cfg, setCfg] = useState<WANConfig>();
   const [form, setForm] = useState<WANConfig>({ proto: "dhcp" });
@@ -139,7 +142,8 @@ export function WanPage({ mwan, onMwanChange }: {
 
   return (
     <div className="flex flex-col gap-[var(--card-gap)]">
-      <Card index={0} icon={Globe} title={t("wan.title")}>
+      <ModeCard index={0} />
+      <Card index={1} icon={Globe} title={t("wan.title")}>
         {error ? (
           <Banner tone="danger">{t("common.loadError")}</Banner>
         ) : !status ? (
@@ -196,11 +200,7 @@ export function WanPage({ mwan, onMwanChange }: {
         )}
       </Card>
 
-      <Card
-        index={1}
-        icon={Save}
-        title={t("wan.configTitle")}
-        eyebrow={cfg?.iface ? t("wan.editingIface", { iface: cfg.iface }) : undefined}
+      <Card index={2} icon={Save} title={t("wan.configTitle")}
         action={
           !editing && cfg !== undefined ? (
             <Button variant="secondary" size="sm" icon={Pencil} onClick={() => setEditing(true)}>{t("wan.edit")}</Button>
@@ -262,7 +262,9 @@ export function WanPage({ mwan, onMwanChange }: {
         )}
       </Card>
 
-      <MultiWanCard probe={mwan} onChange={onMwanChange} index={2} />
+      {/* MultiWAN es funcionalidad labs: solo se dibuja con Labs activado
+          (Sistema > Opciones). */}
+      {labs && <MultiWanCard probe={mwan} onChange={onMwanChange} index={3} />}
     </div>
   );
 }

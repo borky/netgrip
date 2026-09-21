@@ -147,6 +147,15 @@ export function BanipPage() {
   const dosAvailable = !!report?.parsed;
   const enabledFeeds = useMemo(() => probe?.feeds.filter((f) => f.enabled) ?? [], [probe?.feeds]);
 
+  // Descartar el aviso de baja RAM: persiste el dismiss en el router (por
+  // timestamp de la ejecución) y actualiza el probe sin recargar la página.
+  // Una ejecución nueva de banIP cambia el timestamp y el aviso vuelve.
+  const dismissRamWarning = () => {
+    api.banipDismissRamWarning()
+      .then((p) => { setProbe(p); push({ tone: "ok", text: t("banip.ramWarningDismissed") }); })
+      .catch((e) => push({ tone: "danger", text: t("banip.actionFailed"), detail: e instanceof Error ? e.message : String(e) }));
+  };
+
   const installDialog = (
     <ConfirmDialog
       open={confirmInstall}
@@ -184,13 +193,15 @@ export function BanipPage() {
       return notInstalledView;
     }
     // Status conocido (instalado) y probe completo en camino: header real +
-    // skeletons en las zonas lentas.
+    // skeletons en las zonas lentas. Hasta el primer status la pill queda
+    // neutra: el fallback "Desactivado" era un estado falso bajo carga inicial.
     const stActive = !!st && st.enabled && st.running;
+    const statusPending = !st;
     return (
       <div className="flex flex-col gap-[var(--card-gap)]">
         <div className="flex flex-wrap items-center gap-2">
-          <Pill tone={stActive ? "ok" : st?.enabled ? "warn" : "muted"} live={stActive}>
-            {stActive ? t("banip.stateActive") : st?.enabled ? t("banip.stateStopped") : t("banip.stateDisabled")}
+          <Pill tone={statusPending ? "muted" : stActive ? "ok" : st?.enabled ? "warn" : "muted"} live={stActive}>
+            {statusPending ? t("banip.stateChecking") : stActive ? t("banip.stateActive") : st?.enabled ? t("banip.stateStopped") : t("banip.stateDisabled")}
           </Pill>
           <span className="flex-1" />
           <Button variant="primary" size="sm" disabled={busy !== null} onClick={() => setConfirmReload(true)}>
@@ -229,7 +240,6 @@ export function BanipPage() {
   }
 
   const active = probe.enabled && probe.running;
-  const lowMem = probe.mem_available_mb > 0 && probe.mem_available_mb < 256;
 
   const tabs: { value: Tab; label: string }[] = [
     { value: "feeds", label: t("banip.tabFeeds") },
@@ -297,7 +307,11 @@ export function BanipPage() {
 
       {/* Explicación sencilla + avisos */}
       <p className="text-small text-muted -mt-1">{t("banip.introDesc")}</p>
-      {lowMem && <Banner tone="warn">{t("banip.lowMem", { mb: fmtInt.format(probe.mem_available_mb) })}</Banner>}
+      {probe.ram_warning && !probe.ram_warning.dismissed && (
+        <Banner tone="warn" onDismiss={dismissRamWarning}>
+          {t("banip.lowMem", { mb: fmtInt.format(probe.ram_warning.free_mb) })}
+        </Banner>
+      )}
 
       {/* Resumen */}
       <div className="grid grid-cols-2 md:grid-cols-12 gap-[var(--card-gap)]">
