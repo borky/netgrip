@@ -51,6 +51,10 @@ source for its own devices: there is no release channel to keep current, and
 `fork-release.yml` exists for the day there is. Revisit if the fork gets
 users who install binaries rather than build them.
 
+Nine PRs have merged upstream, including the whole multi-WAN feature
+(gnacho/netgrip#337, merged as a merge commit rather than a squash — which is
+why a rebase dropped all thirteen of this branch's copies automatically).
+
 ## Waiting on upstream, not fork-only
 
 These would go upstream tomorrow if they could:
@@ -58,7 +62,7 @@ These would go upstream tomorrow if they could:
 | patch | blocked by |
 |---|---|
 | Reporting the panel port and the uplink policy to the monitoring agent | Needs `PanelPort` and `MultiWan` in a released `netpulse/agent`. Only builds with the local `go.work` until then. |
-| The multi-WAN half of the fork-per-item performance work | The file it touches is not upstream yet (see the open multi-WAN PR). |
+| The multi-WAN half of the fork-per-item performance work | **No longer blocked**: the multi-WAN module merged upstream (gnacho/netgrip#337), so this is offered as its own PR. It needed porting rather than cherry-picking - upstream's merged version keeps the tracker-state reading inline in `MwanActiveUplink`, while this branch had already factored it out as `mwanLiveState` in the agent-reporting commit above. |
 
 ## The identifying-data hooks
 
