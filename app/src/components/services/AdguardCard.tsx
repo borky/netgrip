@@ -1,25 +1,37 @@
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { Download, ExternalLink, Play, Shield, Square } from "lucide-react";
+import { Download, ExternalLink, Shield, Square } from "lucide-react";
 import { api } from "../../api";
 import type { DNSConfig } from "../../types";
-import { Button, Card, ConfirmDialog, Pill, SkeletonRows, useToast } from "../ui";
+import { Button, Card, ConfirmDialog, Field, Input, Pill, SkeletonRows, Toggle, useToast } from "../ui";
 import { InstallProgress, useInstallJob } from "../wizard/common";
 import { TechName } from "./shared";
 
+/** Select con el mismo estilo "filled" del Input de foundations (§4). */
+const SELECT_CLS = `h-[var(--input-h)] rounded-[10px] border border-transparent bg-fill px-2 text-small
+  outline-none transition-[background-color,border-color,box-shadow] duration-[var(--dur-fast)]
+  hover:border-border-strong focus:bg-surface focus:shadow-[0_0_0_2px_var(--color-accent)]`;
+
 /**
- * AdGuard Home (#359): instalación desde el catálogo opcional, arranque y
- * parada del servicio, y atajo a la config DNS (dnsmasq) cuando la
- * integración no está activa. La escritura dnsmasq sigue viviendo en la
- * página Red local; aquí solo se enlaza.
+ * AdGuard Home (#359, #360): un único toggle de "protección DNS" que hace el
+ * handoff completo. ON = paquete instalado, servicio en marcha y dnsmasq
+ * entregándole toda la red (con backup y healthcheck, en el backend). OFF =
+ * config DNS previa restaurada y servicio parado, sin desinstalar. El estado
+ * intermedio "en marcha pero sin filtrado" lleva su propia pill.
  */
-export function AdguardCard({ index = 0, onNavigate }: { index?: number; onNavigate?: (p: string) => void }) {
+export function AdguardCard({ index = 0 }: { index?: number }) {
   const { t } = useTranslation();
   const { push } = useToast();
   const { begin, running: installing, job } = useInstallJob();
   const [cfg, setCfg] = useState<DNSConfig>();
-  const [busy, setBusy] = useState(false);
-  const [confirmInstall, setConfirmInstall] = useState(false);
+  const [busyWith, setBusyWith] = useState<"enable" | "disable" | null>(null);
+  const busy = busyWith !== null;
+  const [confirmEnable, setConfirmEnable] = useState(false);
+  const [confirmDisable, setConfirmDisable] = useState(false);
+  // DoH (#364)
+  const [provider, setProvider] = useState<string>("");
+  const [customUrl, setCustomUrl] = useState("");
+  const [dohBusy, setDohBusy] = useState(false);
 
   const load = () => api.dns().then(setCfg).catch(() => {});
   useEffect(() => { load(); }, []);
@@ -28,31 +40,105 @@ export function AdguardCard({ index = 0, onNavigate }: { index?: number; onNavig
   if (!cfg.applicable && !cfg.adguard_active) return null;
 
   const dashboardUrl = `http://${window.location.hostname}:3000`;
+  const protection = cfg.adguard_protection;
 
-  const install = async () => {
-    setConfirmInstall(false);
-    const j = await begin(() => api.wizardPackages(["adguard"]));
-    if (j.phase === "done") {
-      push({ tone: "ok", text: t("adguard.installOk") });
+  const doEnable = async () => {
+    setConfirmEnable(false);
+    setBusyWith("enable");
+    try {
+      if (!cfg.adguard_installed) {
+        const j = await begin(() => api.wizardPackages(["adguard"]));
+        if (j.phase !== "done") {
+          push({ tone: "danger", text: j.error || t("adguard.installFailed") });
+          return;
+        }
+      }
+      const res = await api.adguardProtection(true);
+      if (res.error) push({ tone: "danger", text: t("adguard.protectionFailed"), detail: res.error });
+      else {
+        if (res.state) setCfg(res.state);
+        push({ tone: "ok", text: t("adguard.protectionEnabled") });
+      }
+    } catch (e) {
+      push({ tone: "danger", text: t("adguard.protectionFailed"), detail: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setBusyWith(null);
       load();
-    } else {
-      push({ tone: "danger", text: j.error || t("adguard.installFailed") });
     }
   };
 
-  const action = async (a: "start" | "stop") => {
-    setBusy(true);
+  const doDisable = async () => {
+    setConfirmDisable(false);
+    setBusyWith("disable");
     try {
-      const res = await api.adguardAction(a);
-      if (res.error) push({ tone: "danger", text: t("adguard.actionFailed"), detail: res.error });
+      const res = await api.adguardProtection(false);
+      if (res.error) push({ tone: "danger", text: t("adguard.protectionFailed"), detail: res.error });
       else {
-        setCfg(res.state);
-        push({ tone: "ok", text: t("adguard.actionOk") });
+        if (res.state) setCfg(res.state);
+        push({ tone: "ok", text: t("adguard.protectionDisabled") });
       }
     } catch (e) {
-      push({ tone: "danger", text: t("adguard.actionFailed"), detail: e instanceof Error ? e.message : String(e) });
+      push({ tone: "danger", text: t("adguard.protectionFailed"), detail: e instanceof Error ? e.message : String(e) });
     } finally {
-      setBusy(false);
+      setBusyWith(null);
+      load();
+    }
+  };
+
+  const stopService = async () => {
+    setBusyWith("disable");
+    try {
+      const res = await api.adguardAction("stop");
+      if (res.error) push({ tone: "danger", text: t("adguard.actionFailed"), detail: res.error });
+      else {
+        if (res.state) setCfg(res.state);
+        load();
+      }
+    } finally {
+      setBusyWith(null);
+    }
+  };
+
+  const dohUpstreamCount = (cfg.doh_upstreams ?? []).filter((u) => u.startsWith("https://")).length;
+  const effectiveProvider = provider || cfg.doh_providers?.[0]?.id || "custom";
+
+  const resolveUpstreams = (): string[] => {
+    if (effectiveProvider === "custom") return customUrl.trim() ? [customUrl.trim()] : [];
+    const p = (cfg.doh_providers ?? []).find((x) => x.id === effectiveProvider);
+    return p ? [p.url] : [];
+  };
+  const canActivate = resolveUpstreams().length > 0;
+
+  const doActivateDoH = async () => {
+    setDohBusy(true);
+    try {
+      const res = await api.adguardDoh("enable", resolveUpstreams());
+      if (res.error) push({ tone: "danger", text: t("adguard.dohFailed"), detail: res.error });
+      else {
+        if (res.state) setCfg(res.state);
+        push({ tone: "ok", text: t("adguard.dohEnabled") });
+      }
+    } catch (e) {
+      push({ tone: "danger", text: t("adguard.dohFailed"), detail: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setDohBusy(false);
+      load();
+    }
+  };
+
+  const doDeactivateDoH = async () => {
+    setDohBusy(true);
+    try {
+      const res = await api.adguardDoh("disable", []);
+      if (res.error) push({ tone: "danger", text: t("adguard.dohFailed"), detail: res.error });
+      else {
+        if (res.state) setCfg(res.state);
+        push({ tone: "ok", text: t("adguard.dohDisabled") });
+      }
+    } catch (e) {
+      push({ tone: "danger", text: t("adguard.dohFailed"), detail: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setDohBusy(false);
       load();
     }
   };
@@ -65,7 +151,7 @@ export function AdguardCard({ index = 0, onNavigate }: { index?: number; onNavig
         <div className="mt-3 flex flex-col gap-2">
           <p className="text-caption text-muted">{t("adguard.notInstalledDesc")}</p>
           <div>
-            <Button variant="primary" size="sm" loading={installing} onClick={() => setConfirmInstall(true)}>
+            <Button variant="secondary" size="sm" loading={installing} onClick={() => setConfirmEnable(true)}>
               <Download size={14} aria-hidden="true" /> {t("adguard.install")}
             </Button>
           </div>
@@ -74,56 +160,134 @@ export function AdguardCard({ index = 0, onNavigate }: { index?: number; onNavig
       ) : (
         <>
           <div className="mt-3 flex items-center gap-2">
-            {cfg.adguard_running ? (
-              <>
-                <Pill tone="ok" live>{t("adguard.running")}</Pill>
-                <a
-                  href={dashboardUrl}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="inline-flex items-center gap-1 text-small text-accent hover:text-accent-hover ring-focus rounded-sm"
-                >
-                  {t("adguard.openDashboard")}
-                  <ExternalLink size={12} aria-hidden="true" />
-                </a>
-              </>
+            {protection ? (
+              <Pill tone="ok" live>{t("adguard.protectionOn")}</Pill>
+            ) : cfg.adguard_running ? (
+              <Pill tone="warn">{t("adguard.runningNoFilter")}</Pill>
             ) : (
-              <>
-                <Pill tone="muted">{t("adguard.stopped")}</Pill>
-                <Button variant="secondary" size="sm" disabled={busy} onClick={() => action("start")}>
-                  <Play size={14} aria-hidden="true" /> {t("adguard.start")}
-                </Button>
-              </>
+              <Pill tone="muted">{t("adguard.stopped")}</Pill>
             )}
             {cfg.adguard_running && (
-              <Button variant="ghost" size="sm" className="text-danger hover:text-danger" disabled={busy} onClick={() => action("stop")}>
+              <a
+                href={dashboardUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-1 text-small text-accent hover:text-accent-hover ring-focus rounded-sm"
+              >
+                {t("adguard.openDashboard")}
+                <ExternalLink size={12} aria-hidden="true" />
+              </a>
+            )}
+            {cfg.adguard_running && !protection && (
+              <Button variant="ghost" size="sm" className="text-danger hover:text-danger" disabled={busy} onClick={stopService}>
                 <Square size={14} aria-hidden="true" /> {t("adguard.stop")}
               </Button>
             )}
           </div>
 
-          {/* Integración dnsmasq: si el DNS no apunta a AdGuard, atajo a la config */}
-          {!cfg.adguard_active && (
-            <div className="mt-3 flex items-center gap-2">
-              <p className="text-caption text-muted flex-1">{t("adguard.dnsNotActive")}</p>
-              {onNavigate && (
-                <Button variant="secondary" size="sm" onClick={() => onNavigate("lan")}>
-                  {t("adguard.configureDns")}
-                </Button>
-              )}
+          <div className="mt-3 flex items-center gap-2">
+            <Toggle
+              checked={protection}
+              busy={busy || dohBusy}
+              onChange={(on) => (on ? setConfirmEnable(true) : setConfirmDisable(true))}
+              label={t("adguard.protectionSwitch")}
+            />
+            <span className="text-small text-secondary">{t("adguard.protectionSwitch")}</span>
+          </div>
+          <p className="mt-2 text-caption text-muted">
+            {protection
+              ? t("adguard.protectionOnDesc")
+              : cfg.adguard_has_backup
+                ? t("adguard.protectionOffBackupDesc")
+                : t("adguard.protectionOffDesc")}
+          </p>
+          {busyWith && (
+            <div className="mt-3 flex flex-col gap-1.5" role="status">
+              <span className="text-small text-muted">
+                {busyWith === "enable" ? t("adguard.protectionEnabling") : t("adguard.protectionDisabling")}
+              </span>
+              <div aria-hidden="true" className="h-1.5 w-full overflow-hidden rounded-full bg-border">
+                <div className="h-full w-1/3 rounded-full bg-accent" style={{ animation: "progress-slide 1.1s ease-in-out infinite" }} />
+              </div>
             </div>
           )}
+
+          <div className="mt-4 border-t border-border pt-3">
+            <div className="flex items-center gap-2">
+              <span className="text-small font-medium text-secondary">{t("adguard.dohTitle")}</span>
+              {cfg.doh_enabled ? (
+                <Pill tone="ok">{t("adguard.dohActive", { count: dohUpstreamCount })}</Pill>
+              ) : (
+                <Pill tone="muted">{t("adguard.dohInactive")}</Pill>
+              )}
+            </div>
+            <p className="mt-1.5 text-caption text-muted">{t("adguard.dohHint")}</p>
+
+            {cfg.doh_enabled ? (
+              <div className="mt-2">
+                <Button variant="ghost" size="sm" disabled={busy || dohBusy} onClick={doDeactivateDoH}>
+                  {t("adguard.dohDeactivate")}
+                </Button>
+              </div>
+            ) : (
+              <div className="mt-2 flex flex-col gap-2">
+                <Field label={t("adguard.dohProviderLabel")}>
+                  <select
+                    value={effectiveProvider}
+                    onChange={(e) => setProvider(e.target.value)}
+                    aria-label={t("adguard.dohProviderLabel")}
+                    className={SELECT_CLS}
+                  >
+                    {(cfg.doh_providers ?? []).map((p) => (
+                      <option key={p.id} value={p.id}>{t(`adguard.dohProviders.${p.id}`)}</option>
+                    ))}
+                    <option value="custom">{t("adguard.dohCustomOption")}</option>
+                  </select>
+                </Field>
+                {effectiveProvider === "custom" && (
+                  <Input
+                    value={customUrl}
+                    onChange={(e) => setCustomUrl(e.target.value)}
+                    placeholder={t("adguard.dohCustomPlaceholder")}
+                  />
+                )}
+                <div>
+                  <Button variant="secondary" size="sm" loading={dohBusy} disabled={busy || !canActivate} onClick={doActivateDoH}>
+                    {t("adguard.dohActivate")}
+                  </Button>
+                </div>
+              </div>
+            )}
+
+            {dohBusy && (
+              <div className="mt-3 flex flex-col gap-1.5" role="status">
+                <span className="text-small text-muted">{t("adguard.dohApplying")}</span>
+                <div aria-hidden="true" className="h-1.5 w-full overflow-hidden rounded-full bg-border">
+                  <div className="h-full w-1/3 rounded-full bg-accent" style={{ animation: "progress-slide 1.1s ease-in-out infinite" }} />
+                </div>
+              </div>
+            )}
+          </div>
         </>
       )}
 
       <ConfirmDialog
-        open={confirmInstall}
-        onClose={() => setConfirmInstall(false)}
-        onConfirm={install}
-        title={t("adguard.installConfirmTitle")}
-        consequence={t("adguard.installConfirmBody")}
-        confirmLabel={t("adguard.install")}
-        busy={installing}
+        open={confirmEnable}
+        onClose={() => setConfirmEnable(false)}
+        onConfirm={doEnable}
+        title={cfg.adguard_installed ? t("adguard.enableTitle") : t("adguard.enableInstallTitle")}
+        consequence={cfg.adguard_installed ? t("adguard.enableBody") : t("adguard.enableInstallBody")}
+        confirmLabel={cfg.adguard_installed ? t("adguard.enableConfirm") : t("adguard.install")}
+        busy={busy}
+      />
+      <ConfirmDialog
+        open={confirmDisable}
+        onClose={() => setConfirmDisable(false)}
+        onConfirm={doDisable}
+        title={t("adguard.disableTitle")}
+        consequence={t("adguard.disableBody")}
+        confirmLabel={t("adguard.disableConfirm")}
+        busy={busy}
       />
     </Card>
   );

@@ -269,7 +269,19 @@ const realApi = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ action }),
     }),
-  setDns: (opts: { rebind_protection?: boolean; override_dns?: boolean; dns_vpn?: boolean }) =>
+  adguardProtection: (enable: boolean) =>
+    request<import("./types").ModuleResult<import("./types").DNSConfig>>("/api/dns/adguard/protection", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enable, confirm: true }),
+    }),
+  adguardDoh: (action: "enable" | "disable", upstreams: string[]) =>
+    request<import("./types").ModuleResult<import("./types").DNSConfig>>("/api/dns/doh/action", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action, upstreams }),
+    }),
+  setDns: (opts: { rebind_protection?: boolean; override_dns?: boolean; dns_vpn?: boolean; force_dns?: boolean }) =>
     request<import("./types").ModuleResult<import("./types").DNSConfig>>("/api/dns", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -284,7 +296,7 @@ const realApi = {
   ethports: () => request<{ ports: import("./types").EthPort[] }>("/api/ethports"),
   usteer: () => request<{ aps: import("./types").UsteerAP[] }>("/api/usteer"),
   guestwifi: () => request<import("./types").GuestProbe>("/api/guestwifi"),
-  setGuestwifi: (cfg: { enabled: boolean; ssid?: string; key?: string; band?: string }) =>
+  setGuestwifi: (cfg: { enabled: boolean; ssid?: string; key?: string; band?: string; subnet?: string; isolate?: boolean }) =>
     request<import("./types").ModuleResult<import("./types").GuestProbe>>("/api/guestwifi", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -844,6 +856,8 @@ const realApi = {
     }),
   banipStatus: () =>
     request<import("./types").BanipStatus>("/api/banip/status"),
+  banipDismissRamWarning: () =>
+    request<import("./types").BanipProbe>("/api/banip/dismiss-ram-warning", { method: "POST" }),
   banipSearch: (ip: string) =>
     request<import("./types").BanipSearchResult>(`/api/banip/search?ip=${encodeURIComponent(ip)}`),
   banipList: (list: "allowlist" | "blocklist") =>

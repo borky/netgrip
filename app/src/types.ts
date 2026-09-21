@@ -309,6 +309,7 @@ export interface GuestProbe {
   active: boolean;
   ssid: string;
   subnet: string;
+  isolate: boolean;
   ifaces: string[];
   clients: number;
   gl_conflict: boolean;
@@ -425,9 +426,18 @@ export interface DNSConfig {
   rebind_protection: boolean;
   override_dns: boolean;
   dns_vpn: boolean;
+  force_dns: boolean;
   adguard_active: boolean;
   adguard_installed: boolean;
   adguard_running: boolean;
+  adguard_protection: boolean;
+  adguard_has_backup: boolean;
+  adguard_dns_port?: number;
+  /** DoH (#364): active upstreams, current list (capped at 8) and the
+   *  provider presets the UI offers (backend single source of truth). */
+  doh_enabled: boolean;
+  doh_upstreams: string[];
+  doh_providers: { id: string; url: string }[];
   hosts: HostEntry[];
 }
 
@@ -776,6 +786,14 @@ export interface BanipReport {
   dos: BanipDos;
 }
 
+/** Low-RAM-after-last-run warning. Dismissible per run: `last_run` is the
+ * dismiss identifier, so a new banIP run shows the warning again. */
+export interface BanipRamWarning {
+  free_mb: number;
+  last_run: string;
+  dismissed: boolean;
+}
+
 export interface BanipProbe {
   installed: boolean;
   enabled: boolean;
@@ -784,6 +802,8 @@ export interface BanipProbe {
   applicable: boolean;
   version: string;
   mem_available_mb: number;
+  /** set when the last run left little free RAM (server-side threshold) */
+  ram_warning?: BanipRamWarning;
   feeds: BanipFeed[];
   /** available feeds not configured in UCI (from banip.feeds / custom.feeds) */
   catalog: BanipCatalogFeed[];
