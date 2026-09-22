@@ -77,6 +77,8 @@ const state = {
   quota: structuredClone(D.demoQuotas),
   portTemplates: [...D.demoPortTemplates],
   hasCert: true,
+  panelHttps: false,
+  panelCert: "panel" as "panel" | "router" | "custom",
   history: D.buildDemoHistory(),
   netifyd: { ...D.demoNetifyd },
 };
@@ -707,8 +709,19 @@ export const demoApi: typeof api = {
   },
   remoteAccess: () => get(state.remote),
   setRemoteAccess: async (opts) => { Object.assign(state.remote, opts); return write(state.remote); },
-  httpsState: () => get({ has_cert: state.hasCert }),
-  enableHttps: async () => { await wait(800, 1500); state.hasCert = true; return { status: "ok" }; },
+  httpsState: () => get({
+    has_cert: state.hasCert, enabled: state.panelHttps, serving: state.panelHttps,
+    cert: state.panelCert, router_cert: true,
+    serving_cert: state.panelHttps ? "/etc/netgrip/ssl/cert.pem" : "",
+    serving_source: state.panelHttps ? state.panelCert : "",
+  }),
+  setPanelHttps: async (enabled: boolean, cert?: "panel" | "router" | "custom") => {
+    await wait(800, 1500);
+    if (cert) state.panelCert = cert;
+    if (enabled && state.panelCert === "panel") state.hasCert = true;
+    state.panelHttps = enabled;
+    return { status: enabled ? "enabled" : "disabled", https: enabled, restarting: false };
+  },
   setPassword: async () => { await wait(800, 1500); },
   telegramGet: () => get(state.telegram),
   telegramSet: async (botToken, chatId, enabled) => {

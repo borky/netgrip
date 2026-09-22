@@ -1,5 +1,14 @@
 export class UnauthorizedError extends Error {}
 
+/** Too many failed logins from this address. retryAfter is in seconds, from
+ *  the server's Retry-After header: the login form shows the wait instead of
+ *  claiming the panel is unreachable. */
+export class RateLimitedError extends Error {
+  constructor(readonly retryAfter: number) {
+    super("rate limited");
+  }
+}
+
 /** Callback instalado por App: cualquier 401 autenticado manda la app al
  *  login (sesión muerta en caliente tras un reinicio/sysupgrade). */
 let onUnauthorized: (() => void) | null = null;
@@ -82,6 +91,9 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     // propio login ya gestionan su 401; no se redirige desde aquí.
     if (onUnauthorized && path !== "/api/me" && path !== "/api/login") onUnauthorized();
     throw new UnauthorizedError();
+  }
+  if (res.status === 429) {
+    throw new RateLimitedError(Number(res.headers.get("Retry-After")) || 30);
   }
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
@@ -557,9 +569,16 @@ const realApi = {
   history: () =>
     request<{ entries: import("./types").HistoryEntry[] }>("/api/history"),
   httpsState: () =>
-    request<{ has_cert: boolean }>("/api/https"),
-  enableHttps: () =>
-    request<{ status: string }>("/api/https", { method: "POST" }),
+    request<{
+      has_cert: boolean; enabled: boolean; serving: boolean;
+      cert: "panel" | "router" | "custom"; router_cert: boolean;
+      serving_cert: string; serving_source: "" | "panel" | "router" | "custom";
+    }>("/api/https"),
+  setPanelHttps: (enabled: boolean, cert?: "panel" | "router" | "custom") =>
+    request<{ status: string; https: boolean; restarting: boolean }>("/api/https", {
+      method: "POST",
+      body: JSON.stringify({ enabled, cert }),
+    }),
   wakeOnLan: (mac: string) =>
     request<{ status: string }>("/api/wol", {
       method: "POST",
