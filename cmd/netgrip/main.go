@@ -21,6 +21,9 @@ func main() {
 	port := flag.Int("port", 8090, "listen port")
 	rpcdURL := flag.String("rpcd-url", auth.DefaultRPCdURL, "rpcd JSON-RPC endpoint used for login validation")
 	updateRepo := flag.String("update-repo", "", "GitHub owner/name to check for releases (default: upstream; env NETGRIP_UPDATE_REPO)")
+	useTLS := flag.Bool("tls", false, "serve the panel over HTTPS on the listen port")
+	tlsCert := flag.String("tls-cert", server.DefaultCertPath, "certificate to serve with -tls")
+	tlsKey := flag.String("tls-key", server.DefaultKeyPath, "private key to serve with -tls")
 	flag.Parse()
 	if *showVersion {
 		fmt.Println(version)
@@ -66,8 +69,27 @@ func main() {
 	modules.StartPoEWatchdog()
 	modules.StartBanipWarmup()
 	modules.StartAnnouncements()
-	log.Printf("netgrip %s listening on %s (rpcd: %s)", version, addr, resolvedRPCd)
-	if err := http.ListenAndServe(addr, server.New(resolvedRPCd, version)); err != nil {
+	// The login form posts the router's root password, so how the panel
+	// listens is a security decision, not a preference. With -tls it serves
+	// HTTPS on the same port: plaintext then fails at the handshake, which
+	// is the point - a redirect cannot protect a password already sent to
+	// it.
+	scheme, srv := "http", &http.Server{Addr: addr, Handler: server.New(resolvedRPCd, version, *useTLS)}
+	serve := srv.ListenAndServe
+	if *useTLS {
+		certs, err := server.NewCertReloader(*tlsCert, *tlsKey)
+		if err != nil {
+			// Never fall back to plaintext: a panel that quietly serves the
+			// password in clear after TLS was asked for is worse than one
+			// that refuses to start, because nothing says so.
+			log.Fatalf("-tls: cannot load %s and %s: %v", *tlsCert, *tlsKey, err)
+		}
+		srv.TLSConfig = certs.TLSConfig()
+		serve = func() error { return srv.ListenAndServeTLS("", "") }
+		scheme = "https"
+	}
+	log.Printf("netgrip %s listening on %s://%s (rpcd: %s)", version, scheme, addr, resolvedRPCd)
+	if err := serve(); err != nil {
 		// One-shot actionable hint instead of a respawn loop of bare
 		// "address already in use" lines (#210).
 		log.Printf("cannot listen on %s: %v", addr, err)
