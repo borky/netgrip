@@ -99,3 +99,33 @@ go build ./...
 
 Without the workspace, `GOWORK=off go build ./...` must still pass on `main`
 and on any `feature/` branch — that is what proves a branch is PR-ready.
+
+## Invariants learned the hard way
+
+Both of these cost a lockout on a live router before they were written down.
+They are enforced in code and pinned by tests; this is the short version of
+why, so nobody relaxes them by accident.
+
+**A cookie name that has ever been issued with `Secure` can never be used
+from a plaintext origin again.** A browser refuses to let an insecure origin
+overwrite a `Secure` cookie of the same name (RFC 6265bis 5.4, "leave secure
+cookies alone"), and the same rule blocks deleting it — so no server can
+clean it up. Turning the panel's HTTPS off therefore made a correct password
+produce a 204 and no session, with nothing in any log to say why. The session
+cookie now has one name per transport and **neither is the name it used to
+have**: `__Secure-netgrip_session` over TLS, `netgrip_http_session` over
+plain HTTP, and the old `netgrip_session` is read but never issued.
+See `internal/server/server.go` and `session_cookie_test.go`.
+
+**"Can it be served", "should it be offered" and "what is on the wire" are
+three different questions.** Answering any of them with a proxy for another
+is how the Access card came to offer a certificate that saving refused, to
+report a pair that was not in use, and to say "Serving plain HTTP" over
+HTTPS. `internal/certs` holds the two predicates — `LoadPair` for *can this
+be served*, `Usable` for *is it worth keeping* — so the listener and the card
+cannot drift apart. Reporting follows what the listener would really do;
+offering follows what saving will really accept.
+
+The general rule behind both: report what is observable, never what was
+configured or intended, and where a check stands in for the real thing, make
+it the same check the real consumer makes.
