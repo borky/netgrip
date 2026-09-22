@@ -368,39 +368,13 @@ func GenerateSelfSignedCert() error {
 		return fmt.Errorf("mkdir ssl: %w", err)
 	}
 	hostname, _ := os.Hostname()
-	if hostname == "" {
-		hostname = "netgrip"
+	certPEM, keyPEM, err := buildSelfSigned(hostname, localAddresses(), time.Now())
+	if err != nil {
+		return err
 	}
-	if _, err := exec.LookPath("px5g"); err == nil {
-		cmd := exec.Command("px5g", "selfsigned",
-			"-days", "3650",
-			"-newkey", "rsa:2048",
-			"-keyout", keyPath,
-			"-x509",
-			"-out", certPath,
-			"-subj", "/CN="+hostname,
-		)
-		if out, err := cmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("px5g selfsigned: %s (%w)", strings.TrimSpace(string(out)), err)
-		}
-		return nil
-	}
-	if _, err := exec.LookPath("openssl"); err == nil {
-		cmd := exec.Command("openssl", "req", "-x509", "-newkey", "rsa:2048",
-			"-keyout", keyPath, "-out", certPath,
-			"-days", "3650", "-nodes",
-			"-subj", "/CN="+hostname,
-		)
-		if out, err := cmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("openssl req: %s (%w)", strings.TrimSpace(string(out)), err)
-		}
-		return nil
-	}
-	return fmt.Errorf("neither px5g nor openssl found on the router")
+	return writeSelfSigned(certPath, keyPath, certPEM, keyPEM)
 }
 
-// HTTPSCertPaths son las rutas configuradas para el par del panel, vacías si
-// no se han fijado. Quien sirve decide qué hacer con el vacío.
 func HTTPSCertPaths() (string, string) {
 	return uciGet("netgrip.main.https_cert"), uciGet("netgrip.main.https_key")
 }
