@@ -259,11 +259,7 @@ func sshOps(cfg SSHAccess) []executor.Op {
 		set("dropbear.main.enable", "0")
 	}
 	if cfg.Port != "" {
-		port, perr := strconv.Atoi(cfg.Port)
-		if perr != nil || port < 1 || port > 65535 {
-			port = 22
-		}
-		set("dropbear.main.Port", strconv.Itoa(port))
+		set("dropbear.main.Port", strconv.Itoa(sshPortOrDefault(cfg.Port)))
 	}
 	if cfg.Enabled {
 		ops = append(ops, executor.Op{Kind: "initd", Args: []string{"dropbear", "enable"}})
@@ -277,18 +273,48 @@ func sshOps(cfg SSHAccess) []executor.Op {
 	return ops
 }
 
+// sshHealthy decides whether the change that was just applied took effect.
+//
+// Both directions are a question about the port, and they are opposite
+// questions: enabling worked when something is listening, disabling worked
+// when nothing is. Asking "is dropbear running" first - before the two cases
+// were separated - meant disabling SSH could never succeed, because a
+// stopped service is exactly what was asked for, so the check failed and
+// rolled the change straight back. That guard belongs only to the enabled
+// case.
+//
+// The state is polled rather than sampled once: dropbear needs a moment
+// after the restart either to bind the port or to let go of it.
 func sshHealthy(cfg SSHAccess) bool {
-	if !executor.ServiceRunning("dropbear") {
-		return false
+	port := sshPortOrDefault(cfg.Port)
+	for i := 0; i < 10; i++ {
+		if listeningOnPort(port) == cfg.Enabled {
+			return sshHealthyFor(cfg.Enabled, cfg.Enabled, executor.ServiceRunning("dropbear"))
+		}
+		time.Sleep(300 * time.Millisecond)
 	}
-	if !cfg.Enabled {
-		return executor.ServiceEnabled("dropbear") == cfg.Enabled
+	return false
+}
+
+// sshHealthyFor is the decision itself, separated from how the observations
+// are made so that it can be read and tested without a router.
+func sshHealthyFor(wantEnabled, listening, running bool) bool {
+	if !wantEnabled {
+		// Nothing listening is the whole of success here. dropbear not
+		// running is the point, not a failure.
+		return !listening
 	}
-	port, err := strconv.Atoi(cfg.Port)
+	return listening && running
+}
+
+// sshPortOrDefault is dropbear's port, falling back to 22 when the value is
+// missing or not a port.
+func sshPortOrDefault(v string) int {
+	port, err := strconv.Atoi(v)
 	if err != nil || port < 1 || port > 65535 {
-		port = 22
+		return 22
 	}
-	return listeningOnPort(port)
+	return port
 }
 
 // listeningOnPort reports whether anything holds a listening socket on the
