@@ -21,9 +21,14 @@ import (
 )
 
 const (
-	// DefaultCertPath y DefaultKeyPath: el par de uhttpd. Son los que sirve
-	// LuCI, así que el navegador que ya aceptó ese certificado no ve nada
-	// nuevo más allá del origen distinto (host:puerto).
+	// PanelCertPath y PanelKeyPath: el par que genera el propio panel desde
+	// Ajustes (GenerateSelfSignedCert). Si está, es el que quiso el usuario.
+	PanelCertPath = "/etc/netgrip/ssl/cert.pem"
+	PanelKeyPath  = "/etc/netgrip/ssl/key.pem"
+
+	// DefaultCertPath y DefaultKeyPath: el par de uhttpd, el reserva. Son
+	// los que sirve LuCI, así que el navegador que ya aceptó ese
+	// certificado no ve nada nuevo más allá del origen distinto.
 	DefaultCertPath = "/etc/uhttpd.crt"
 	DefaultKeyPath  = "/etc/uhttpd.key"
 
@@ -168,4 +173,25 @@ func parseDERKey(der []byte) (crypto.PrivateKey, error) {
 		return k, nil
 	}
 	return nil, errors.New("private key is neither PEM nor DER (EC, PKCS#8 or PKCS#1)")
+}
+
+// ResolveCertPaths decide qué par servir, en el orden en que un usuario lo
+// esperaría: lo que pidió explícitamente; si no, el que generó desde el
+// panel; si no, el de uhttpd, que en un router siempre está.
+//
+// El par propio va antes que el de uhttpd a propósito: generarlo es un acto
+// deliberado desde Ajustes, y quien lo hizo esperaba que se usara.
+func ResolveCertPaths(certPath, keyPath string) (string, string) {
+	if certPath != "" && keyPath != "" {
+		return certPath, keyPath
+	}
+	if fileExists(PanelCertPath) && fileExists(PanelKeyPath) {
+		return PanelCertPath, PanelKeyPath
+	}
+	return DefaultCertPath, DefaultKeyPath
+}
+
+func fileExists(p string) bool {
+	fi, err := os.Stat(p)
+	return err == nil && !fi.IsDir()
 }

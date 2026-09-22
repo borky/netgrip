@@ -21,9 +21,9 @@ func main() {
 	port := flag.Int("port", 8090, "listen port")
 	rpcdURL := flag.String("rpcd-url", auth.DefaultRPCdURL, "rpcd JSON-RPC endpoint used for login validation")
 	updateRepo := flag.String("update-repo", "", "GitHub owner/name to check for releases (default: upstream; env NETGRIP_UPDATE_REPO)")
-	useTLS := flag.Bool("tls", false, "serve the panel over HTTPS on the listen port")
-	tlsCert := flag.String("tls-cert", server.DefaultCertPath, "certificate to serve with -tls")
-	tlsKey := flag.String("tls-key", server.DefaultKeyPath, "private key to serve with -tls")
+	useTLS := flag.Bool("https", false, "serve the panel over HTTPS on the listen port")
+	tlsCert := flag.String("https-cert", "", "certificate to serve with -https (default: the panel's own, else uhttpd's)")
+	tlsKey := flag.String("https-key", "", "private key to serve with -https (default: the panel's own, else uhttpd's)")
 	flag.Parse()
 	if *showVersion {
 		fmt.Println(version)
@@ -77,12 +77,13 @@ func main() {
 	scheme, srv := "http", &http.Server{Addr: addr, Handler: server.New(resolvedRPCd, version, *useTLS)}
 	serve := srv.ListenAndServe
 	if *useTLS {
-		certs, err := server.NewCertReloader(*tlsCert, *tlsKey)
+		certFile, keyFile := server.ResolveCertPaths(*tlsCert, *tlsKey)
+		certs, err := server.NewCertReloader(certFile, keyFile)
 		if err != nil {
 			// Never fall back to plaintext: a panel that quietly serves the
-			// password in clear after TLS was asked for is worse than one
+			// password in clear after HTTPS was asked for is worse than one
 			// that refuses to start, because nothing says so.
-			log.Fatalf("-tls: cannot load %s and %s: %v", *tlsCert, *tlsKey, err)
+			log.Fatalf("-https: cannot load %s and %s: %v", certFile, keyFile, err)
 		}
 		srv.TLSConfig = certs.TLSConfig()
 		serve = func() error { return srv.ListenAndServeTLS("", "") }
