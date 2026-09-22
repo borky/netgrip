@@ -5,11 +5,11 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"os/exec"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/gnacho/netgrip/internal/certs"
 	"github.com/gnacho/netgrip/internal/executor"
 )
 
@@ -91,23 +91,19 @@ func SetPanelSessionTTL(minutes int) error {
 	if minutes <= 0 {
 		return fmt.Errorf("session timeout must be > 0 minutes")
 	}
+	var ops []executor.Op
+	// The netgrip UCI package may not exist yet (the panel never wrote the
+	// section). `uci set netgrip.main=panel` creates it as a NAMED section,
+	// so `uci set netgrip.main.<opt>=<val>` resolves; a bare `config main`
+	// would be an anonymous @main[0], which `uci set` cannot address by
+	// name. It used to be done with `uci import`, which replaces the whole
+	// package: a document holding only this section took netgrip.wizard and
+	// netgrip.selfupdate with it.
 	if !uciSectionExists("netgrip.main") {
-		// The netgrip UCI package may not exist yet (panel never wrote the
-		// section). `uci import` creates the config package with a NAMED
-		// section so `uci set netgrip.main.<opt>=<val>` resolves. A bare
-		// `config main` would create an anonymous @main[0], which `uci set`
-		// cannot address by name.
-		cmd := exec.Command("uci", "import", "netgrip")
-		cmd.Stdin = strings.NewReader("config panel 'main'\n\toption panel 'panel'\n")
-		if out, err := cmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("init netgrip config: %s", strings.TrimSpace(string(out)))
-		}
+		ops = append(ops, executor.Op{Kind: "uci_set", Args: []string{"netgrip.main", "panel"}})
 	}
-	ops := []executor.Op{
-		{Kind: "uci_set", Args: []string{panelSessionTTLMinutePath, strconv.Itoa(minutes)}},
-		{Kind: "uci_commit", Args: []string{"netgrip"}},
-	}
-	return executor.Apply(ops, nil)
+	ops = append(ops, executor.Op{Kind: "uci_set", Args: []string{panelSessionTTLMinutePath, strconv.Itoa(minutes)}})
+	return applyNetgripConfig(ops)
 }
 
 func probeLuciAccess() LuciAccess {
@@ -353,13 +349,14 @@ func hasListenerOnPort(table string, port int) bool {
 
 const sslDir = "/etc/netgrip/ssl"
 
-// Variables y no constantes para que los tests puedan apuntarlas a un
-// directorio temporal; en ejecución nadie las cambia.
+// Variables rather than constants so tests can point them at a temporary
+// directory; nothing changes them at runtime.
 var (
 	certPath = sslDir + "/cert.pem"
 	keyPath  = sslDir + "/key.pem"
 
-	// El par de uhttpd, el que sirve LuCI.
+	// uhttpd's pair, the one LuCI serves. Only the fallback: the paths come
+	// from uhttpd's own configuration, see RouterCertPaths.
 	routerCertPath = "/etc/uhttpd.crt"
 	routerKeyPath  = "/etc/uhttpd.key"
 )
@@ -369,41 +366,100 @@ func fileReadable(p string) bool {
 	return err == nil && !fi.IsDir()
 }
 
-// HasRouterCert dice si el par de uhttpd está disponible para elegirlo.
-func HasRouterCert() bool {
-	return fileReadable(routerCertPath) && fileReadable(routerKeyPath)
+// RouterCertPaths is uhttpd's pair, read from uhttpd's own configuration.
+//
+// The conventional /etc/uhttpd.crt is only the default value of a UCI option,
+// and a firmware that moves it would otherwise hide "the router's
+// certificate" from the selector on a router that plainly has one, and
+// mislabel what is being served.
+//
+// A variable so tests can pin the pair: reading uci first means a test that
+// only overrides the fallback paths below passes on a development machine,
+// where there is no uci, and quietly tests nothing on a router.
+var RouterCertPaths = func() (string, string) {
+	cert, key := uciGet("uhttpd.main.cert"), uciGet("uhttpd.main.key")
+	if cert == "" || key == "" {
+		return routerCertPath, routerKeyPath
+	}
+	return cert, key
 }
 
-// CertSource dice qué par se usaría: el configurado si lo hay y, si no está
-// configurado, el que el arranque elegiría por descarte.
+// PanelCertPaths is the pair the panel generates for itself. Exported so the
+// listener names the same two files this package writes, rather than keeping
+// its own copy of the paths that would drift the first time either moved.
+func PanelCertPaths() (string, string) { return certPath, keyPath }
+
+// certServable says whether a pair could actually be served, which is the
+// same question the listener asks at startup. This is what decides what to
+// REPORT, so it has to agree with what the process would really do, or the
+// card names one pair while another is on the wire.
+func certServable(certFile, keyFile string) bool {
+	if !fileReadable(certFile) || !fileReadable(keyFile) {
+		return false
+	}
+	_, err := certs.LoadPair(certFile, keyFile)
+	return err == nil
+}
+
+// HasRouterCert says whether uhttpd's pair is there to be CHOSEN, which is a
+// stricter question than whether it could be served: the selector must only
+// offer what saving will accept.
 //
-// Sin esto el selector enseñaba "el propio del panel" siempre que la
-// configuración estuviera vacía, aunque no existiera tal par y lo que se
-// estuviera sirviendo fuese el del router. Un selector que nombra algo
-// distinto de lo que hay es peor que no tenerlo: invita a guardar creyendo
-// que no se cambia nada.
+// Offering on "it loads" while EnableHTTPS gated on "it is usable" left the
+// option on screen - preselected, on a router with no pair of its own - and
+// Save answering 500, with nothing the card could do about it. uhttpd's
+// certificate is not ours to regenerate, so the honest move is not to offer
+// it.
+func HasRouterCert() bool {
+	cert, key := RouterCertPaths()
+	return certs.Usable(cert, key, time.Now()) == nil
+}
+
+// CertSource says which pair would be used: the configured one if there is
+// one and, failing that, the one startup would arrive at by elimination.
+//
+// Without this the selector showed "the panel's own" whenever the
+// configuration was empty, even on a router where no such pair existed and
+// the router's was being served. A selector naming something other than what
+// is there is worse than no selector: it invites saving in the belief that
+// nothing changes.
 func CertSource() string {
+	routerCert, _ := RouterCertPaths()
 	switch c, _ := HTTPSCertPaths(); c {
-	case routerCertPath:
+	case "":
+		// Unconfigured: fall through to the boot order below.
+	case routerCert:
 		return CertSourceRouter
 	case certPath:
 		return CertSourcePanel
+	default:
+		// A pair somebody configured by hand. Saying "the panel's own"
+		// here was not merely a wrong label: the card sent that back on
+		// the next Save, which rewrote the paths and threw the
+		// configuration away without anyone asking for it.
+		return CertSourceCustom
 	}
-	// Sin configurar: el mismo orden que sigue el arranque.
-	if HasSelfSignedCert() {
+	// Unconfigured: the same order startup follows.
+	if certServable(certPath, keyPath) {
 		return CertSourcePanel
 	}
-	if HasRouterCert() {
+	if certServable(routerCert, routerCertKey()) {
 		return CertSourceRouter
 	}
-	// Ninguno existe todavía: el propio es el que se generaría.
+	// Neither exists yet: the panel's own is the one that would be made.
 	return CertSourcePanel
 }
 
+func routerCertKey() string {
+	_, key := RouterCertPaths()
+	return key
+}
+
+// HasSelfSignedCert says whether the panel's own pair is there AND could be
+// served. Two os.Stat calls were not enough: a pair that exists but cannot
+// serve made the card report a certificate the listener would skip over.
 func HasSelfSignedCert() bool {
-	_, err1 := os.Stat(certPath)
-	_, err2 := os.Stat(keyPath)
-	return err1 == nil && err2 == nil
+	return certServable(certPath, keyPath)
 }
 
 func GenerateSelfSignedCert() error {
@@ -418,26 +474,27 @@ func GenerateSelfSignedCert() error {
 	return writeSelfSigned(certPath, keyPath, certPEM, keyPEM)
 }
 
-func HTTPSCertPaths() (string, string) {
+// HTTPSCertPaths is the pair the panel is configured to serve. A variable so
+// tests can pin it without a uci binary.
+var HTTPSCertPaths = func() (string, string) {
 	return uciGet("netgrip.main.https_cert"), uciGet("netgrip.main.https_key")
 }
 
-// DisableHTTPS devuelve el panel a HTTP. No borra el certificado: volver a
-// activarlo no tiene por qué regenerarlo, y un par generado a mano o puesto
-// por el usuario no es nuestro para tirarlo.
+// DisableHTTPS puts the panel back on HTTP. It does not delete the
+// certificate: turning TLS on again need not regenerate it, and a pair
+// generated by hand or supplied by the user is not ours to throw away.
 func DisableHTTPS() error {
 	if !uciSectionExists("netgrip.main") {
-		return nil // nunca se activó: nada que apagar
+		return nil // never turned on: nothing to turn off
 	}
-	return executor.Apply([]executor.Op{
+	return applyNetgripConfig([]executor.Op{
 		{Kind: "uci_set", Args: []string{"netgrip.main.https", "0"}},
-		{Kind: "uci_commit", Args: []string{"netgrip"}},
-	}, nil)
+	})
 }
 
-// HTTPSEnabled dice si el panel está configurado para servir TLS. Es lo que
-// está en la configuración, no cómo se arrancó el proceso: entre cambiarlo y
-// reiniciar, los dos difieren.
+// HTTPSEnabled says whether the panel is configured to serve TLS. This is
+// what the configuration holds, not how the process was started: between
+// changing it and restarting, the two differ.
 func HTTPSEnabled() bool {
 	return uciGet("netgrip.main.https") == "1"
 }
@@ -447,36 +504,150 @@ func HTTPSEnabled() bool {
 // paths still served the panel's own pair because the files were on disk,
 // which is not what "use the router's certificate" means to anybody.
 const (
-	CertSourcePanel  = "panel"  // el par propio del panel, con las IPs en el SAN
-	CertSourceRouter = "router" // el de uhttpd, el mismo que sirve LuCI
+	CertSourcePanel  = "panel"  // the panel's own pair, with the router's IPs in the SAN
+	CertSourceRouter = "router" // uhttpd's, the same one LuCI serves
+	CertSourceCustom = "custom" // a pair configured by hand, which is left exactly as it is
 )
 
 // EnableHTTPS turns the panel's TLS on with the chosen certificate, writing
 // the paths explicitly so what is served is what was asked for.
+//
+// The chosen pair is vetted before anything is written. Both the failure to
+// write and the failure to vet leave the configuration exactly as it was:
+// this used to call DisableHTTPS on the way out, which is not a rollback but
+// a second state change - on a panel already serving HTTPS it committed
+// https=0 without restarting, so the process kept serving TLS while the
+// configuration said plaintext, and the next reboot quietly obeyed the
+// configuration.
 func EnableHTTPS(source string) error {
-	certFile, keyFile := certPath, keyPath
-	if source == CertSourceRouter {
-		certFile, keyFile = routerCertPath, routerKeyPath
-		if !fileReadable(certFile) || !fileReadable(keyFile) {
-			return fmt.Errorf("the router's certificate is not at %s and %s", certFile, keyFile)
-		}
-	} else if !HasSelfSignedCert() {
-		if err := GenerateSelfSignedCert(); err != nil {
-			return err
-		}
-	}
-	if !uciSectionExists("netgrip.main") {
-		cmd := exec.Command("uci", "import", "netgrip")
-		cmd.Stdin = strings.NewReader("config panel 'main'\n\toption panel 'panel'\n")
-		if out, err := cmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("init netgrip config: %s", strings.TrimSpace(string(out)))
-		}
+	certFile, keyFile, err := resolveSource(source)
+	if err != nil {
+		return err
 	}
 	ops := []executor.Op{
 		{Kind: "uci_set", Args: []string{"netgrip.main.https", "1"}},
-		{Kind: "uci_set", Args: []string{"netgrip.main.https_cert", certFile}},
-		{Kind: "uci_set", Args: []string{"netgrip.main.https_key", keyFile}},
-		{Kind: "uci_commit", Args: []string{"netgrip"}},
 	}
+	// A hand-configured pair is left exactly where it is. Rewriting the
+	// paths to the panel's own would discard a choice nobody revisited.
+	if source != CertSourceCustom {
+		ops = append(ops,
+			executor.Op{Kind: "uci_set", Args: []string{"netgrip.main.https_cert", certFile}},
+			executor.Op{Kind: "uci_set", Args: []string{"netgrip.main.https_key", keyFile}},
+		)
+	}
+	// Create the section through the executor rather than with `uci
+	// import`, which REPLACES the whole package: importing a document
+	// holding only the panel section would take netgrip.wizard and
+	// netgrip.selfupdate with it, and the snapshot below cannot undo what
+	// happened before it was taken.
+	if !uciSectionExists("netgrip.main") {
+		ops = append([]executor.Op{{Kind: "uci_set", Args: []string{"netgrip.main", "panel"}}}, ops...)
+	}
+	return applyNetgripConfig(ops)
+}
+
+// resolveSource vets the chosen pair and returns it. Nothing is written until
+// this succeeds, so a pair that cannot serve leaves the configuration alone.
+func resolveSource(source string) (certFile, keyFile string, err error) {
+	switch source {
+	case CertSourceRouter:
+		certFile, keyFile = RouterCertPaths()
+		if err := certs.Usable(certFile, keyFile, time.Now()); err != nil {
+			return "", "", fmt.Errorf("the router's certificate at %s cannot be served: %w", certFile, err)
+		}
+	case CertSourceCustom:
+		certFile, keyFile = HTTPSCertPaths()
+		if certFile == "" || keyFile == "" {
+			return "", "", fmt.Errorf("no certificate is configured to keep")
+		}
+		if err := certs.Usable(certFile, keyFile, time.Now()); err != nil {
+			return "", "", fmt.Errorf("the configured certificate at %s cannot be served: %w", certFile, err)
+		}
+	default:
+		certFile, keyFile = certPath, keyPath
+		if err := certs.Usable(certFile, keyFile, time.Now()); err != nil {
+			// Regenerate rather than refuse. Checking only that the files
+			// existed meant a pair that no browser would open - the
+			// empty-SAN one px5g used to write - survived every attempt to
+			// replace it, with no way back except deleting it over SSH.
+			if err := regenerateSelfSigned(); err != nil {
+				return "", "", err
+			}
+			if err := certs.Usable(certFile, keyFile, time.Now()); err != nil {
+				return "", "", fmt.Errorf("the generated certificate is not usable: %w", err)
+			}
+		}
+	}
+	return certFile, keyFile, nil
+}
+
+// regenerateSelfSigned replaces the panel's pair, moving whatever was there
+// aside first. The pair may have been put there by hand, and even a broken
+// one is worth more than nothing to whoever has to work out what happened.
+func regenerateSelfSigned() error {
+	stamp := time.Now().Format("20060102-150405")
+	for _, p := range []string{certPath, keyPath} {
+		if fileReadable(p) {
+			if err := os.Rename(p, p+".replaced-"+stamp); err != nil {
+				return fmt.Errorf("move the old certificate aside: %w", err)
+			}
+		}
+	}
+	return GenerateSelfSignedCert()
+}
+
+// RestoreHTTPSConfig puts back an earlier TLS configuration verbatim, paths
+// included. It is the undo for a change that was written and then turned out
+// not to serve; turning HTTPS off instead would be a different state, not the
+// one the caller had.
+func RestoreHTTPSConfig(enabled bool, certFile, keyFile string) error {
+	if !uciSectionExists("netgrip.main") {
+		return nil
+	}
+	ops := []executor.Op{{Kind: "uci_set", Args: []string{"netgrip.main.https", boolOption(enabled)}}}
+	// Empty means the option was not set: delete it rather than writing an
+	// empty string, which would pin the pair to a path that is not there.
+	for _, opt := range []struct{ key, value string }{
+		{"https_cert", certFile},
+		{"https_key", keyFile},
+	} {
+		if opt.value == "" {
+			ops = append(ops, executor.Op{Kind: "uci_delete", Args: []string{"netgrip.main." + opt.key}})
+			continue
+		}
+		ops = append(ops, executor.Op{Kind: "uci_set", Args: []string{"netgrip.main." + opt.key, opt.value}})
+	}
+	// No snapshot here, deliberately. This IS the undo; taking a fresh one
+	// would capture the state being undone, so a failure partway would
+	// "roll back" to exactly what the caller is trying to get rid of.
+	ops = append(ops, executor.Op{Kind: "uci_commit", Args: []string{"netgrip"}})
 	return executor.Apply(ops, nil)
+}
+
+func boolOption(v bool) string {
+	if v {
+		return "1"
+	}
+	return "0"
+}
+
+// applyNetgripConfig writes and commits a set of netgrip options, restoring
+// the file if any of them fails.
+//
+// The commit has to be the last op and the snapshot is what makes that safe.
+// Without it a failure halfway left the earlier sets staged but uncommitted
+// in /tmp/.uci, where the next unrelated `uci commit netgrip` - a plain
+// session-timeout save, for instance - would pick them up and apply a change
+// nobody had asked for.
+func applyNetgripConfig(ops []executor.Op) error {
+	snap, err := executor.Snapshot("netgrip")
+	if err != nil {
+		return fmt.Errorf("snapshot netgrip: %w", err)
+	}
+	ops = append(ops, executor.Op{Kind: "uci_commit", Args: []string{"netgrip"}})
+	if err := executor.Apply(ops, nil); err != nil {
+		_ = executor.Restore("netgrip", snap)
+		return err
+	}
+	return nil
 }
