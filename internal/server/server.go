@@ -2041,6 +2041,11 @@ func (s *Server) handleHTTPSGet(w http.ResponseWriter, _ *http.Request) {
 		// applies it the two differ, and the UI has to be able to say so.
 		"enabled": modules.HTTPSEnabled(),
 		"serving": s.secure,
+		// serving_cert is the pair this process actually opened, and
+		// serving_source names it. Configured and served differ whenever a
+		// configured pair was missing and the panel fell back.
+		"serving_cert":   s.servingCert,
+		"serving_source": servingSource(s.servingCert),
 	})
 }
 
