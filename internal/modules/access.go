@@ -1,6 +1,7 @@
 package modules
 
 import (
+	"crypto/tls"
 	"fmt"
 	"net/http"
 	"os"
@@ -199,12 +200,27 @@ func luciOps(cfg LuciAccess) []executor.Op {
 }
 
 func luciHealth(cfg LuciAccess) bool {
-	client := &http.Client{Timeout: 3 * time.Second}
+	// The question is whether uhttpd came back after the restart, not
+	// whether its certificate is trustworthy. Routers ship a self-signed
+	// one - CN=OpenWrt, no IP SAN - so a verifying client fails the
+	// handshake against loopback every time, and turning "force HTTPS" on
+	// could never succeed: the check rolled back a change that had worked.
+	// Skipping verification is safe here in a way it would not be anywhere
+	// else: the request never leaves the box.
+	client := &http.Client{
+		Timeout:   3 * time.Second,
+		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}},
+	}
 	scheme := "http"
 	port := cfg.HTTPPort
 	if cfg.ForceHTTPS {
 		scheme = "https"
 		port = cfg.HTTPSPort
+		if port <= 0 {
+			port = 443
+		}
+	} else if port <= 0 {
+		port = 80
 	}
 	url := fmt.Sprintf("%s://127.0.0.1:%d/", scheme, port)
 	for i := 0; i < 10; i++ {
