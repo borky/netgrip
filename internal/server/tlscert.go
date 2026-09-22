@@ -20,7 +20,9 @@ import (
 	"time"
 )
 
-const (
+// Variables y no constantes para que los tests puedan apuntarlas a un
+// directorio temporal; en ejecución nadie las cambia.
+var (
 	// PanelCertPath y PanelKeyPath: el par que genera el propio panel desde
 	// Ajustes (GenerateSelfSignedCert). Si está, es el que quiso el usuario.
 	PanelCertPath = "/etc/netgrip/ssl/cert.pem"
@@ -31,6 +33,9 @@ const (
 	// certificado no ve nada nuevo más allá del origen distinto.
 	DefaultCertPath = "/etc/uhttpd.crt"
 	DefaultKeyPath  = "/etc/uhttpd.key"
+)
+
+const (
 
 	// retryAfterFailure: tras una recarga fallida (el par a medio escribir
 	// mientras px5g lo regenera) no se vuelve a tocar el disco hasta pasado
@@ -175,20 +180,53 @@ func parseDERKey(der []byte) (crypto.PrivateKey, error) {
 	return nil, errors.New("private key is neither PEM nor DER (EC, PKCS#8 or PKCS#1)")
 }
 
-// ResolveCertPaths decide qué par servir, en el orden en que un usuario lo
+// certCandidates son los pares a probar, en el orden en que un usuario lo
 // esperaría: lo que pidió explícitamente; si no, el que generó desde el
 // panel; si no, el de uhttpd, que en un router siempre está.
 //
 // El par propio va antes que el de uhttpd a propósito: generarlo es un acto
 // deliberado desde Ajustes, y quien lo hizo esperaba que se usara.
-func ResolveCertPaths(certPath, keyPath string) (string, string) {
+func certCandidates(certPath, keyPath string) [][2]string {
+	var out [][2]string
 	if certPath != "" && keyPath != "" {
-		return certPath, keyPath
+		out = append(out, [2]string{certPath, keyPath})
 	}
-	if fileExists(PanelCertPath) && fileExists(PanelKeyPath) {
-		return PanelCertPath, PanelKeyPath
+	return append(out,
+		[2]string{PanelCertPath, PanelKeyPath},
+		[2]string{DefaultCertPath, DefaultKeyPath},
+	)
+}
+
+// ResolveCertPaths es el par que se serviría: el primero que exista.
+func ResolveCertPaths(certPath, keyPath string) (string, string) {
+	for _, c := range certCandidates(certPath, keyPath) {
+		if fileExists(c[0]) && fileExists(c[1]) {
+			return c[0], c[1]
+		}
 	}
 	return DefaultCertPath, DefaultKeyPath
+}
+
+// OpenCertificate abre el primer par utilizable y dice cuál fue.
+//
+// Que el par configurado falte o no cargue no es razón para dejar el panel
+// sin arrancar: un certificado borrado, un fichero a medio escribir o una
+// ruta que apunta a donde ya no hay nada dejarían el router sin panel hasta
+// que alguien entre por SSH. Se sirve otro y se avisa. Lo que no se hace
+// nunca es caer a texto plano: si ninguno sirve, esto devuelve error y quien
+// llama se niega a arrancar.
+func OpenCertificate(certPath, keyPath string) (r *CertReloader, usedCert, usedKey string, err error) {
+	var firstErr error
+	for _, c := range certCandidates(certPath, keyPath) {
+		r, err := NewCertReloader(c[0], c[1])
+		if err == nil {
+			return r, c[0], c[1], nil
+		}
+		if firstErr == nil {
+			firstErr = err
+		}
+	}
+	return nil, "", "", firstErr
 }
 
 func fileExists(p string) bool {

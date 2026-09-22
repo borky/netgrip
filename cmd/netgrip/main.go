@@ -77,13 +77,17 @@ func main() {
 	scheme, srv := "http", &http.Server{Addr: addr, Handler: server.New(resolvedRPCd, version, *useTLS)}
 	serve := srv.ListenAndServe
 	if *useTLS {
-		certFile, keyFile := server.ResolveCertPaths(*tlsCert, *tlsKey)
-		certs, err := server.NewCertReloader(certFile, keyFile)
+		wanted, wantedKey := server.ResolveCertPaths(*tlsCert, *tlsKey)
+		certs, certFile, _, err := server.OpenCertificate(*tlsCert, *tlsKey)
 		if err != nil {
-			// Never fall back to plaintext: a panel that quietly serves the
-			// password in clear after HTTPS was asked for is worse than one
-			// that refuses to start, because nothing says so.
-			log.Fatalf("-https: cannot load %s and %s: %v", certFile, keyFile, err)
+			// No usable pair anywhere. Never fall back to plaintext: a panel
+			// quietly serving the password in clear after HTTPS was asked
+			// for is worse than one that refuses to start, because nothing
+			// says so.
+			log.Fatalf("-https: no usable certificate (%s and %s): %v", wanted, wantedKey, err)
+		}
+		if certFile != wanted {
+			log.Printf("-https: %s could not be used, serving %s instead", wanted, certFile)
 		}
 		srv.TLSConfig = certs.TLSConfig()
 		serve = func() error { return srv.ListenAndServeTLS("", "") }
