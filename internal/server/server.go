@@ -386,16 +386,23 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "session token")
 		return
 	}
-	http.SetCookie(w, &http.Cookie{
+	http.SetCookie(w, s.sessionCookieFor(token, int(ttl.Seconds())))
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// sessionCookieFor construye la cookie de sesión. Secure sigue al transporte
+// con el que se arrancó el panel: detrás de un proxy r.TLS es nil y deducirlo
+// de la petición dejaría la cookie sin el flag justo donde más falta hace.
+func (s *Server) sessionCookieFor(token string, maxAge int) *http.Cookie {
+	return &http.Cookie{
 		Name:     sessionCookie,
 		Value:    token,
 		Path:     "/",
 		HttpOnly: true,
 		Secure:   s.secure,
 		SameSite: http.SameSiteLaxMode,
-		MaxAge:   int(ttl.Seconds()),
-	})
-	w.WriteHeader(http.StatusNoContent)
+		MaxAge:   maxAge,
+	}
 }
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
@@ -404,7 +411,10 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 		s.revoked[c.Value] = true
 		s.mu.Unlock()
 	}
-	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Path: "/", MaxAge: -1})
+	// Mismos atributos que al emitirla: un navegador solo reemplaza una
+	// cookie cuyo nombre, path y flags coinciden, así que borrarla con otros
+	// dejaría la sesión viva en el navegador.
+	http.SetCookie(w, s.sessionCookieFor("", -1))
 	w.WriteHeader(http.StatusNoContent)
 }
 
