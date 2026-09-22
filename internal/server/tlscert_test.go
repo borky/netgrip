@@ -142,3 +142,50 @@ func TestDefaultPathsAreUhttpds(t *testing.T) {
 		t.Fatalf("defaults = %q, %q", DefaultCertPath, DefaultKeyPath)
 	}
 }
+
+// A configured pair that is missing must not take the panel down: the point
+// of HTTPS here is that the panel keeps working over TLS, and a deleted or
+// half-written certificate would otherwise leave the router with no panel
+// until somebody logs in over SSH. Falling back is still TLS; falling back
+// to plaintext is what must never happen.
+func TestOpenCertificateFallsBackToAUsablePair(t *testing.T) {
+	dir := t.TempDir()
+	goodCert, goodKey := writePair(t, dir, "fallback")
+
+	// Point the "configured" pair at nothing, and make the fallbacks the
+	// good pair by overriding the package paths for the test.
+	origCert, origKey := PanelCertPath, PanelKeyPath
+	t.Cleanup(func() { PanelCertPath, PanelKeyPath = origCert, origKey })
+	PanelCertPath, PanelKeyPath = goodCert, goodKey
+
+	r, usedCert, _, err := OpenCertificate(filepath.Join(dir, "gone.crt"), filepath.Join(dir, "gone.key"))
+	if err != nil {
+		t.Fatalf("should have fallen back, got %v", err)
+	}
+	if usedCert != goodCert {
+		t.Errorf("used %s, want the fallback %s", usedCert, goodCert)
+	}
+	if got := leafCN(t, r); got != "fallback" {
+		t.Errorf("serving CN %q", got)
+	}
+}
+
+// With nothing usable anywhere it must fail, so the caller refuses to start
+// rather than serving the router's password in clear.
+func TestOpenCertificateFailsWhenNothingIsUsable(t *testing.T) {
+	dir := t.TempDir()
+	origCert, origKey := PanelCertPath, PanelKeyPath
+	origDef, origDefKey := DefaultCertPath, DefaultKeyPath
+	t.Cleanup(func() {
+		PanelCertPath, PanelKeyPath = origCert, origKey
+		DefaultCertPath, DefaultKeyPath = origDef, origDefKey
+	})
+	PanelCertPath = filepath.Join(dir, "a.crt")
+	PanelKeyPath = filepath.Join(dir, "a.key")
+	DefaultCertPath = filepath.Join(dir, "b.crt")
+	DefaultKeyPath = filepath.Join(dir, "b.key")
+
+	if _, _, _, err := OpenCertificate("", ""); err == nil {
+		t.Fatal("no usable pair must be an error")
+	}
+}
