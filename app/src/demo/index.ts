@@ -720,6 +720,8 @@ export const demoApi: typeof api = {
   httpsState: () => get({
     has_cert: state.hasCert, enabled: state.panelHttps, serving: state.panelHttps,
     cert: state.panelCert, router_cert: true,
+    serving_cert: state.panelHttps ? "/etc/netgrip/ssl/cert.pem" : "",
+    serving_source: state.panelHttps ? state.panelCert : "",
   }),
   setPanelHttps: async (enabled: boolean, cert?: "panel" | "router") => {
     await wait(800, 1500);

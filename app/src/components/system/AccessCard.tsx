@@ -37,6 +37,9 @@ export function AccessCard({ index = 2 }: { index?: number }) {
   const [ttlMin, setTtlMin] = useState(720);
   const [hasCert, setHasCert] = useState(false);
   const [hasRouterCert, setHasRouterCert] = useState(false);
+  // Lo que se está sirviendo ahora mismo, que no tiene por qué ser lo
+  // configurado: si el par configurado falta, el panel sirve otro y lo dice.
+  const [serving, setServing] = useState<"" | "panel" | "router" | "custom">("");
   // Lo aplicado, para saber al guardar si algo cambió de verdad: sólo
   // entonces hay que reiniciar el panel y llevarse el navegador con él.
   const [appliedHttps, setAppliedHttps] = useState(false);
@@ -65,6 +68,7 @@ export function AccessCard({ index = 2 }: { index?: number }) {
       setAppliedHttps(s.enabled);
       setPanelCert(s.cert);
       setAppliedCert(s.cert);
+      setServing(s.serving ? s.serving_source : "");
     }).catch(() => {});
   };
   useEffect(reload, []);
@@ -202,9 +206,21 @@ export function AccessCard({ index = 2 }: { index?: number }) {
                 </div>
               )}
               <div className="flex items-center gap-2">
-                <ShieldCheck size={14} className={hasCert ? "text-ok" : "text-faint"} aria-hidden="true" />
-                <span className="text-small flex-1">{hasCert ? t("access.httpsReady") : t("access.httpsNone")}</span>
+                <ShieldCheck size={14} className={serving ? "text-ok" : "text-faint"} aria-hidden="true" />
+                <span className="text-small flex-1">
+                  {serving
+                    ? t("access.servingWith", {
+                        cert:
+                          serving === "panel" ? t("access.certOwn")
+                            : serving === "router" ? t("access.certRouter")
+                              : t("access.certCustom"),
+                      })
+                    : t("access.servingPlain")}
+                </span>
               </div>
+              <p className="text-caption text-muted">
+                {hasCert ? t("access.ownCertReady") : t("access.ownCertNone")}
+              </p>
             </div>,
             savePanel, panel, ttlMin <= 0,
           )}

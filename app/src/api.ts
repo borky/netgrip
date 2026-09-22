@@ -560,6 +560,7 @@ const realApi = {
     request<{
       has_cert: boolean; enabled: boolean; serving: boolean;
       cert: "panel" | "router"; router_cert: boolean;
+      serving_cert: string; serving_source: "" | "panel" | "router" | "custom";
     }>("/api/https"),
   setPanelHttps: (enabled: boolean, cert?: "panel" | "router") =>
     request<{ status: string; https: boolean; restarting: boolean }>("/api/https", {

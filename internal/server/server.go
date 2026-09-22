@@ -34,6 +34,11 @@ const (
 type Server struct {
 	rpcdURL string
 	version string
+	// servingCert: la ruta del par que este proceso abrió de verdad, vacía
+	// si no sirve TLS. Configurado y servido pueden no coincidir - el par
+	// configurado puede faltar y haberse caído a otro - y la tarjeta tiene
+	// que poder decir cuál es cuál.
+	servingCert string
 	// secure: el panel se sirve por TLS, así que la cookie de sesión lleva
 	// el flag Secure. Se pasa desde el arranque en vez de deducirlo de la
 	// petición: detrás de un proxy r.TLS es nil y la cookie saldría sin el
@@ -43,6 +48,9 @@ type Server struct {
 	mu      sync.Mutex
 	revoked map[string]bool
 }
+
+// SetServingCert registra el par que el proceso abrió al arrancar.
+func (s *Server) SetServingCert(path string) { s.servingCert = path }
 
 // New construye el panel. secure indica que se servirá por TLS.
 func New(rpcdURL, version string, secure bool) *Server {
@@ -2903,4 +2911,18 @@ func (s *Server) handleLanServicesDelete(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// servingSource nombra el par que se está sirviendo.
+func servingSource(path string) string {
+	switch path {
+	case "":
+		return ""
+	case PanelCertPath:
+		return modules.CertSourcePanel
+	case DefaultCertPath:
+		return modules.CertSourceRouter
+	default:
+		return "custom"
+	}
 }
