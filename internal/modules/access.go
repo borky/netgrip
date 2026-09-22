@@ -2,7 +2,6 @@ package modules
 
 import (
 	"fmt"
-	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -280,16 +279,60 @@ func sshHealthy(cfg SSHAccess) bool {
 	if !cfg.Enabled {
 		return executor.ServiceEnabled("dropbear") == cfg.Enabled
 	}
-	port := cfg.Port
-	if _, err := strconv.Atoi(port); err != nil {
-		port = "22"
+	port, err := strconv.Atoi(cfg.Port)
+	if err != nil || port < 1 || port > 65535 {
+		port = 22
 	}
-	conn, err := net.DialTimeout("tcp", "127.0.0.1:"+port, 2*time.Second)
-	if err != nil {
+	return listeningOnPort(port)
+}
+
+// listeningOnPort reports whether anything holds a listening socket on the
+// port, on any address.
+//
+// Dialling 127.0.0.1 answers a different question. dropbear bound to one
+// interface - `option Interface 'lan'`, which is how you keep SSH off the
+// WAN - never listens on loopback, so the dial is refused and a perfectly
+// healthy daemon looks dead. The healthcheck then rolls back a change that
+// was fine, and says SSH is broken when it is not.
+//
+// Reading /proc is also cheaper than a dial with a timeout, on a path that
+// runs while the user waits for a save to come back.
+func listeningOnPort(port int) bool {
+	for _, p := range []string{"/proc/net/tcp", "/proc/net/tcp6"} {
+		b, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		if hasListenerOnPort(string(b), port) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasListenerOnPort parses one /proc/net/tcp table: the local address column
+// is HEX_ADDRESS:HEX_PORT and state 0A is TCP_LISTEN. Split out so the
+// parsing is testable against captured router output.
+func hasListenerOnPort(table string, port int) bool {
+	lines := strings.Split(table, "\n")
+	if len(lines) < 2 {
 		return false
 	}
-	conn.Close()
-	return true
+	for _, line := range lines[1:] { // the first line is the header
+		f := strings.Fields(line)
+		if len(f) < 4 || f[3] != "0A" {
+			continue
+		}
+		colon := strings.LastIndex(f[1], ":")
+		if colon < 0 {
+			continue
+		}
+		p, err := strconv.ParseInt(f[1][colon+1:], 16, 32)
+		if err == nil && int(p) == port {
+			return true
+		}
+	}
+	return false
 }
 
 const (
