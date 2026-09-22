@@ -74,12 +74,14 @@ func main() {
 	// HTTPS on the same port: plaintext then fails at the handshake, which
 	// is the point - a redirect cannot protect a password already sent to
 	// it.
-	panel := server.New(resolvedRPCd, version, *useTLS)
-	scheme, srv := "http", &http.Server{Addr: addr, Handler: panel}
-	serve := srv.ListenAndServe
+	// The certificate is opened before the server is built, so the path it
+	// ended up serving is set once, at construction, and never written
+	// while handlers are reading it.
+	var reloader *server.CertReloader
+	servingCert := ""
 	if *useTLS {
 		wanted, wantedKey := server.ResolveCertPaths(*tlsCert, *tlsKey)
-		certs, certFile, _, err := server.OpenCertificate(*tlsCert, *tlsKey)
+		reloaded, certFile, err := server.OpenCertificate(*tlsCert, *tlsKey)
 		if err != nil {
 			// No usable pair anywhere. Never fall back to plaintext: a panel
 			// quietly serving the password in clear after HTTPS was asked
@@ -90,8 +92,13 @@ func main() {
 		if certFile != wanted {
 			log.Printf("-https: %s could not be used, serving %s instead", wanted, certFile)
 		}
-		panel.SetServingCert(certFile)
-		srv.TLSConfig = certs.TLSConfig()
+		reloader, servingCert = reloaded, certFile
+	}
+	panel := server.New(resolvedRPCd, version, *useTLS, servingCert)
+	scheme, srv := "http", &http.Server{Addr: addr, Handler: panel}
+	serve := srv.ListenAndServe
+	if reloader != nil {
+		srv.TLSConfig = reloader.TLSConfig()
 		serve = func() error { return srv.ListenAndServeTLS("", "") }
 		scheme = "https"
 	}
