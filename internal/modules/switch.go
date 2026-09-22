@@ -128,14 +128,10 @@ func SetSwitchPort(edit SwitchPortEdit) (*SwitchProbe, bool, error) {
 
 	if edit.Description != nil {
 		key := "netgrip.ports." + sanitizeUCIKey(edit.Name) + ".description"
-		if !uciSectionExists("netgrip.ports") {
-			cmd := exec.Command("uci", "import", "netgrip")
-			cmd.Stdin = strings.NewReader("config ports 'ports'\n")
-			_ = cmd.Run()
-		}
+		_ = EnsureNetgripSection("ports", "ports")
 		secName := sanitizeUCIKey(edit.Name)
 		if !uciSectionExists("netgrip.ports." + secName) {
-			cmd := exec.Command("uci", "import", "netgrip")
+			cmd := exec.Command("uci", "-m", "import", "netgrip")
 			cmd.Stdin = strings.NewReader("config port '" + secName + "'\n")
 			_ = cmd.Run()
 		}

@@ -29,9 +29,9 @@ type DNSConfig struct {
 	// AdGuardProtection is the DNS handoff (#360): dnsmasq forwards
 	// everything to the local AdGuard listener. AdGuardHasBackup reports the
 	// snapshot taken before the handoff, so the UI can promise a restore.
-	AdGuardProtection bool        `json:"adguard_protection"`
-	AdGuardHasBackup  bool        `json:"adguard_has_backup"`
-	AdGuardDnsPort    int         `json:"adguard_dns_port,omitempty"`
+	AdGuardProtection bool `json:"adguard_protection"`
+	AdGuardHasBackup  bool `json:"adguard_has_backup"`
+	AdGuardDnsPort    int  `json:"adguard_dns_port,omitempty"`
 	// DoH (#364): whether AdGuard resolves through DNS-over-HTTPS upstreams,
 	// the current upstream list (capped at 8) and the provider presets the UI
 	// offers. Providers are a backend constant (single source of truth).

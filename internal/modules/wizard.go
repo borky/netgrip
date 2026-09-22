@@ -21,20 +21,11 @@ func ProbeWizard() *WizardState {
 }
 
 func CompleteWizard() error {
-	if !uciSectionExists("netgrip.wizard") {
-		if !uciSectionExists("netgrip.main") {
-			cmd := exec.Command("uci", "import", "netgrip")
-			cmd.Stdin = strings.NewReader("config panel 'main'\n\toption panel 'panel'\nconfig wizard 'wizard'\n\toption completed '0'\n")
-			if out, err := cmd.CombinedOutput(); err != nil {
-				return fmt.Errorf("init netgrip wizard config: %s", strings.TrimSpace(string(out)))
-			}
-		} else {
-			cmd := exec.Command("uci", "import", "netgrip")
-			cmd.Stdin = strings.NewReader("config wizard 'wizard'\n\toption completed '0'\n")
-			if out, err := cmd.CombinedOutput(); err != nil {
-				return fmt.Errorf("add wizard section: %s", strings.TrimSpace(string(out)))
-			}
-		}
+	// Both branches used a bare `uci import`, which REPLACES the package:
+	// the second one, holding only the wizard section, took netgrip.main -
+	// the panel's port and TLS settings - and netgrip.selfupdate with it.
+	if err := EnsureNetgripSection("wizard", "wizard"); err != nil {
+		return err
 	}
 	out, err := exec.Command("uci", "set", "netgrip.wizard.completed=1").CombinedOutput()
 	if err != nil {
