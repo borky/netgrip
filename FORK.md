@@ -55,6 +55,12 @@ Nine PRs have merged upstream, including the whole multi-WAN feature
 (gnacho/netgrip#337, merged as a merge commit rather than a squash — which is
 why a rebase dropped all thirteen of this branch's copies automatically).
 
+## Upstream behaviour this fork accepts as-is
+
+| behaviour | decision |
+|---|---|
+| The panel polls `https://netgrip.cloudless.club/announcements.json` every 6 hours and renders the result as a ribbon (upstream #389) | **Left alone, deliberately.** It means this build makes a recurring outbound call to upstream's domain and upstream can show text and a link inside the panel. Acceptable while the only user is the person who builds it — and it is how a security notice would arrive. No patch is needed to change course later: upstream already honours `NETGRIP_ANNOUNCEMENTS_URL`, so the init script can point it elsewhere, or at something unreachable to silence it (there is no explicit off switch). Revisit if the fork gets other users. |
+
 ## Waiting on upstream, not fork-only
 
 These would go upstream tomorrow if they could:
