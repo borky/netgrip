@@ -351,8 +351,11 @@ func hasListenerOnPort(table string, port int) bool {
 	return false
 }
 
-const (
-	sslDir   = "/etc/netgrip/ssl"
+const sslDir = "/etc/netgrip/ssl"
+
+// Variables y no constantes para que los tests puedan apuntarlas a un
+// directorio temporal; en ejecución nadie las cambia.
+var (
 	certPath = sslDir + "/cert.pem"
 	keyPath  = sslDir + "/key.pem"
 
@@ -371,12 +374,29 @@ func HasRouterCert() bool {
 	return fileReadable(routerCertPath) && fileReadable(routerKeyPath)
 }
 
-// CertSource dice cuál de los dos pares está configurado, mirando las rutas
-// en vez de adivinarlo por lo que haya en disco.
+// CertSource dice qué par se usaría: el configurado si lo hay y, si no está
+// configurado, el que el arranque elegiría por descarte.
+//
+// Sin esto el selector enseñaba "el propio del panel" siempre que la
+// configuración estuviera vacía, aunque no existiera tal par y lo que se
+// estuviera sirviendo fuese el del router. Un selector que nombra algo
+// distinto de lo que hay es peor que no tenerlo: invita a guardar creyendo
+// que no se cambia nada.
 func CertSource() string {
-	if c, _ := HTTPSCertPaths(); c == routerCertPath {
+	switch c, _ := HTTPSCertPaths(); c {
+	case routerCertPath:
+		return CertSourceRouter
+	case certPath:
+		return CertSourcePanel
+	}
+	// Sin configurar: el mismo orden que sigue el arranque.
+	if HasSelfSignedCert() {
+		return CertSourcePanel
+	}
+	if HasRouterCert() {
 		return CertSourceRouter
 	}
+	// Ninguno existe todavía: el propio es el que se generaría.
 	return CertSourcePanel
 }
 

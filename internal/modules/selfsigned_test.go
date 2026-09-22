@@ -4,6 +4,8 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"net"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -144,5 +146,44 @@ func TestLocalAddressesAlwaysIncludeLoopback(t *testing.T) {
 	}
 	if !v4 || !v6 {
 		t.Errorf("loopback missing from %v", addrs)
+	}
+}
+
+// CertSource decides what the selector shows. Reporting the configured path
+// alone meant an unset configuration always read as "the panel's own", even
+// on a router where no such pair existed and the router's was being served -
+// a selector naming something other than what is in use, which invites
+// saving in the belief that nothing changes.
+func TestCertSourceFollowsWhatWouldBeUsed(t *testing.T) {
+	dir := t.TempDir()
+	origCert, origKey := certPath, keyPath
+	origRouter, origRouterKey := routerCertPath, routerKeyPath
+	t.Cleanup(func() {
+		certPath, keyPath = origCert, origKey
+		routerCertPath, routerKeyPath = origRouter, origRouterKey
+	})
+	certPath = filepath.Join(dir, "panel.crt")
+	keyPath = filepath.Join(dir, "panel.key")
+	routerCertPath = filepath.Join(dir, "router.crt")
+	routerKeyPath = filepath.Join(dir, "router.key")
+
+	// Nothing on disk: the panel's own is what would be generated.
+	if got := CertSource(); got != CertSourcePanel {
+		t.Errorf("with nothing available: %q, want %q", got, CertSourcePanel)
+	}
+
+	// Only the router's exists: that is what the fallback serves, so that is
+	// what the selector must show.
+	os.WriteFile(routerCertPath, []byte("x"), 0o644)
+	os.WriteFile(routerKeyPath, []byte("x"), 0o600)
+	if got := CertSource(); got != CertSourceRouter {
+		t.Errorf("with only the router's pair: %q, want %q", got, CertSourceRouter)
+	}
+
+	// Once the panel has its own, that wins, matching the boot order.
+	os.WriteFile(certPath, []byte("x"), 0o644)
+	os.WriteFile(keyPath, []byte("x"), 0o600)
+	if got := CertSource(); got != CertSourcePanel {
+		t.Errorf("with both: %q, want %q", got, CertSourcePanel)
 	}
 }
