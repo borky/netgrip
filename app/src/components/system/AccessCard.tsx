@@ -3,7 +3,7 @@ import { useTranslation } from "react-i18next";
 import { Lock, ShieldCheck } from "lucide-react";
 import { api } from "../../api";
 import type { AccessProbe } from "../../types";
-import { ActionBanner, Button, Card, Input, SkeletonRows, Toggle, useToast } from "../ui";
+import { ActionBanner, Button, Card, Input, SegmentedControl, SkeletonRows, Toggle, useToast } from "../ui";
 import { useActionCycle } from "../wifi/action";
 
 // durationToMin convierte un time.Duration de Go ("12h0m0s") a minutos.
@@ -36,8 +36,13 @@ export function AccessCard({ index = 2 }: { index?: number }) {
   const [sshPort, setSshPort] = useState("22");
   const [ttlMin, setTtlMin] = useState(720);
   const [hasCert, setHasCert] = useState(false);
+  const [hasRouterCert, setHasRouterCert] = useState(false);
+  // Lo aplicado, para saber al guardar si algo cambió de verdad: sólo
+  // entonces hay que reiniciar el panel y llevarse el navegador con él.
+  const [appliedHttps, setAppliedHttps] = useState(false);
+  const [appliedCert, setAppliedCert] = useState<"panel" | "router">("panel");
   const [panelHttps, setPanelHttps] = useState(false);
-  const [httpsBusy, setHttpsBusy] = useState(false);
+  const [panelCert, setPanelCert] = useState<"panel" | "router">("panel");
 
   const panel = useActionCycle();
   const luci = useActionCycle();
@@ -55,14 +60,34 @@ export function AccessCard({ index = 2 }: { index?: number }) {
     }).catch(() => {});
     api.httpsState().then((s) => {
       setHasCert(s.has_cert);
+      setHasRouterCert(s.router_cert);
       setPanelHttps(s.enabled);
+      setAppliedHttps(s.enabled);
+      setPanelCert(s.cert);
+      setAppliedCert(s.cert);
     }).catch(() => {});
   };
   useEffect(reload, []);
 
+  // Todo lo del panel se aplica aquí, al guardar. El interruptor de HTTPS
+  // se aplicaba solo al pulsarlo, que es justo lo que un botón Guardar dice
+  // que no va a pasar.
   const savePanel = () =>
     panel.run(async () => {
       await api.setPanelSessionTtl(ttlMin);
+      const schemeChanged = panelHttps !== appliedHttps;
+      const certChanged = panelHttps && panelCert !== appliedCert;
+      if (!schemeChanged && !certChanged) return { status: "applied" as const };
+
+      await api.setPanelHttps(panelHttps, panelCert);
+      setAppliedHttps(panelHttps);
+      setAppliedCert(panelCert);
+      // Cambiar certificado sin cambiar de esquema también reinicia, pero
+      // la URL no se mueve: basta con esperar a que vuelva.
+      push({ tone: "ok", text: t("access.panelHttpsRestarting") });
+      await waitForRestart();
+      const target = `${panelHttps ? "https" : "http"}://${window.location.host}${window.location.pathname}`;
+      window.setTimeout(() => { window.location.href = target; }, 800);
       return { status: "applied" as const };
     }).then(() => reload());
 
@@ -99,22 +124,6 @@ export function AccessCard({ index = 2 }: { index?: number }) {
     }
   };
 
-  const togglePanelHttps = async (next: boolean) => {
-    const target = `${next ? "https" : "http"}://${window.location.host}${window.location.pathname}`;
-    if (!window.confirm(t("access.panelHttpsConfirm", { url: target }))) return;
-    setHttpsBusy(true);
-    try {
-      await api.setPanelHttps(next);
-      setPanelHttps(next);
-      push({ tone: "ok", text: t("access.panelHttpsRestarting") });
-      await waitForRestart();
-      // Un respiro para que el listener nuevo acepte: el viejo ya no está.
-      window.setTimeout(() => { window.location.href = target; }, 800);
-    } catch (err) {
-      push({ tone: "danger", text: err instanceof Error ? err.message : String(err) });
-      setHttpsBusy(false);
-    }
-  };
 
   const numPort = (value: number, onChange: (v: number) => void, ariaLabel: string) => (
     <Input
@@ -163,9 +172,35 @@ export function AccessCard({ index = 2 }: { index?: number }) {
                   <span className="text-body font-medium">{t("access.panelHttps")}</span>
                   <p className="text-caption text-muted">{t("access.panelHttpsHint")}</p>
                 </div>
-                <Toggle checked={panelHttps} onChange={togglePanelHttps}
-                  label={t("access.panelHttps")} disabled={httpsBusy} />
+                <Toggle checked={panelHttps} onChange={setPanelHttps} label={t("access.panelHttps")} />
               </div>
+              {panelHttps && (
+                <div className="flex flex-col gap-1.5 py-1.5">
+                  <div className="flex items-center gap-3">
+                    <span className="text-body font-medium flex-1 min-w-0">{t("access.certSource")}</span>
+                    <SegmentedControl
+                      size="sm"
+                      ariaLabel={t("access.certSource")}
+                      value={panelCert}
+                      onChange={(v) => setPanelCert(v)}
+                      options={
+                        // La opción del router sólo aparece si ese par está:
+                        // ofrecer algo que no se puede servir sería una
+                        // promesa que el guardado rompe.
+                        hasRouterCert
+                          ? [
+                              { value: "panel" as const, label: t("access.certOwn") },
+                              { value: "router" as const, label: t("access.certRouter") },
+                            ]
+                          : [{ value: "panel" as const, label: t("access.certOwn") }]
+                      }
+                    />
+                  </div>
+                  <p className="text-caption text-muted">
+                    {panelCert === "router" ? t("access.certRouterHint") : t("access.certOwnHint")}
+                  </p>
+                </div>
+              )}
               <div className="flex items-center gap-2">
                 <ShieldCheck size={14} className={hasCert ? "text-ok" : "text-faint"} aria-hidden="true" />
                 <span className="text-small flex-1">{hasCert ? t("access.httpsReady") : t("access.httpsNone")}</span>
