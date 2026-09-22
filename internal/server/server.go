@@ -27,8 +27,20 @@ var distFS embed.FS
 
 const (
 	sessionCookie = "netgrip_session"
-	sessionTTL    = 12 * time.Hour
-	leasesPath    = "/tmp/dhcp.leases"
+	// secureSessionCookie: el mismo papel pero con otro nombre cuando se
+	// sirve por TLS.
+	//
+	// Un navegador no deja que un origen inseguro sobrescriba una cookie
+	// marcada Secure ("leave secure cookies alone", RFC 6265bis §5.4), así
+	// que con un solo nombre, apagar HTTPS dejaba la cookie vieja de HTTPS
+	// bloqueando la nueva: el login acertaba la contraseña, el servidor
+	// mandaba su cookie, el navegador la descartaba en silencio y la sesión
+	// no existía. Nombres distintos no colisionan y cambiar de esquema deja
+	// de romper el acceso. El prefijo __Secure- además obliga al navegador a
+	// rechazarla si alguna vez llegara sin Secure o por HTTP.
+	secureSessionCookie = "__Secure-netgrip_session"
+	sessionTTL          = 12 * time.Hour
+	leasesPath          = "/tmp/dhcp.leases"
 )
 
 type Server struct {
@@ -403,9 +415,31 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 // sessionCookieFor construye la cookie de sesión. Secure sigue al transporte
 // con el que se arrancó el panel: detrás de un proxy r.TLS es nil y deducirlo
 // de la petición dejaría la cookie sin el flag justo donde más falta hace.
+// sessionCookie lee la cookie de sesión con el nombre que toca, y acepta el
+// otro como respaldo: entre el cambio de esquema y el siguiente login puede
+// llegar cualquiera de los dos.
+func (s *Server) sessionCookie(r *http.Request) (*http.Cookie, error) {
+	if c, err := r.Cookie(s.sessionCookieName()); err == nil {
+		return c, nil
+	}
+	other := secureSessionCookie
+	if s.secure {
+		other = sessionCookie
+	}
+	return r.Cookie(other)
+}
+
+// sessionCookieName es el nombre que corresponde al transporte actual.
+func (s *Server) sessionCookieName() string {
+	if s.secure {
+		return secureSessionCookie
+	}
+	return sessionCookie
+}
+
 func (s *Server) sessionCookieFor(token string, maxAge int) *http.Cookie {
 	return &http.Cookie{
-		Name:     sessionCookie,
+		Name:     s.sessionCookieName(),
 		Value:    token,
 		Path:     "/",
 		HttpOnly: true,
@@ -416,7 +450,7 @@ func (s *Server) sessionCookieFor(token string, maxAge int) *http.Cookie {
 }
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
-	if c, err := r.Cookie(sessionCookie); err == nil {
+	if c, err := s.sessionCookie(r); err == nil {
 		s.mu.Lock()
 		s.revoked[c.Value] = true
 		s.mu.Unlock()
@@ -434,7 +468,7 @@ func (s *Server) handleMe(w http.ResponseWriter, _ *http.Request) {
 
 func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		c, err := r.Cookie(sessionCookie)
+		c, err := s.sessionCookie(r)
 		if err != nil || !auth.ValidSessionToken(c.Value) || s.isRevoked(c.Value) {
 			writeError(w, http.StatusUnauthorized, "login required")
 			return
