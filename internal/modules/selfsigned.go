@@ -70,8 +70,17 @@ func buildSelfSigned(hostname string, addrs []net.IP, now time.Time) (certPEM, k
 	return certPEM, keyPEM, nil
 }
 
-// localAddresses son las direcciones por las que se puede llegar al panel,
-// sin loopback ni enlaces locales: entran en el SAN.
+// localAddresses son las direcciones desde las que se administra el router, y
+// por tanto las que van en el SAN.
+//
+// Sólo direcciones privadas. Un router tiene también la pública del enlace, y
+// meterla tenía dos pegas: el certificado se lo enseña a cualquiera que se
+// conecte al panel, y caduca de hecho cada vez que el proveedor cambia la
+// dirección, que es justo cuando nadie está mirando. Al panel no se llega
+// desde fuera; nombrar la dirección de salida no servía para nada.
+//
+// Un LAN con direcciones públicas se queda sin entradas de IP y sirve con el
+// nombre del equipo, que es el caso raro y el fallo seguro.
 func localAddresses() []net.IP {
 	var out []net.IP
 	ifaces, err := net.Interfaces()
@@ -88,15 +97,23 @@ func localAddresses() []net.IP {
 		}
 		for _, a := range addrs {
 			ipn, ok := a.(*net.IPNet)
-			if !ok || ipn.IP.IsLinkLocalUnicast() || ipn.IP.IsLoopback() {
+			if !ok || !administrativeAddr(ipn.IP) {
 				continue
 			}
 			out = append(out, ipn.IP)
 		}
 	}
-	// Loopback al final: entrar por 127.0.0.1 es raro pero los
+	// Loopback al final: entrar por 127.0.0.1 es raro, pero los
 	// healthchecks lo hacen.
 	return append(out, net.IPv4(127, 0, 0, 1), net.IPv6loopback)
+}
+
+// administrativeAddr: privada (RFC1918 o ULA), ni loopback ni enlace local.
+func administrativeAddr(ip net.IP) bool {
+	if ip == nil || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+		return false
+	}
+	return ip.IsPrivate()
 }
 
 // writeSelfSigned deja el par en disco con los permisos que corresponden a
