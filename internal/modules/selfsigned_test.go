@@ -104,3 +104,45 @@ func TestGeneratedPairIsUsableAndValidNow(t *testing.T) {
 		t.Error("certificate cannot be used for a TLS handshake")
 	}
 }
+
+// The SAN is shown to everyone who opens the panel, and it should not
+// advertise the router's public address: nothing reaches the panel from
+// outside, and the entry goes stale the moment the provider changes it.
+func TestSANSkipsPublicAndLocalAddresses(t *testing.T) {
+	cases := []struct {
+		ip   string
+		want bool
+		why  string
+	}{
+		{"192.168.99.1", true, "RFC1918, a LAN gateway"},
+		{"10.99.0.1", true, "RFC1918, a modem's LAN side"},
+		{"172.16.4.1", true, "RFC1918"},
+		{"fd00:dead:beef::1", true, "ULA"},
+		{"203.0.113.9", false, "public: the uplink's address"},
+		{"2001:db8::1", false, "public IPv6 (documentation range)"},
+		{"169.254.3.4", false, "link-local"},
+		{"127.0.0.1", false, "loopback is appended separately"},
+	}
+	for _, c := range cases {
+		if got := administrativeAddr(net.ParseIP(c.ip)); got != c.want {
+			t.Errorf("%s (%s): got %v, want %v", c.ip, c.why, got, c.want)
+		}
+	}
+}
+
+// Loopback is still named, because the healthchecks reach the panel that way.
+func TestLocalAddressesAlwaysIncludeLoopback(t *testing.T) {
+	addrs := localAddresses()
+	var v4, v6 bool
+	for _, ip := range addrs {
+		if ip.Equal(net.IPv4(127, 0, 0, 1)) {
+			v4 = true
+		}
+		if ip.Equal(net.IPv6loopback) {
+			v6 = true
+		}
+	}
+	if !v4 || !v6 {
+		t.Errorf("loopback missing from %v", addrs)
+	}
+}
