@@ -19,11 +19,11 @@ import (
 type WifiEdit struct {
 	Section    string   `json:"section"` // UCI section, e.g. default_radio0
 	Sections   []string `json:"sections,omitempty"`
-	SSID       string `json:"ssid,omitempty"`
-	Key        string `json:"key,omitempty"`
-	Encryption string `json:"encryption,omitempty"`
-	Hidden     *bool  `json:"hidden,omitempty"`
-	Disabled   *bool  `json:"disabled,omitempty"`
+	SSID       string   `json:"ssid,omitempty"`
+	Key        string   `json:"key,omitempty"`
+	Encryption string   `json:"encryption,omitempty"`
+	Hidden     *bool    `json:"hidden,omitempty"`
+	Disabled   *bool    `json:"disabled,omitempty"`
 	// MAC sets a fixed BSSID (e.g. "00:11:22:33:44:55"); empty means keep.
 	MAC string `json:"mac,omitempty"`
 }

@@ -12,8 +12,8 @@ import (
 )
 
 var (
-	fleetConfigPath        = "/etc/netgrip/fleet.json"
-	legacyFleetConfigPath  = "/etc/owpanel/fleet.json"
+	fleetConfigPath       = "/etc/netgrip/fleet.json"
+	legacyFleetConfigPath = "/etc/owpanel/fleet.json"
 )
 
 type FleetNode struct {
