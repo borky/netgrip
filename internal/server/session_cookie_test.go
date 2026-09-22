@@ -174,3 +174,44 @@ func TestALegacySessionIsMovedOntoTheCurrentName(t *testing.T) {
 		}
 	}
 }
+
+// Logout has to clear every name the cookie might have arrived under, not
+// just the current one. Revocation is in memory and does not survive the
+// restart this feature causes, so a cookie left in the browser would
+// authenticate again afterwards.
+func TestLogoutClearsEveryNameItAccepts(t *testing.T) {
+	for _, secure := range []bool{false, true} {
+		s := &Server{secure: secure, revoked: map[string]bool{}}
+		r, _ := http.NewRequest("POST", "/api/logout", nil)
+		r.AddCookie(&http.Cookie{Name: legacySessionCookie, Value: "token"})
+		w := httptest.NewRecorder()
+		s.handleLogout(w, r)
+
+		cleared := map[string]bool{}
+		for _, c := range w.Result().Cookies() {
+			if c.MaxAge < 0 {
+				cleared[c.Name] = true
+			}
+		}
+		want := append([]string{s.sessionCookieName()}, s.otherSessionCookieNames()...)
+		for _, name := range want {
+			if !cleared[name] {
+				t.Errorf("secure=%v: logout left %q in the browser", secure, name)
+			}
+		}
+	}
+}
+
+// A request with no cookie at all must be an error, never a nil cookie with
+// a nil error: requireAuth reads c.Value straight after checking err, so the
+// handler would panic on the first anonymous request.
+func TestNoCookieIsAnErrorNotANilPair(t *testing.T) {
+	for _, secure := range []bool{false, true} {
+		s := &Server{secure: secure}
+		r, _ := http.NewRequest("GET", "/", nil)
+		c, _, err := s.sessionCookie(r)
+		if err == nil {
+			t.Errorf("secure=%v: no cookie must report an error, got cookie %v", secure, c)
+		}
+	}
+}
