@@ -3,14 +3,18 @@ package server
 import (
 	"embed"
 	"encoding/json"
+	"fmt"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/gnacho/netgrip/internal/auth"
+	"github.com/gnacho/netgrip/internal/executor"
 	"github.com/gnacho/netgrip/internal/modules"
 	"github.com/gnacho/netgrip/internal/ubus"
 )
@@ -18,26 +22,75 @@ import (
 //go:embed all:dist
 var distFS embed.FS
 
+// The session cookie has one name per transport, and neither of them is the
+// name it used to have.
+//
+// A browser will not let an insecure origin overwrite a cookie marked Secure
+// ("leave secure cookies alone", RFC 6265bis 5.4). With a single name,
+// turning HTTPS off left the old Secure cookie blocking the new one: the
+// login got the password right, the server sent its cookie, the browser
+// silently discarded it, and the panel came straight back to the login form
+// with nothing anywhere saying why.
+//
+// Two names fix that going forward, but only if NEITHER is the old one. A
+// name that has ever been set with Secure is unusable from HTTP for as long
+// as that cookie lives, and no server can clear it - the same rule that
+// blocks the overwrite blocks the deletion. So the plaintext cookie is
+// renamed too, and legacySessionCookie is read but never written: a session
+// that predates this survives, and is moved onto the right name on its next
+// request.
 const (
-	sessionCookie = "netgrip_session"
-	sessionTTL    = 12 * time.Hour
-	leasesPath    = "/tmp/dhcp.leases"
+	// httpSessionCookie: served over plain HTTP. Named for its transport so
+	// it cannot collide with a cookie some HTTPS origin set earlier.
+	httpSessionCookie = "netgrip_http_session"
+
+	// secureSessionCookie: served over TLS. The __Secure- prefix makes the
+	// browser refuse it if it ever arrives without Secure or over HTTP.
+	secureSessionCookie = "__Secure-netgrip_session"
+
+	// legacySessionCookie: what both used to be called. Accepted on the way
+	// in, never issued.
+	legacySessionCookie = "netgrip_session"
+
+	leasesPath = "/tmp/dhcp.leases"
 )
 
 type Server struct {
 	rpcdURL string
 	version string
+	// servingCert: the path of the pair this process actually opened, empty
+	// when it is not serving TLS. Configured and served need not agree -
+	// the configured pair can be missing and the listener falls back to
+	// another - and the card has to be able to say which is which.
+	//
+	// Written once, at construction: it used to have a setter called after
+	// New, which left an exported writer for a field the handlers read with
+	// nothing enforcing the order.
+	servingCert string
+	// secure: the panel is served over TLS, so the session cookie carries
+	// the Secure flag. Passed in from startup rather than deduced from the
+	// request: behind a proxy r.TLS is nil and the cookie would go out
+	// without the flag exactly where it is needed most.
+	secure  bool
 	mux     *http.ServeMux
 	mu      sync.Mutex
 	revoked map[string]bool
+	// logins slows password guessing. The panel's login takes the
+	// router's root password and had no rate limit at all.
+	logins *loginThrottle
 }
 
-func New(rpcdURL, version string) *Server {
+// New builds the panel. secure says it will be served over TLS, and
+// servingCert is the pair that was opened for it.
+func New(rpcdURL, version string, secure bool, servingCert string) *Server {
 	s := &Server{
-		rpcdURL: rpcdURL,
-		version: version,
-		mux:     http.NewServeMux(),
-		revoked: make(map[string]bool),
+		rpcdURL:     rpcdURL,
+		version:     version,
+		servingCert: servingCert,
+		logins:      newLoginThrottle(),
+		secure:      secure,
+		mux:         http.NewServeMux(),
+		revoked:     make(map[string]bool),
 	}
 	s.mux.HandleFunc("/", s.handleSPA)
 	s.mux.HandleFunc("POST /api/login", s.handleLogin)
@@ -159,7 +212,7 @@ func New(rpcdURL, version string) *Server {
 	s.mux.HandleFunc("POST /api/lag", s.requireAuth(s.handleLAGSet))
 	s.mux.HandleFunc("DELETE /api/lag", s.requireAuth(s.handleLAGDelete))
 	s.mux.HandleFunc("GET /api/https", s.requireAuth(s.handleHTTPSGet))
-	s.mux.HandleFunc("POST /api/https", s.requireAuth(s.handleHTTPSEnable))
+	s.mux.HandleFunc("POST /api/https", s.requireAuth(s.handleHTTPSSet))
 	s.mux.HandleFunc("POST /api/wol", s.requireAuth(s.handleWoL))
 	s.mux.HandleFunc("GET /api/cpu", s.requireAuth(s.handleCPUGet))
 	s.mux.HandleFunc("GET /api/nlbwmon", s.requireAuth(s.handleNlbwmonGet))
@@ -301,6 +354,14 @@ type loginRequest struct {
 }
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
+	addr := clientAddr(r)
+	if wait := s.logins.retryAfter(addr); wait > 0 {
+		seconds := int(wait.Seconds()) + 1
+		w.Header().Set("Retry-After", strconv.Itoa(seconds))
+		writeError(w, http.StatusTooManyRequests,
+			fmt.Sprintf("too many attempts, try again in %d seconds", seconds))
+		return
+	}
 	var req loginRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid json")
@@ -316,6 +377,16 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !ok {
+		// Logged because this is the router's root password: a panel that
+		// accepts it should say when it was offered and refused. It is
+		// also the only way to tell a rejected attempt from one that never
+		// arrived, which is a real question when a browser is holding a
+		// cookie it will not replace.
+		if wait := s.logins.failed(addr); wait > 0 {
+			log.Printf("login: refused for %q from %s, throttled for %s", req.Username, addr, wait)
+		} else {
+			log.Printf("login: refused for %q from %s", req.Username, addr)
+		}
 		writeError(w, http.StatusUnauthorized, "invalid credentials")
 		return
 	}
@@ -325,24 +396,126 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "session token")
 		return
 	}
-	http.SetCookie(w, &http.Cookie{
-		Name:     sessionCookie,
-		Value:    token,
-		Path:     "/",
-		HttpOnly: true,
-		SameSite: http.SameSiteLaxMode,
-		MaxAge:   int(ttl.Seconds()),
-	})
+	s.logins.succeeded(addr)
+	cookie := s.sessionCookieFor(token, int(ttl.Seconds()))
+	http.SetCookie(w, cookie)
+	log.Printf("login: accepted for %q from %s, session cookie %q (secure=%v)",
+		req.Username, addr, cookie.Name, cookie.Secure)
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// clientAddr is the peer address without the port, for the log.
+func clientAddr(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+// sessionCookie reads the session cookie under the name that belongs to the
+// current transport, and accepts the other as a fallback: between a change of
+// scheme and the next login, either may arrive.
+//
+// The second return value says the fallback name was the one that matched,
+// which is what lets a session carry across the switch without also letting a
+// token issued in clear keep its old, weaker cookie forever.
+func (s *Server) sessionCookie(r *http.Request) (*http.Cookie, bool, error) {
+	if c, err := r.Cookie(s.sessionCookieName()); err == nil {
+		return c, false, nil
+	}
+	// Any other name we have ever issued. Whichever answers, the session is
+	// real and is moved onto the current name by the caller.
+	for _, name := range s.otherSessionCookieNames() {
+		if c, err := r.Cookie(name); err == nil {
+			return c, true, nil
+		}
+	}
+	// Never (nil, nil): the caller reads c.Value straight after checking
+	// the error, so a nil error with no cookie would panic the handler.
+	return nil, false, http.ErrNoCookie
+}
+
+// sessionCookieName is the name that belongs to the current transport.
+func (s *Server) sessionCookieName() string {
+	if s.secure {
+		return secureSessionCookie
+	}
+	return httpSessionCookie
+}
+
+// otherSessionCookieNames are the names a session may still arrive under.
+func (s *Server) otherSessionCookieNames() []string {
+	if s.secure {
+		return []string{httpSessionCookie, legacySessionCookie}
+	}
+	// Not secureSessionCookie: a browser never sends a __Secure- cookie
+	// over plain HTTP, so asking for it would only ever find nothing.
+	return []string{legacySessionCookie}
+}
+
+// reissueUnderCurrentName moves a session to the cookie name this transport
+// should be using, and expires the one it arrived under.
+//
+// Over TLS that matters: the __Secure- prefix buys nothing while the plain
+// name stays an accepted alias, so a token issued over plain HTTP - one that
+// may have been read off the LAN - would otherwise keep working, unprotected,
+// for the rest of its life.
+func (s *Server) reissueUnderCurrentName(w http.ResponseWriter, token string) {
+	ttl := time.Duration(modules.PanelSessionTTLMinutes()) * time.Minute
+	http.SetCookie(w, s.sessionCookieFor(token, int(ttl.Seconds())))
+	for _, name := range s.otherSessionCookieNames() {
+		// Best effort: a Secure cookie cannot be expired from a plaintext
+		// origin, which is the whole reason the names changed. The one
+		// that can be cleared is, and the session is on the right name
+		// either way.
+		http.SetCookie(w, &http.Cookie{
+			Name:     name,
+			Value:    "",
+			Path:     "/",
+			HttpOnly: true,
+			SameSite: http.SameSiteLaxMode,
+			MaxAge:   -1,
+		})
+	}
+}
+
+// sessionCookieFor builds the session cookie. Secure follows the transport
+// the panel was started with: behind a proxy r.TLS is nil, and deducing it
+// from the request would drop the flag exactly where it is needed most.
+
+func (s *Server) sessionCookieFor(token string, maxAge int) *http.Cookie {
+	return &http.Cookie{
+		Name:     s.sessionCookieName(),
+		Value:    token,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   s.secure,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   maxAge,
+	}
+}
+
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
-	if c, err := r.Cookie(sessionCookie); err == nil {
+	if c, _, err := s.sessionCookie(r); err == nil {
 		s.mu.Lock()
 		s.revoked[c.Value] = true
 		s.mu.Unlock()
 	}
-	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Path: "/", MaxAge: -1})
+	// The same attributes it was issued with: a browser replaces a cookie
+	// only when the name, path and flags match, so clearing it with any
+	// others would leave the session alive in the browser.
+	http.SetCookie(w, s.sessionCookieFor("", -1))
+	// And every other name it might have arrived under. Revocation alone
+	// is not enough: s.revoked lives in memory and does not survive the
+	// restart this feature causes, so a cookie left behind would
+	// authenticate again afterwards.
+	for _, name := range s.otherSessionCookieNames() {
+		http.SetCookie(w, &http.Cookie{
+			Name: name, Value: "", Path: "/", HttpOnly: true,
+			SameSite: http.SameSiteLaxMode, MaxAge: -1,
+		})
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -352,10 +525,13 @@ func (s *Server) handleMe(w http.ResponseWriter, _ *http.Request) {
 
 func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		c, err := r.Cookie(sessionCookie)
+		c, legacyName, err := s.sessionCookie(r)
 		if err != nil || !auth.ValidSessionToken(c.Value) || s.isRevoked(c.Value) {
 			writeError(w, http.StatusUnauthorized, "login required")
 			return
+		}
+		if legacyName {
+			s.reissueUnderCurrentName(w, c.Value)
 		}
 		next(w, r)
 	}
@@ -1948,15 +2124,138 @@ func (s *Server) handleHistoryGet(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) handleHTTPSGet(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, map[string]any{"has_cert": modules.HasSelfSignedCert()})
+	writeJSON(w, map[string]any{
+		"has_cert": modules.HasSelfSignedCert(),
+		// cert: which pair is configured, and whether the router's is even
+		// available to choose.
+		"cert":        modules.CertSource(),
+		"router_cert": modules.HasRouterCert(),
+		// enabled is what the configuration says; serving is how this
+		// process was started. Between a change and the restart that
+		// applies it the two differ, and the UI has to be able to say so.
+		"enabled": modules.HTTPSEnabled(),
+		"serving": s.secure,
+		// serving_cert is the pair this process actually opened, and
+		// serving_source names it. Configured and served differ whenever a
+		// configured pair was missing and the panel fell back.
+		"serving_cert":   s.servingCert,
+		"serving_source": servingSource(s.servingCert),
+	})
 }
 
-func (s *Server) handleHTTPSEnable(w http.ResponseWriter, _ *http.Request) {
-	if err := modules.EnableHTTPS(); err != nil {
+type httpsRequest struct {
+	Enabled *bool `json:"enabled"`
+	// Cert: "panel" (the panel's own pair, with the router's addresses in
+	// the SAN) or "router" (uhttpd's, the same one LuCI serves). Empty
+	// keeps whatever was already configured.
+	Cert string `json:"cert"`
+}
+
+// handleHTTPSSet turns the panel's own TLS on or off. It takes effect on the
+// restart it schedules: the listener cannot change scheme underneath the
+// request that asked for it.
+func (s *Server) handleHTTPSSet(w http.ResponseWriter, r *http.Request) {
+	var req httpsRequest
+	// An empty body means enable, which is what POST /api/https did before
+	// it could also turn TLS off.
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	enable := req.Enabled == nil || *req.Enabled
+
+	// Nothing to do is not a reason to restart the panel. The running
+	// state has to agree as well as the configuration: between a change
+	// and the restart that applies it the two differ, and that gap is
+	// exactly when the restart is still owed.
+	if s.secure == enable && modules.HTTPSEnabled() == enable &&
+		(!enable || req.Cert == "" || req.Cert == modules.CertSource()) {
+		writeJSON(w, map[string]any{"status": "unchanged", "https": enable, "restarting": false})
+		return
+	}
+
+	if !enable {
+		if err := modules.DisableHTTPS(); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		s.respondHTTPSChange(w, false)
+		return
+	}
+
+	source := req.Cert
+	switch source {
+	case "":
+		source = modules.CertSource()
+	case modules.CertSourcePanel, modules.CertSourceRouter, modules.CertSourceCustom:
+	default:
+		// Anything else used to mean "panel", so a typo silently generated
+		// and installed a new pair.
+		writeError(w, http.StatusBadRequest,
+			fmt.Sprintf("unknown certificate source %q; expected %q, %q or %q",
+				source, modules.CertSourcePanel, modules.CertSourceRouter, modules.CertSourceCustom))
+		return
+	}
+
+	// What to go back to if the new configuration turns out not to serve.
+	// Restoring it is not the same as turning HTTPS off: on a panel already
+	// serving TLS, disabling it was a second state change that left the
+	// process on HTTPS and the configuration on plaintext.
+	prevEnabled := modules.HTTPSEnabled()
+	prevCert, prevKey := modules.HTTPSCertPaths()
+
+	if err := modules.EnableHTTPS(source); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, map[string]string{"status": "enabled"})
+	// Refuse to restart into a configuration that cannot serve. Without
+	// this, a pair that does not load takes the panel down on restart and
+	// the only way back is the command line - from a button whose whole
+	// point is not needing one.
+	//
+	// The check is OpenCertificate, the very call the next process will
+	// make, and not a stricter one: a preflight that refuses what startup
+	// would have accepted reports an impossibility that is not there.
+	certFile, keyFile := modules.HTTPSCertPaths()
+	if _, used, err := OpenCertificate(certFile, keyFile); err != nil {
+		if rerr := modules.RestoreHTTPSConfig(prevEnabled, prevCert, prevKey); rerr != nil {
+			log.Printf("https: restoring the previous configuration failed: %v", rerr)
+		}
+		writeError(w, http.StatusInternalServerError,
+			fmt.Sprintf("no usable certificate for %s, configuration left as it was: %v", certFile, err))
+		return
+	} else if used != certFile {
+		log.Printf("https: %s could not be opened, the panel will serve %s", certFile, used)
+	}
+	s.respondHTTPSChange(w, true)
+}
+
+// respondHTTPSChange answers, then restarts the panel so the new scheme
+// takes effect. The sleep is what lets the answer reach the browser: the
+// process serving it is the one going away.
+func (s *Server) respondHTTPSChange(w http.ResponseWriter, https bool) {
+	status := "disabled"
+	if https {
+		status = "enabled"
+	}
+	// The transport is changing, so every session issued under the old one
+	// dies with it. This matters in the plaintext-to-TLS direction: those
+	// tokens crossed the LAN in clear and may have been read off it, and
+	// without this they would be carried over and promoted into the Secure
+	// cookie - protected in transit from then on, but belonging to whoever
+	// captured them. Everyone logs in again on the new scheme, which is
+	// what the change of address asks of them anyway.
+	if https != s.secure {
+		auth.BumpEpoch()
+	}
+	writeJSON(w, map[string]any{"status": status, "https": https, "restarting": true})
+	go func() {
+		time.Sleep(700 * time.Millisecond)
+		// Logged, not discarded. This is the one step nothing else can
+		// report on: the process that would notice the failure is the one
+		// being replaced, and the browser has already been answered. A
+		// missing init script left no trace anywhere at all.
+		if err := executor.Run(executor.Op{Kind: "initd", Args: []string{"netgrip", "restart"}}); err != nil {
+			log.Printf("https: restart failed, the panel is still on the old scheme: %v", err)
+		}
+	}()
 }
 
 type wolRequest struct {
@@ -2622,7 +2921,10 @@ func (s *Server) handlePushConfigGet(w http.ResponseWriter, _ *http.Request) {
 // trigger it remotely.
 func (s *Server) handleAgentRestart(w http.ResponseWriter, r *http.Request) {
 	authorized := false
-	if c, err := r.Cookie(sessionCookie); err == nil && auth.ValidSessionToken(c.Value) && !s.isRevoked(c.Value) {
+	// Through the same helper as every other handler: reading one
+	// hardcoded name meant this endpoint stopped recognising a UI session
+	// the moment the cookie's name followed the transport.
+	if c, _, err := s.sessionCookie(r); err == nil && auth.ValidSessionToken(c.Value) && !s.isRevoked(c.Value) {
 		authorized = true
 	}
 	if !authorized {
@@ -2702,4 +3004,22 @@ func (s *Server) handleLanServicesDelete(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// servingSource names the pair actually on the wire, which is not always the
+// configured one: the listener falls back when the configured pair cannot be
+// opened, and the card has to say so rather than repeat the configuration.
+func servingSource(path string) string {
+	routerCert, _ := routerPair()
+	panelCert, _ := panelPair()
+	switch path {
+	case "":
+		return ""
+	case panelCert:
+		return modules.CertSourcePanel
+	case routerCert:
+		return modules.CertSourceRouter
+	default:
+		return modules.CertSourceCustom
+	}
 }

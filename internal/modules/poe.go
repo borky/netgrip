@@ -116,14 +116,10 @@ func SetPoESchedule(sched PoESchedule) (*PoEProbe, error) {
 		return nil, nil
 	}
 	key := "netgrip.poe." + sanitizeUCIKey(sched.Port)
-	if !uciSectionExists("netgrip.poe") {
-		cmd := exec.Command("uci", "import", "netgrip")
-		cmd.Stdin = strings.NewReader("config poe 'poe'\n")
-		_ = cmd.Run()
-	}
+	_ = EnsureNetgripSection("poe", "poe")
 	secName := sanitizeUCIKey(sched.Port)
 	if !uciSectionExists("netgrip.poe." + secName) {
-		cmd := exec.Command("uci", "import", "netgrip")
+		cmd := exec.Command("uci", "-m", "import", "netgrip")
 		cmd.Stdin = strings.NewReader("config poeport '" + secName + "'\n")
 		_ = cmd.Run()
 	}
