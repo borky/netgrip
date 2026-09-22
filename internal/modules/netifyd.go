@@ -13,12 +13,12 @@ import (
 
 // NetifydProbe is the read-only state of the netifyd DPI engine.
 type NetifydProbe struct {
-	Installed bool           `json:"installed"`
-	Enabled   bool           `json:"enabled"`
-	Running   bool           `json:"running"`
-	Applicable bool          `json:"applicable"`
-	LowEnd    bool           `json:"low_end"`
-	Apps      []NetifydApp   `json:"apps"`
+	Installed  bool         `json:"installed"`
+	Enabled    bool         `json:"enabled"`
+	Running    bool         `json:"running"`
+	Applicable bool         `json:"applicable"`
+	LowEnd     bool         `json:"low_end"`
+	Apps       []NetifydApp `json:"apps"`
 }
 
 var (
@@ -61,11 +61,11 @@ func lowEndDevice() bool {
 // ProbeNetifyd returns the current netifyd state and the live app table.
 func ProbeNetifyd() *NetifydProbe {
 	p := &NetifydProbe{
-		Installed:  netifydInstalledFn(),
-		Enabled:    netifydEnabledFn(),
-		Running:    netifydRunningFn(),
-		LowEnd:     lowEndDeviceFn(),
-		Apps:       netifydTable.Apps(),
+		Installed: netifydInstalledFn(),
+		Enabled:   netifydEnabledFn(),
+		Running:   netifydRunningFn(),
+		LowEnd:    lowEndDeviceFn(),
+		Apps:      netifydTable.Apps(),
 	}
 	p.Applicable = p.Installed || !p.LowEnd
 	return p

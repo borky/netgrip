@@ -121,7 +121,9 @@ type poeCycleError struct {
 	err  error
 }
 
-func (e *poeCycleError) Error() string { return "poe " + e.port + ": " + e.err.Error() + " (" + e.out + ")" }
+func (e *poeCycleError) Error() string {
+	return "poe " + e.port + ": " + e.err.Error() + " (" + e.out + ")"
+}
 
 func poeCycle(port string) error {
 	if err := poeSetPort(port, false); err != nil {
