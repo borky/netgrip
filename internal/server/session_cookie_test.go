@@ -56,3 +56,43 @@ func TestLogoutCookieMatchesTheOneItReplaces(t *testing.T) {
 		t.Errorf("Value = %q, want empty", clear.Value)
 	}
 }
+
+// Switching the panel between HTTP and HTTPS used to lock people out, and
+// the password was never the problem: a browser refuses to let an insecure
+// origin overwrite a cookie marked Secure, so the old HTTPS cookie blocked
+// the new one and the session silently never existed. Different names per
+// transport cannot collide.
+func TestSessionCookieNameFollowsTheTransport(t *testing.T) {
+	plain := (&Server{secure: false}).sessionCookieFor("t", 60)
+	tls := (&Server{secure: true}).sessionCookieFor("t", 60)
+
+	if plain.Name == tls.Name {
+		t.Fatalf("both transports use %q; the secure one blocks the other", plain.Name)
+	}
+	if tls.Name != secureSessionCookie {
+		t.Errorf("TLS cookie = %q, want the __Secure- prefixed name", tls.Name)
+	}
+	if !tls.Secure {
+		t.Error("a __Secure- prefixed cookie must carry Secure or the browser drops it")
+	}
+	if plain.Secure {
+		t.Error("the plaintext cookie must not claim Secure; it would never be sent")
+	}
+}
+
+// A session issued before a restart in the same scheme must still be read,
+// and the other name is accepted as a fallback so the change of scheme does
+// not invalidate a session that is otherwise fine.
+func TestSessionCookieIsReadUnderEitherName(t *testing.T) {
+	for _, secure := range []bool{false, true} {
+		s := &Server{secure: secure}
+		for _, name := range []string{sessionCookie, secureSessionCookie} {
+			r, _ := http.NewRequest("GET", "/", nil)
+			r.AddCookie(&http.Cookie{Name: name, Value: "token"})
+			c, err := s.sessionCookie(r)
+			if err != nil || c.Value != "token" {
+				t.Errorf("secure=%v, cookie %q: got %v, %v", secure, name, c, err)
+			}
+		}
+	}
+}
