@@ -86,7 +86,7 @@ const state = {
   portTemplates: [...D.demoPortTemplates],
   hasCert: true,
   panelHttps: false,
-  panelCert: "panel" as "panel" | "router",
+  panelCert: "panel" as "panel" | "router" | "custom",
   history: D.buildDemoHistory(),
   netifyd: { ...D.demoNetifyd },
 };
@@ -723,7 +723,7 @@ export const demoApi: typeof api = {
     serving_cert: state.panelHttps ? "/etc/netgrip/ssl/cert.pem" : "",
     serving_source: state.panelHttps ? state.panelCert : "",
   }),
-  setPanelHttps: async (enabled: boolean, cert?: "panel" | "router") => {
+  setPanelHttps: async (enabled: boolean, cert?: "panel" | "router" | "custom") => {
     await wait(800, 1500);
     if (cert) state.panelCert = cert;
     if (enabled && state.panelCert === "panel") state.hasCert = true;

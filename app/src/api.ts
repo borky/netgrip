@@ -559,10 +559,10 @@ const realApi = {
   httpsState: () =>
     request<{
       has_cert: boolean; enabled: boolean; serving: boolean;
-      cert: "panel" | "router"; router_cert: boolean;
+      cert: "panel" | "router" | "custom"; router_cert: boolean;
       serving_cert: string; serving_source: "" | "panel" | "router" | "custom";
     }>("/api/https"),
-  setPanelHttps: (enabled: boolean, cert?: "panel" | "router") =>
+  setPanelHttps: (enabled: boolean, cert?: "panel" | "router" | "custom") =>
     request<{ status: string; https: boolean; restarting: boolean }>("/api/https", {
       method: "POST",
       body: JSON.stringify({ enabled, cert }),

@@ -1,12 +1,17 @@
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Lock, ShieldCheck } from "lucide-react";
-import { api } from "../../api";
+import { api, isDemo } from "../../api";
 import type { AccessProbe } from "../../types";
-import { ActionBanner, Button, Card, Input, SegmentedControl, SkeletonRows, Toggle, useToast } from "../ui";
+import { ActionBanner, Button, Card, ConfirmDialog, Input, SegmentedControl, SkeletonRows, Toggle, useToast } from "../ui";
 import { useActionCycle } from "../wifi/action";
 
-// durationToMin convierte un time.Duration de Go ("12h0m0s") a minutos.
+/** Which certificate the panel serves. "custom" is a pair somebody
+ *  configured by hand; it is offered so that saving anything else in the card
+ *  does not quietly rewrite the paths and throw that choice away. */
+type CertSource = "panel" | "router" | "custom";
+
+// durationToMin turns a Go time.Duration ("12h0m0s") into minutes.
 function durationToMin(d: string): number {
   if (!d) return 720;
   let total = 0;
@@ -21,10 +26,10 @@ function durationToMin(d: string): number {
   return Math.round(total) || 720;
 }
 
-/** Tres servicios distintos viven en esta tarjeta: el panel, LuCI y SSH.
- *  Cada uno guarda por su cuenta a propósito - con un botón común, apagar
- *  "forzar HTTPS" de LuCI reaplicaba también SSH y podía fallar con un error
- *  sobre dropbear, que no era lo que nadie había tocado. */
+/** Three separate services live in this card: the panel, LuCI and SSH.
+ *  Each one saves on its own deliberately - with a single button, turning
+ *  LuCI's "force HTTPS" off reapplied SSH as well and could fail with an
+ *  error about dropbear, which is not what anybody had touched. */
 export function AccessCard({ index = 2 }: { index?: number }) {
   const { t } = useTranslation();
   const { push } = useToast();
@@ -37,16 +42,17 @@ export function AccessCard({ index = 2 }: { index?: number }) {
   const [ttlMin, setTtlMin] = useState(720);
   const [hasCert, setHasCert] = useState(false);
   const [hasRouterCert, setHasRouterCert] = useState(false);
-  // Lo que se está sirviendo ahora mismo, que no tiene por qué ser lo
-  // configurado: si el par configurado falta, el panel sirve otro y lo dice.
+  // What is being served right now, which need not be what is configured:
+  // if the configured pair is missing the panel serves another and says so.
   const [servingTls, setServingTls] = useState(false);
   const [serving, setServing] = useState<"" | "panel" | "router" | "custom">("");
-  // Lo aplicado, para saber al guardar si algo cambió de verdad: sólo
-  // entonces hay que reiniciar el panel y llevarse el navegador con él.
+  // What is already applied, so Save can tell whether anything really
+  // changed: only then is a restart needed, taking the browser with it.
   const [appliedHttps, setAppliedHttps] = useState(false);
-  const [appliedCert, setAppliedCert] = useState<"panel" | "router">("panel");
+  const [appliedCert, setAppliedCert] = useState<CertSource>("panel");
   const [panelHttps, setPanelHttps] = useState(false);
-  const [panelCert, setPanelCert] = useState<"panel" | "router">("panel");
+  const [panelCert, setPanelCert] = useState<CertSource>("panel");
+  const [confirmScheme, setConfirmScheme] = useState(false);
 
   const panel = useActionCycle();
   const luci = useActionCycle();
@@ -75,25 +81,51 @@ export function AccessCard({ index = 2 }: { index?: number }) {
   };
   useEffect(reload, []);
 
-  // Todo lo del panel se aplica aquí, al guardar. El interruptor de HTTPS
-  // se aplicaba solo al pulsarlo, que es justo lo que un botón Guardar dice
-  // que no va a pasar.
-  const savePanel = () =>
+  const schemeTarget = (https: boolean) =>
+    `${https ? "https" : "http"}://${window.location.host}${window.location.pathname}`;
+
+  // Anything that restarts the panel is asked about first rather than done
+  // underneath the person who pressed Save. A certificate change counts: it
+  // restarts too, and it often lands the browser on an interstitial for a
+  // certificate it has never been shown.
+  const savePanel = () => {
+    if (panelHttps !== appliedHttps || (panelHttps && panelCert !== appliedCert)) {
+      setConfirmScheme(true);
+      return;
+    }
+    applyPanel();
+  };
+
+  // Everything in the panel section is applied here, on Save. The HTTPS
+  // switch used to apply on the toggle itself, which is exactly what a Save
+  // button says will not happen.
+  const applyPanel = () =>
     panel.run(async () => {
       await api.setPanelSessionTtl(ttlMin);
       const schemeChanged = panelHttps !== appliedHttps;
       const certChanged = panelHttps && panelCert !== appliedCert;
       if (!schemeChanged && !certChanged) return { status: "applied" as const };
 
-      await api.setPanelHttps(panelHttps, panelCert);
+      const res = await api.setPanelHttps(panelHttps, panelCert);
       setAppliedHttps(panelHttps);
       setAppliedCert(panelCert);
-      // Cambiar certificado sin cambiar de esquema también reinicia, pero
-      // la URL no se mueve: basta con esperar a que vuelva.
+      // The server decides whether a restart is owed; it answers
+      // "unchanged" when the running state already matches. Waiting for a
+      // restart that was never scheduled would time out and report a
+      // failure that did not happen.
+      if (!res.restarting) return { status: "applied" as const };
+      // Changing the certificate without changing the scheme restarts too,
+      // but the URL does not move: waiting for it to come back is enough.
       push({ tone: "ok", text: t("access.panelHttpsRestarting") });
-      await waitForRestart();
-      const target = `${panelHttps ? "https" : "http"}://${window.location.host}${window.location.pathname}`;
-      window.setTimeout(() => { window.location.href = target; }, 800);
+      const target = schemeTarget(panelHttps);
+      if (!(await waitForRestart())) {
+        // The restart never happened, so the old scheme is still the live
+        // one. Following the new URL here would land on a port that is not
+        // speaking it; say so and leave the tab where it works.
+        push({ tone: "danger", text: t("access.panelHttpsNoRestart", { url: target }) });
+        return { status: "applied" as const };
+      }
+      window.location.href = target;
       return { status: "applied" as const };
     }).then(() => reload());
 
@@ -107,29 +139,56 @@ export function AccessCard({ index = 2 }: { index?: number }) {
       if (res?.status === "applied") reload();
     });
 
-  // Cambiar el esquema del propio panel obliga a reiniciarlo, así que la
-  // pestaña que lo pidió se queda en una URL que ya no responde. Se avisa
-  // antes y se lleva al usuario a la nueva, en vez de dejarlo mirando un
-  // error de conexión.
-  // El panel que responde es el que se va a reiniciar, así que no se puede
-  // preguntar al nuevo si ya está: en el esquema viejo deja de responder y
-  // en el nuevo la petición es de otro origen. Lo que sí se ve desde aquí es
-  // que el viejo se cae; después de eso, procd lo ha relevado.
-  const waitForRestart = async () => {
+  // Changing the panel's own scheme means restarting it, so the tab that
+  // asked is left on a URL that no longer answers.
+  //
+  // What can be observed from here is only that the OLD process goes away.
+  // The new one cannot be asked whether it is up: on the old scheme it no
+  // longer answers, and on the new one the request is cross-origin and, with
+  // a self-signed certificate the browser has not been shown yet, fails for
+  // a reason indistinguishable from "not up". So the old listener dying is
+  // the signal, and it is the one that matters - if it never dies the
+  // restart did not happen and following the new URL would land on a port
+  // still speaking the old scheme.
+  //
+  // Returns whether the restart was actually observed. A fixed timer used to
+  // stand in for this and fired early, so the browser asked for HTTP from a
+  // listener that was still TLS: "Client sent an HTTP request to an HTTPS
+  // server".
+  const waitForRestart = async (): Promise<boolean> => {
+    if (isDemo()) return true; // no process to wait for, and no /api/me either
     const deadline = Date.now() + 15000;
-    // Primero: que se caiga. Un temporizador fijo llegaba pronto y el
-    // navegador pedía HTTP a un listener que aún era TLS, que responde
-    // "Client sent an HTTP request to an HTTPS server".
     while (Date.now() < deadline) {
       try {
         await fetch(`/api/me?probe=${Date.now()}`, { cache: "no-store" });
       } catch {
-        return; // dejó de responder: el proceso viejo se fue
+        // Gone. Now give the replacement time to bind before following it:
+        // it has the whole of main() to get through - collectors, monitors,
+        // the certificate - before it listens, and on a router that is
+        // seconds. Navigating on the death signal alone lands on
+        // connection-refused, which is the same error by another route.
+        await new Promise((r) => setTimeout(r, 2500));
+        return true;
       }
       await new Promise((r) => setTimeout(r, 300));
     }
+    return false;
   };
 
+
+  // The router's option appears only when that pair can be served: offering
+  // one that saving would refuse is a promise the card cannot keep. The
+  // current value is always among the options, or the control renders with
+  // nothing selected and the card stops saying what is in use.
+  const certOptions = [
+    { value: "panel" as const, label: t("access.certOwn") },
+    ...(hasRouterCert || panelCert === "router"
+      ? [{ value: "router" as const, label: t("access.certRouter") }]
+      : []),
+    ...(panelCert === "custom" || appliedCert === "custom"
+      ? [{ value: "custom" as const, label: t("access.certCustomOption") }]
+      : []),
+  ];
 
   const numPort = (value: number, onChange: (v: number) => void, ariaLabel: string) => (
     <Input
@@ -155,6 +214,14 @@ export function AccessCard({ index = 2 }: { index?: number }) {
 
   return (
     <Card index={index} title={t("access.title")} icon={Lock}>
+      <ConfirmDialog
+        open={confirmScheme}
+        onClose={() => setConfirmScheme(false)}
+        onConfirm={() => { setConfirmScheme(false); applyPanel(); }}
+        title={t("access.panelSection")}
+        consequence={t("access.panelHttpsConfirm", { url: schemeTarget(panelHttps) })}
+        confirmLabel={t("access.save")}
+      />
       {!probe ? (
         <SkeletonRows rows={3} />
       ) : (
@@ -189,21 +256,15 @@ export function AccessCard({ index = 2 }: { index?: number }) {
                       ariaLabel={t("access.certSource")}
                       value={panelCert}
                       onChange={(v) => setPanelCert(v)}
-                      options={
-                        // La opción del router sólo aparece si ese par está:
-                        // ofrecer algo que no se puede servir sería una
-                        // promesa que el guardado rompe.
-                        hasRouterCert
-                          ? [
-                              { value: "panel" as const, label: t("access.certOwn") },
-                              { value: "router" as const, label: t("access.certRouter") },
-                            ]
-                          : [{ value: "panel" as const, label: t("access.certOwn") }]
-                      }
+                      options={certOptions}
                     />
                   </div>
                   <p className="text-caption text-muted">
-                    {panelCert === "router" ? t("access.certRouterHint") : t("access.certOwnHint")}
+                    {panelCert === "router"
+                      ? t("access.certRouterHint")
+                      : panelCert === "custom"
+                        ? t("access.certCustomHint")
+                        : t("access.certOwnHint")}
                   </p>
                 </div>
               )}
