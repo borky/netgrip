@@ -80,6 +80,25 @@ export function AccessCard({ index = 2 }: { index?: number }) {
   // pestaña que lo pidió se queda en una URL que ya no responde. Se avisa
   // antes y se lleva al usuario a la nueva, en vez de dejarlo mirando un
   // error de conexión.
+  // El panel que responde es el que se va a reiniciar, así que no se puede
+  // preguntar al nuevo si ya está: en el esquema viejo deja de responder y
+  // en el nuevo la petición es de otro origen. Lo que sí se ve desde aquí es
+  // que el viejo se cae; después de eso, procd lo ha relevado.
+  const waitForRestart = async () => {
+    const deadline = Date.now() + 15000;
+    // Primero: que se caiga. Un temporizador fijo llegaba pronto y el
+    // navegador pedía HTTP a un listener que aún era TLS, que responde
+    // "Client sent an HTTP request to an HTTPS server".
+    while (Date.now() < deadline) {
+      try {
+        await fetch(`/api/me?probe=${Date.now()}`, { cache: "no-store" });
+      } catch {
+        return; // dejó de responder: el proceso viejo se fue
+      }
+      await new Promise((r) => setTimeout(r, 300));
+    }
+  };
+
   const togglePanelHttps = async (next: boolean) => {
     const target = `${next ? "https" : "http"}://${window.location.host}${window.location.pathname}`;
     if (!window.confirm(t("access.panelHttpsConfirm", { url: target }))) return;
@@ -88,7 +107,9 @@ export function AccessCard({ index = 2 }: { index?: number }) {
       await api.setPanelHttps(next);
       setPanelHttps(next);
       push({ tone: "ok", text: t("access.panelHttpsRestarting") });
-      window.setTimeout(() => { window.location.href = target; }, 3000);
+      await waitForRestart();
+      // Un respiro para que el listener nuevo acepte: el viejo ya no está.
+      window.setTimeout(() => { window.location.href = target; }, 800);
     } catch (err) {
       push({ tone: "danger", text: err instanceof Error ? err.message : String(err) });
       setHttpsBusy(false);
