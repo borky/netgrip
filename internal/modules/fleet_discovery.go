@@ -93,12 +93,11 @@ func FleetDiscoveryEnabled() bool {
 // SetFleetDiscoveryEnabled persiste el estado de discovery en UCI. El cambio
 // requiere reiniciar el servicio netgrip para que el listener arranque o pare.
 func SetFleetDiscoveryEnabled(enabled bool) error {
-	if !uciSectionExists("netgrip.main") {
-		cmd := exec.Command("uci", "import", "netgrip")
-		cmd.Stdin = strings.NewReader("config netgrip 'main'\n")
-		if out, err := cmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("init netgrip config: %s", strings.TrimSpace(string(out)))
-		}
+	// A bare `uci import` REPLACES the package, so this took the panel's
+	// own settings with it; it also declared the section as type "netgrip"
+	// while every other writer uses "panel".
+	if err := EnsureNetgripSection("main", "panel"); err != nil {
+		return err
 	}
 	val := "1"
 	if !enabled {

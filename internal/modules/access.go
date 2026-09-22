@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -91,19 +94,9 @@ func SetPanelSessionTTL(minutes int) error {
 	if minutes <= 0 {
 		return fmt.Errorf("session timeout must be > 0 minutes")
 	}
-	var ops []executor.Op
-	// The netgrip UCI package may not exist yet (the panel never wrote the
-	// section). `uci set netgrip.main=panel` creates it as a NAMED section,
-	// so `uci set netgrip.main.<opt>=<val>` resolves; a bare `config main`
-	// would be an anonymous @main[0], which `uci set` cannot address by
-	// name. It used to be done with `uci import`, which replaces the whole
-	// package: a document holding only this section took netgrip.wizard and
-	// netgrip.selfupdate with it.
-	if !uciSectionExists("netgrip.main") {
-		ops = append(ops, executor.Op{Kind: "uci_set", Args: []string{"netgrip.main", "panel"}})
-	}
-	ops = append(ops, executor.Op{Kind: "uci_set", Args: []string{panelSessionTTLMinutePath, strconv.Itoa(minutes)}})
-	return applyNetgripConfig(ops)
+	return applyNetgripConfig([]executor.Op{
+		{Kind: "uci_set", Args: []string{panelSessionTTLMinutePath, strconv.Itoa(minutes)}},
+	})
 }
 
 func probeLuciAccess() LuciAccess {
@@ -535,14 +528,6 @@ func EnableHTTPS(source string) error {
 			executor.Op{Kind: "uci_set", Args: []string{"netgrip.main.https_key", keyFile}},
 		)
 	}
-	// Create the section through the executor rather than with `uci
-	// import`, which REPLACES the whole package: importing a document
-	// holding only the panel section would take netgrip.wizard and
-	// netgrip.selfupdate with it, and the snapshot below cannot undo what
-	// happened before it was taken.
-	if !uciSectionExists("netgrip.main") {
-		ops = append([]executor.Op{{Kind: "uci_set", Args: []string{"netgrip.main", "panel"}}}, ops...)
-	}
 	return applyNetgripConfig(ops)
 }
 
@@ -586,14 +571,65 @@ func resolveSource(source string) (certFile, keyFile string, err error) {
 // one is worth more than nothing to whoever has to work out what happened.
 func regenerateSelfSigned() error {
 	stamp := time.Now().Format("20060102-150405")
+	var moved []string
 	for _, p := range []string{certPath, keyPath} {
-		if fileReadable(p) {
-			if err := os.Rename(p, p+".replaced-"+stamp); err != nil {
-				return fmt.Errorf("move the old certificate aside: %w", err)
+		if !fileReadable(p) {
+			continue
+		}
+		aside := p + replacedSuffix + stamp
+		if err := os.Rename(p, aside); err != nil {
+			// Put back whatever was already moved. Half a pair kept aside
+			// is worse than none: the leftover half looks like a usable
+			// backup and is not.
+			for _, done := range moved {
+				_ = os.Rename(done+replacedSuffix+stamp, done)
+			}
+			return fmt.Errorf("move the old certificate aside: %w", err)
+		}
+		moved = append(moved, p)
+	}
+	if err := GenerateSelfSignedCert(); err != nil {
+		return err
+	}
+	pruneReplaced()
+	return nil
+}
+
+// replacedSuffix marks a pair kept aside by a regeneration.
+const replacedSuffix = ".replaced-"
+
+// pruneReplaced keeps only the most recent set aside. Flash on these boards
+// is measured in tens of megabytes, and without this every regeneration
+// leaves another certificate and private key behind for good, with only SSH
+// to clear them.
+func pruneReplaced() {
+	entries, err := os.ReadDir(sslDir)
+	if err != nil {
+		return
+	}
+	var stamps []string
+	seen := map[string]bool{}
+	for _, e := range entries {
+		i := strings.LastIndex(e.Name(), replacedSuffix)
+		if i < 0 {
+			continue
+		}
+		if stamp := e.Name()[i+len(replacedSuffix):]; !seen[stamp] {
+			seen[stamp] = true
+			stamps = append(stamps, stamp)
+		}
+	}
+	if len(stamps) <= 1 {
+		return
+	}
+	sort.Strings(stamps) // the stamp sorts chronologically by construction
+	for _, old := range stamps[:len(stamps)-1] {
+		for _, e := range entries {
+			if strings.HasSuffix(e.Name(), replacedSuffix+old) {
+				_ = os.Remove(filepath.Join(sslDir, e.Name()))
 			}
 		}
 	}
-	return GenerateSelfSignedCert()
 }
 
 // RestoreHTTPSConfig puts back an earlier TLS configuration verbatim, paths
@@ -631,6 +667,44 @@ func boolOption(v bool) string {
 	return "0"
 }
 
+// ensureNetgripPackage makes sure /etc/config/netgrip and its panel section
+// exist, because everything below assumes they do.
+//
+// `uci set` cannot create a missing package, and `uci export` - which the
+// snapshot uses - cannot read one either, so on a router that has never
+// written this file every panel save failed before it began. Only `uci
+// import` creates it. Verified on a router: both return "Entry not found".
+//
+// The -m is the whole point, and it is a GLOBAL option that goes before the
+// subcommand: `uci -m import`, not `uci import -m`, which is a usage error.
+// Without it, import REPLACES the package, so a document holding only the
+// panel section would take netgrip.wizard and netgrip.selfupdate with it.
+//
+// The section is named rather than anonymous so that `uci set
+// netgrip.main.<option>` resolves; a bare `config panel` would be @panel[0],
+// which cannot be addressed by name.
+func ensureNetgripPackage() error {
+	return EnsureNetgripSection("main", "panel")
+}
+
+// EnsureNetgripSection creates one named section of the netgrip package,
+// and the package itself if it is not there. It is a no-op when the section
+// already exists.
+func EnsureNetgripSection(name, sectionType string) error {
+	if uciSectionExists("netgrip." + name) {
+		return nil
+	}
+	cmd := exec.Command("uci", "-m", "import", "netgrip")
+	cmd.Stdin = strings.NewReader(fmt.Sprintf("config %s '%s'\n", sectionType, name))
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("init netgrip.%s: %s", name, strings.TrimSpace(string(out)))
+	}
+	if out, err := exec.Command("uci", "commit", "netgrip").CombinedOutput(); err != nil {
+		return fmt.Errorf("commit netgrip.%s: %s", name, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
 // applyNetgripConfig writes and commits a set of netgrip options, restoring
 // the file if any of them fails.
 //
@@ -640,6 +714,9 @@ func boolOption(v bool) string {
 // session-timeout save, for instance - would pick them up and apply a change
 // nobody had asked for.
 func applyNetgripConfig(ops []executor.Op) error {
+	if err := ensureNetgripPackage(); err != nil {
+		return err
+	}
 	snap, err := executor.Snapshot("netgrip")
 	if err != nil {
 		return fmt.Errorf("snapshot netgrip: %w", err)

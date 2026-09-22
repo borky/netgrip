@@ -98,13 +98,9 @@ func SavePortTemplate(tpl PortTemplateSave) error {
 		return fmt.Errorf("name required")
 	}
 	secName := sanitizeUCIKey(tpl.Name)
-	if !uciSectionExists("netgrip.port_templates") {
-		cmd := exec.Command("uci", "import", "netgrip")
-		cmd.Stdin = strings.NewReader("config port_templates 'port_templates'\n")
-		_ = cmd.Run()
-	}
+	_ = EnsureNetgripSection("port_templates", "port_templates")
 	if !uciSectionExists("netgrip." + secName) {
-		cmd := exec.Command("uci", "import", "netgrip")
+		cmd := exec.Command("uci", "-m", "import", "netgrip")
 		cmd.Stdin = strings.NewReader("config port_template '" + secName + "'\n")
 		_ = cmd.Run()
 	}
