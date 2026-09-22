@@ -38,18 +38,18 @@ type NetifydTimelineResponse struct {
 
 // NetifydTimelineBucket is one time slot with per-app counters.
 type NetifydTimelineBucket struct {
-	Time string                    `json:"time"`
+	Time string                   `json:"time"`
 	Apps map[string]NetifydBucket `json:"apps"`
 }
 
 // NetifydApp is one aggregated application entry from netifyd flow data.
 type NetifydApp struct {
-	Name        string `json:"name"`
-	Bytes       int64  `json:"bytes"`
-	LocalBytes  int64  `json:"local_bytes"`
-	OtherBytes  int64  `json:"other_bytes"`
-	Packets     int64  `json:"packets"`
-	Flows       int    `json:"flows"`
+	Name       string `json:"name"`
+	Bytes      int64  `json:"bytes"`
+	LocalBytes int64  `json:"local_bytes"`
+	OtherBytes int64  `json:"other_bytes"`
+	Packets    int64  `json:"packets"`
+	Flows      int    `json:"flows"`
 }
 
 // netifydFlow keeps the latest application name seen for a digest.
@@ -372,7 +372,7 @@ func (c *netifydSocketClient) readLoop(ctx context.Context) error {
 		}
 
 		// Each message is preceded by a {"length": N} framing line.
-		 framing, err := reader.ReadString('\n')
+		framing, err := reader.ReadString('\n')
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
