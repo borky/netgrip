@@ -23,21 +23,21 @@ start_service() {
 	# has none of the features below. Override per device with
 	# `uci set netgrip.main.update_repo=...`.
 	[ -n "$update_repo" ] || update_repo=borky/netgrip
-	# HTTPS. Apagado salvo que se pida: un upgrade no debe cambiarle a nadie
-	# la URL del panel. Con netgrip.main.https='1' sirve TLS en el mismo
-	# puerto con el par de uhttpd, el mismo que ya sirve LuCI, de modo que el
-	# navegador no tiene que aceptar un certificado nuevo distinto del que ya
-	# aceptó. tls_cert/tls_key apuntan a otro par si se tiene uno propio.
-	local https tls_cert tls_key tls_args
+	# HTTPS para el propio panel. Apagado salvo que se pida: un upgrade no
+	# debe cambiarle a nadie la URL. netgrip.main.https y el par
+	# https_cert/https_key son los que ya escribe Ajustes al generar un
+	# certificado; sin ellos el binario usa el par del panel si existe y si
+	# no el de uhttpd, el mismo que sirve LuCI.
+	local https https_cert https_key tls_args
 	https=$(uci -q get netgrip.main.https 2>/dev/null)
-	tls_cert=$(uci -q get netgrip.main.tls_cert 2>/dev/null)
-	tls_key=$(uci -q get netgrip.main.tls_key 2>/dev/null)
+	https_cert=$(uci -q get netgrip.main.https_cert 2>/dev/null)
+	https_key=$(uci -q get netgrip.main.https_key 2>/dev/null)
 	tls_args=""
 	case "$https" in
 		1|on|true|yes)
-			tls_args="-tls"
-			[ -n "$tls_cert" ] && tls_args="$tls_args -tls-cert $tls_cert"
-			[ -n "$tls_key" ] && tls_args="$tls_args -tls-key $tls_key"
+			tls_args="-https"
+			[ -n "$https_cert" ] && tls_args="$tls_args -https-cert $https_cert"
+			[ -n "$https_key" ] && tls_args="$tls_args -https-key $https_key"
 			;;
 	esac
 	procd_open_instance

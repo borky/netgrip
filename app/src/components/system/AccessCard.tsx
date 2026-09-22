@@ -21,6 +21,10 @@ function durationToMin(d: string): number {
   return Math.round(total) || 720;
 }
 
+/** Tres servicios distintos viven en esta tarjeta: el panel, LuCI y SSH.
+ *  Cada uno guarda por su cuenta a propósito - con un botón común, apagar
+ *  "forzar HTTPS" de LuCI reaplicaba también SSH y podía fallar con un error
+ *  sobre dropbear, que no era lo que nadie había tocado. */
 export function AccessCard({ index = 2 }: { index?: number }) {
   const { t } = useTranslation();
   const { push } = useToast();
@@ -32,10 +36,14 @@ export function AccessCard({ index = 2 }: { index?: number }) {
   const [sshPort, setSshPort] = useState("22");
   const [ttlMin, setTtlMin] = useState(720);
   const [hasCert, setHasCert] = useState(false);
-  const [certBusy, setCertBusy] = useState(false);
-  const { phase, detail, busy, run, clear } = useActionCycle();
+  const [panelHttps, setPanelHttps] = useState(false);
+  const [httpsBusy, setHttpsBusy] = useState(false);
 
-  useEffect(() => {
+  const panel = useActionCycle();
+  const luci = useActionCycle();
+  const ssh = useActionCycle();
+
+  const reload = () => {
     api.access().then((p) => {
       setProbe(p);
       setLuciHttp(p.luci.http_port);
@@ -45,33 +53,45 @@ export function AccessCard({ index = 2 }: { index?: number }) {
       setSshPort(p.ssh.port || "22");
       setTtlMin(durationToMin(p.panel.session_ttl));
     }).catch(() => {});
-    api.httpsState().then((s) => setHasCert(s.has_cert)).catch(() => {});
-  }, []);
-
-  const saveAll = () => {
-    run(async () => {
-      await api.setPanelSessionTtl(ttlMin);
-      const results = await Promise.all([
-        api.setLuciAccess({ http_port: luciHttp, https_port: luciHttps, force_https: luciForce, enabled: true }),
-        api.setSshAccess({ enabled: sshEnabled, port: sshPort }),
-      ]);
-      const failed = results.find((r) => r.status !== "applied");
-      return failed ?? { status: "applied" as const };
-    }).then((res) => {
-      if (res?.status === "applied") api.access().then(setProbe).catch(() => {});
-    });
+    api.httpsState().then((s) => {
+      setHasCert(s.has_cert);
+      setPanelHttps(s.enabled);
+    }).catch(() => {});
   };
+  useEffect(reload, []);
 
-  const genCert = async () => {
-    setCertBusy(true);
+  const savePanel = () =>
+    panel.run(async () => {
+      await api.setPanelSessionTtl(ttlMin);
+      return { status: "applied" as const };
+    }).then(() => reload());
+
+  const saveLuci = () =>
+    luci.run(() =>
+      api.setLuciAccess({ http_port: luciHttp, https_port: luciHttps, force_https: luciForce, enabled: true }),
+    ).then((res) => { if (res?.status === "applied") reload(); });
+
+  const saveSsh = () =>
+    ssh.run(() => api.setSshAccess({ enabled: sshEnabled, port: sshPort })).then((res) => {
+      if (res?.status === "applied") reload();
+    });
+
+  // Cambiar el esquema del propio panel obliga a reiniciarlo, así que la
+  // pestaña que lo pidió se queda en una URL que ya no responde. Se avisa
+  // antes y se lleva al usuario a la nueva, en vez de dejarlo mirando un
+  // error de conexión.
+  const togglePanelHttps = async (next: boolean) => {
+    const target = `${next ? "https" : "http"}://${window.location.host}${window.location.pathname}`;
+    if (!window.confirm(t("access.panelHttpsConfirm", { url: target }))) return;
+    setHttpsBusy(true);
     try {
-      await api.enableHttps();
-      setHasCert(true);
-      push({ tone: "ok", text: t("access.httpsGenerated") });
+      await api.setPanelHttps(next);
+      setPanelHttps(next);
+      push({ tone: "ok", text: t("access.panelHttpsRestarting") });
+      window.setTimeout(() => { window.location.href = target; }, 3000);
     } catch (err) {
       push({ tone: "danger", text: err instanceof Error ? err.message : String(err) });
-    } finally {
-      setCertBusy(false);
+      setHttpsBusy(false);
     }
   };
 
@@ -83,6 +103,20 @@ export function AccessCard({ index = 2 }: { index?: number }) {
     />
   );
 
+  const section = (title: string, body: React.ReactNode, save: () => void, cycle: ReturnType<typeof useActionCycle>, disabled?: boolean) => (
+    <div className="flex flex-col gap-2 rounded-lg border border-border/60 p-3">
+      <span className="text-small font-semibold uppercase tracking-wide text-muted">{title}</span>
+      {body}
+      <div className="flex items-center gap-3">
+        <Button size="sm" onClick={save} loading={cycle.busy} disabled={disabled}>{t("access.save")}</Button>
+        {cycle.phase && (
+          <ActionBanner phase={cycle.phase} text={cycle.phase === "done" ? t("access.saved") : undefined}
+            detail={cycle.detail} onDone={cycle.clear} />
+        )}
+      </div>
+    </div>
+  );
+
   return (
     <Card index={index} title={t("access.title")} icon={Lock}>
       {!probe ? (
@@ -91,58 +125,67 @@ export function AccessCard({ index = 2 }: { index?: number }) {
         <div className="flex flex-col gap-3">
           <p className="text-caption text-muted">{t("access.disclaimer")}</p>
 
-          <div className="grid gap-x-6 gap-y-1 sm:grid-cols-2">
-            <div className="flex items-center gap-3 py-2 border-b border-border/60">
-              <span className="text-body font-medium flex-1 min-w-0">{t("access.sessionTtl")}</span>
-              <div className="flex items-center gap-1.5 shrink-0">
-                <Input type="number" mono min={1} max={100000} value={ttlMin || ""}
-                  onChange={(e) => setTtlMin(Number(e.target.value))} className="w-20" />
-                <span className="text-small text-muted">{t("access.minutes")}</span>
+          {section(
+            t("access.panelSection"),
+            <div className="flex flex-col gap-1">
+              <div className="flex items-center gap-3 py-1.5">
+                <span className="text-body font-medium flex-1 min-w-0">{t("access.sessionTtl")}</span>
+                <div className="flex items-center gap-1.5 shrink-0">
+                  <Input type="number" mono min={1} max={100000} value={ttlMin || ""}
+                    aria-label={t("access.sessionTtl")}
+                    onChange={(e) => setTtlMin(Number(e.target.value))} className="w-20" />
+                  <span className="text-small text-muted">{t("access.minutes")}</span>
+                </div>
               </div>
-            </div>
-
-            <div className="flex items-center gap-3 py-2 border-b border-border/60">
-              <span className="text-body font-medium flex-1 min-w-0">{t("access.luciPorts")}</span>
-              <div className="flex items-center gap-1.5 shrink-0">
-                {numPort(luciHttp, setLuciHttp, t("access.luciHttp"))}
-                <span className="text-muted text-caption">/</span>
-                {numPort(luciHttps, setLuciHttps, t("access.luciHttps"))}
+              <div className="flex items-center gap-3 py-1.5">
+                <div className="flex-1 min-w-0">
+                  <span className="text-body font-medium">{t("access.panelHttps")}</span>
+                  <p className="text-caption text-muted">{t("access.panelHttpsHint")}</p>
+                </div>
+                <Toggle checked={panelHttps} onChange={togglePanelHttps}
+                  label={t("access.panelHttps")} disabled={httpsBusy} />
               </div>
-            </div>
+              <div className="flex items-center gap-2">
+                <ShieldCheck size={14} className={hasCert ? "text-ok" : "text-faint"} aria-hidden="true" />
+                <span className="text-small flex-1">{hasCert ? t("access.httpsReady") : t("access.httpsNone")}</span>
+              </div>
+            </div>,
+            savePanel, panel, ttlMin <= 0,
+          )}
 
-            <div className="flex items-center justify-between gap-3 py-2 border-b border-border/60">
-              <span className="text-body font-medium">{t("access.forceHttps")}</span>
-              <Toggle checked={luciForce} onChange={setLuciForce} label={t("access.forceHttps")} />
-            </div>
+          {section(
+            t("access.luciSection"),
+            <div className="flex flex-col gap-1">
+              <div className="flex items-center gap-3 py-1.5">
+                <span className="text-body font-medium flex-1 min-w-0">{t("access.luciPorts")}</span>
+                <div className="flex items-center gap-1.5 shrink-0">
+                  {numPort(luciHttp, setLuciHttp, t("access.luciHttp"))}
+                  <span className="text-small text-muted">/</span>
+                  {numPort(luciHttps, setLuciHttps, t("access.luciHttps"))}
+                </div>
+              </div>
+              <div className="flex items-center gap-3 py-1.5">
+                <span className="text-body font-medium flex-1">{t("access.forceHttps")}</span>
+                <Toggle checked={luciForce} onChange={setLuciForce} label={t("access.forceHttps")} />
+              </div>
+            </div>,
+            saveLuci, luci,
+          )}
 
-            <div className="flex items-center justify-between gap-3 py-2 border-b border-border/60">
-              <div className="min-w-0">
+          {section(
+            t("access.sshSection"),
+            <div className="flex items-center gap-3 py-1.5">
+              <div className="flex-1 min-w-0">
                 <span className="text-body font-medium">{t("access.enableSsh")}</span>
                 <p className="text-caption text-muted">{t("access.sshHint")}</p>
               </div>
               <div className="flex items-center gap-1.5 shrink-0">
-                <Input type="number" mono min={1} max={65535} value={sshPort} disabled={!sshEnabled}
+                <Input type="number" mono min={1} max={65535} value={sshPort}
                   aria-label={t("access.sshPort")} onChange={(e) => setSshPort(e.target.value)} className="w-20" />
                 <Toggle checked={sshEnabled} onChange={setSshEnabled} label={t("access.enableSsh")} />
               </div>
-            </div>
-          </div>
-
-          <div className="flex items-center gap-2 pt-1">
-            <ShieldCheck size={14} className={hasCert ? "text-ok" : "text-faint"} aria-hidden="true" />
-            <span className="text-small flex-1">{hasCert ? t("access.httpsReady") : t("access.httpsNone")}</span>
-            {!hasCert && (
-              <Button variant="secondary" size="sm" onClick={genCert} loading={certBusy}>
-                {t("access.httpsGenerate")}
-              </Button>
-            )}
-          </div>
-
-          <div className="flex items-center gap-3">
-            <Button onClick={saveAll} loading={busy} disabled={ttlMin <= 0}>{t("access.save")}</Button>
-          </div>
-          {phase && (
-            <ActionBanner phase={phase} text={phase === "done" ? t("access.saved") : undefined} detail={detail} onDone={clear} />
+            </div>,
+            saveSsh, ssh,
           )}
         </div>
       )}

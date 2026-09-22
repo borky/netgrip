@@ -85,6 +85,7 @@ const state = {
   quota: structuredClone(D.demoQuotas),
   portTemplates: [...D.demoPortTemplates],
   hasCert: true,
+  panelHttps: false,
   history: D.buildDemoHistory(),
   netifyd: { ...D.demoNetifyd },
 };
@@ -715,8 +716,13 @@ export const demoApi: typeof api = {
   },
   remoteAccess: () => get(state.remote),
   setRemoteAccess: async (opts) => { Object.assign(state.remote, opts); return write(state.remote); },
-  httpsState: () => get({ has_cert: state.hasCert }),
-  enableHttps: async () => { await wait(800, 1500); state.hasCert = true; return { status: "ok" }; },
+  httpsState: () => get({ has_cert: state.hasCert, enabled: state.panelHttps, serving: state.panelHttps }),
+  setPanelHttps: async (enabled: boolean) => {
+    await wait(800, 1500);
+    if (enabled) state.hasCert = true;
+    state.panelHttps = enabled;
+    return { status: enabled ? "enabled" : "disabled", https: enabled, restarting: false };
+  },
   setPassword: async () => { await wait(800, 1500); },
   telegramGet: () => get(state.telegram),
   telegramSet: async (botToken, chatId, enabled) => {

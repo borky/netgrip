@@ -399,6 +399,32 @@ func GenerateSelfSignedCert() error {
 	return fmt.Errorf("neither px5g nor openssl found on the router")
 }
 
+// HTTPSCertPaths son las rutas configuradas para el par del panel, vacías si
+// no se han fijado. Quien sirve decide qué hacer con el vacío.
+func HTTPSCertPaths() (string, string) {
+	return uciGet("netgrip.main.https_cert"), uciGet("netgrip.main.https_key")
+}
+
+// DisableHTTPS devuelve el panel a HTTP. No borra el certificado: volver a
+// activarlo no tiene por qué regenerarlo, y un par generado a mano o puesto
+// por el usuario no es nuestro para tirarlo.
+func DisableHTTPS() error {
+	if !uciSectionExists("netgrip.main") {
+		return nil // nunca se activó: nada que apagar
+	}
+	return executor.Apply([]executor.Op{
+		{Kind: "uci_set", Args: []string{"netgrip.main.https", "0"}},
+		{Kind: "uci_commit", Args: []string{"netgrip"}},
+	}, nil)
+}
+
+// HTTPSEnabled dice si el panel está configurado para servir TLS. Es lo que
+// está en la configuración, no cómo se arrancó el proceso: entre cambiarlo y
+// reiniciar, los dos difieren.
+func HTTPSEnabled() bool {
+	return uciGet("netgrip.main.https") == "1"
+}
+
 func EnableHTTPS() error {
 	if !HasSelfSignedCert() {
 		if err := GenerateSelfSignedCert(); err != nil {

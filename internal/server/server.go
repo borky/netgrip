@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"embed"
 	"encoding/json"
+	"fmt"
 	"io"
 	"io/fs"
 	"log"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/gnacho/netgrip/internal/auth"
+	"github.com/gnacho/netgrip/internal/executor"
 	"github.com/gnacho/netgrip/internal/modules"
 	"github.com/gnacho/netgrip/internal/ubus"
 )
@@ -171,7 +173,7 @@ func New(rpcdURL, version string, secure bool) *Server {
 	s.mux.HandleFunc("POST /api/lag", s.requireAuth(s.handleLAGSet))
 	s.mux.HandleFunc("DELETE /api/lag", s.requireAuth(s.handleLAGDelete))
 	s.mux.HandleFunc("GET /api/https", s.requireAuth(s.handleHTTPSGet))
-	s.mux.HandleFunc("POST /api/https", s.requireAuth(s.handleHTTPSEnable))
+	s.mux.HandleFunc("POST /api/https", s.requireAuth(s.handleHTTPSSet))
 	s.mux.HandleFunc("POST /api/wol", s.requireAuth(s.handleWoL))
 	s.mux.HandleFunc("GET /api/cpu", s.requireAuth(s.handleCPUGet))
 	s.mux.HandleFunc("GET /api/nlbwmon", s.requireAuth(s.handleNlbwmonGet))
@@ -2020,15 +2022,70 @@ func (s *Server) handleHistoryGet(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) handleHTTPSGet(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, map[string]any{"has_cert": modules.HasSelfSignedCert()})
+	writeJSON(w, map[string]any{
+		"has_cert": modules.HasSelfSignedCert(),
+		// enabled is what the configuration says; serving is how this
+		// process was started. Between a change and the restart that
+		// applies it the two differ, and the UI has to be able to say so.
+		"enabled": modules.HTTPSEnabled(),
+		"serving": s.secure,
+	})
 }
 
-func (s *Server) handleHTTPSEnable(w http.ResponseWriter, _ *http.Request) {
+type httpsRequest struct {
+	Enabled *bool `json:"enabled"`
+}
+
+// handleHTTPSSet turns the panel's own TLS on or off. It takes effect on the
+// restart it schedules: the listener cannot change scheme underneath the
+// request that asked for it.
+func (s *Server) handleHTTPSSet(w http.ResponseWriter, r *http.Request) {
+	var req httpsRequest
+	// An empty body means enable, which is what POST /api/https did before
+	// it could also turn TLS off.
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	enable := req.Enabled == nil || *req.Enabled
+
+	if !enable {
+		if err := modules.DisableHTTPS(); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		s.respondHTTPSChange(w, false)
+		return
+	}
+
 	if err := modules.EnableHTTPS(); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, map[string]string{"status": "enabled"})
+	// Refuse to restart into a configuration that cannot serve. Without
+	// this, a pair that does not load takes the panel down on restart and
+	// the only way back is the command line - from a button whose whole
+	// point is not needing one.
+	certFile, keyFile := ResolveCertPaths(modules.HTTPSCertPaths())
+	if _, err := NewCertReloader(certFile, keyFile); err != nil {
+		_ = modules.DisableHTTPS()
+		writeError(w, http.StatusInternalServerError,
+			fmt.Sprintf("certificate at %s is not usable, left on HTTP: %v", certFile, err))
+		return
+	}
+	s.respondHTTPSChange(w, true)
+}
+
+// respondHTTPSChange answers, then restarts the panel so the new scheme
+// takes effect. The sleep is what lets the answer reach the browser: the
+// process serving it is the one going away.
+func (s *Server) respondHTTPSChange(w http.ResponseWriter, https bool) {
+	status := "disabled"
+	if https {
+		status = "enabled"
+	}
+	writeJSON(w, map[string]any{"status": status, "https": https, "restarting": true})
+	go func() {
+		time.Sleep(700 * time.Millisecond)
+		_ = executor.Run(executor.Op{Kind: "initd", Args: []string{"netgrip", "restart"}})
+	}()
 }
 
 type wolRequest struct {
