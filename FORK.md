@@ -79,13 +79,43 @@ host names, credentials, personal identifiers. A match blocks the commit and
 names the pattern that fired.
 
 Hooks are not versioned, so **a fresh clone has no protection until they are
-reinstalled**. Copy `no-identifying-data.py`, `pre-commit` and `commit-msg`
-into the new clone's `.git/hooks/` and mark them executable. The pattern file
+reinstalled**. Copy `no-identifying-data.py`, `no-ai-trailers.py`,
+`pre-commit` and `commit-msg` into the new clone's `.git/hooks/` and mark them
+executable. The pattern file
 stays outside every repository on purpose: a list of what you want hidden is
 itself a description of your network.
 
 A missing pattern file warns instead of blocking, so a clone on another
 machine can still commit. `git commit --no-verify` overrides once, deliberately.
+
+## The AI-trailer hook
+
+`.git/hooks/no-ai-trailers.py`, also run from `commit-msg`, refuses a message
+carrying `Co-Authored-By` for an AI tool, a `generated with` footer or the
+robot emoji. Upstream asked for this on PR #387: *"This repo keeps AI tooling
+out of the recorded history."*
+
+It is a hook rather than a note to self because the cost of forgetting is not
+a tidy-up. Upstream force-pushed `main` to strip such trailers from an
+already-merged branch: the content was byte-identical, verified by tree hash,
+but every commit hash from the multiWAN merge onward changed, which silently
+broke every open PR based on the old history — GitHub fell back to a merge
+base 200 commits earlier and showed 342 changed files instead of 27. Three
+branches had to be rebased with `git rebase --onto upstream/main <old-base>`
+and force-pushed.
+
+Unlike the identifying-data check it needs no pattern file, so it works in a
+fresh clone as soon as the hooks are copied in. A human co-author is still
+allowed; only values naming a tool or an assistant's service address match.
+
+**It cannot catch every path.** `git rebase` and `git filter-branch` do not run
+`commit-msg`, so a trailer can still arrive through a replay of older commits.
+To clean a branch:
+
+```sh
+FILTER_BRANCH_SQUELCH_WARNING=1 git filter-branch -f \
+  --msg-filter 'sed "/^Co-Authored-By: Claude/d"' upstream/main..HEAD
+```
 
 ## Building
 
