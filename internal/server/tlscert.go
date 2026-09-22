@@ -1,71 +1,82 @@
-// tlscert.go — el par certificado/clave con el que el panel sirve HTTPS,
-// releído del disco cuando cambia.
+// tlscert.go — the certificate/key pair the panel serves HTTPS with, re-read
+// from disk when it changes.
 //
-// El par por defecto es el de uhttpd, que ya está en el router: así el panel
-// hereda la misma decisión de confianza que LuCI en vez de pedir una segunda.
-// Ese par lo regenera px5g cuando caduca, de modo que cargarlo una sola vez
-// al arrancar dejaría al panel sirviendo un certificado caducado hasta el
-// siguiente reinicio - que en un router puede ser meses.
+// The default pair is uhttpd's, already on the router: the panel inherits the
+// same trust decision as LuCI instead of asking for a second one. px5g
+// regenerates that pair when it expires, so loading it once at startup would
+// leave the panel serving an expired certificate until the next restart -
+// which on a router can be months.
 package server
 
 import (
-	"bytes"
-	"crypto"
 	"crypto/tls"
-	"crypto/x509"
-	"errors"
-	"fmt"
+	"log"
 	"os"
 	"sync"
 	"time"
+
+	"github.com/gnacho/netgrip/internal/certs"
+	"github.com/gnacho/netgrip/internal/modules"
 )
 
-// Variables y no constantes para que los tests puedan apuntarlas a un
-// directorio temporal; en ejecución nadie las cambia.
+// Both pairs come from the modules package, which is what writes and manages
+// them: a second copy of the paths here would report "a configured
+// certificate" for the panel's own the first time either moved.
+//
+// Variables so tests can pin them without a uci binary or a real /etc.
 var (
-	// PanelCertPath y PanelKeyPath: el par que genera el propio panel desde
-	// Ajustes (GenerateSelfSignedCert). Si está, es el que quiso el usuario.
-	PanelCertPath = "/etc/netgrip/ssl/cert.pem"
-	PanelKeyPath  = "/etc/netgrip/ssl/key.pem"
+	// panelPair is the pair the panel generates for itself from Settings
+	// (GenerateSelfSignedCert). If it is there, it is the one the user
+	// asked for.
+	panelPair = modules.PanelCertPaths
 
-	// DefaultCertPath y DefaultKeyPath: el par de uhttpd, el reserva. Son
-	// los que sirve LuCI, así que el navegador que ya aceptó ese
-	// certificado no ve nada nuevo más allá del origen distinto.
-	DefaultCertPath = "/etc/uhttpd.crt"
-	DefaultKeyPath  = "/etc/uhttpd.key"
+	// routerPair is uhttpd's pair, the fallback: the one LuCI serves, so a
+	// browser that already accepted that certificate sees nothing new beyond
+	// the different origin. Read from uhttpd's own configuration rather than
+	// assumed, because the conventional paths are only a default - a build
+	// that moves them would otherwise hide the option entirely.
+	routerPair = modules.RouterCertPaths
 )
 
 const (
 
-	// retryAfterFailure: tras una recarga fallida (el par a medio escribir
-	// mientras px5g lo regenera) no se vuelve a tocar el disco hasta pasado
-	// este tiempo, para no golpear el filesystem en cada handshake.
+	// retryAfterFailure: after a failed reload (the pair half-written while
+	// px5g regenerates it) the disk is left alone for this long, so a broken
+	// pair does not mean a stat and a read on every handshake.
 	retryAfterFailure = 30 * time.Second
+
+	// statInterval: the longest a rotated pair goes unnoticed. Without it
+	// every handshake stats two files, which serialises handshakes behind
+	// the mutex for no benefit - px5g rotates a certificate every couple of
+	// years, not every connection.
+	statInterval = 10 * time.Second
 )
 
-// CertReloader sirve un par cert/clave y lo repuebla cuando el mtime de
-// alguno de los dos ficheros avanza. Si la recarga falla sigue sirviendo el
-// último par válido: una regeneración a medio escribir no debe tumbar el
-// listener ni, peor, dejar el panel sin responder.
+// CertReloader serves a cert/key pair and repopulates it when either file's
+// mtime moves. If the reload fails it keeps serving the last good pair: a
+// half-written regeneration must not take the listener down or, worse, leave
+// the panel unreachable.
 type CertReloader struct {
 	certPath string
 	keyPath  string
 
-	mu       sync.Mutex
-	cert     *tls.Certificate
-	mtime    time.Time
-	lastFail time.Time
+	mu        sync.Mutex
+	cert      *tls.Certificate
+	mtime     time.Time
+	lastFail  time.Time
+	lastCheck time.Time
 }
 
-// NewCertReloader carga el par inicial. Devuelve error si no existe o no
-// parsea: quien pidió TLS debe enterarse al arrancar, no en el primer
-// handshake.
+// NewCertReloader loads the initial pair. It returns an error if the pair is
+// missing or does not parse: whoever asked for TLS should find out at startup,
+// not at the first handshake.
 func NewCertReloader(certPath, keyPath string) (*CertReloader, error) {
+	defCert, defKey := routerPair()
 	if certPath == "" {
-		certPath = DefaultCertPath
+		certPath = defCert
 	}
 	if keyPath == "" {
-		keyPath = DefaultKeyPath
+		keyPath = defKey
 	}
 	r := &CertReloader{certPath: certPath, keyPath: keyPath}
 	if err := r.reload(); err != nil {
@@ -74,8 +85,8 @@ func NewCertReloader(certPath, keyPath string) (*CertReloader, error) {
 	return r, nil
 }
 
-// TLSConfig es la configuración del listener: GetCertificate en lugar de una
-// lista estática, para que la recarga en caliente tenga efecto.
+// TLSConfig is the listener's configuration: GetCertificate rather than a
+// static list, so that reloading has any effect.
 func (r *CertReloader) TLSConfig() *tls.Config {
 	return &tls.Config{
 		GetCertificate: r.GetCertificate,
@@ -83,33 +94,50 @@ func (r *CertReloader) TLSConfig() *tls.Config {
 	}
 }
 
-// GetCertificate implementa tls.Config.GetCertificate.
+// GetCertificate implements tls.Config.GetCertificate.
 func (r *CertReloader) GetCertificate(*tls.ClientHelloInfo) (*tls.Certificate, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	now := time.Now()
+	if now.Sub(r.lastCheck) < statInterval {
+		return r.cert, nil
+	}
+	r.lastCheck = now
 	mt, err := newestMtime(r.certPath, r.keyPath)
 	if err != nil {
-		return r.cert, nil // stat falla: servir lo cacheado
+		return r.cert, nil // stat failed: serve what is cached
 	}
-	if mt.After(r.mtime) && time.Since(r.lastFail) > retryAfterFailure {
+	if mt.After(r.mtime) && now.Sub(r.lastFail) > retryAfterFailure {
 		if err := r.reload(); err != nil {
-			r.lastFail = time.Now()
+			r.lastFail = now
 			return r.cert, nil
 		}
 	}
 	return r.cert, nil
 }
 
-// reload repuebla la caché desde disco. Debe llamarse con r.mu tomado, salvo
-// en el constructor.
+// reload repopulates the cache from disk. Call it with r.mu held, except in
+// the constructor.
+//
+// The mtime is taken BEFORE the read, not after: a pair rewritten in between
+// would otherwise be recorded under the newer mtime while the older content
+// is cached, and the update would never be picked up.
 func (r *CertReloader) reload() error {
-	cert, err := loadPair(r.certPath, r.keyPath)
-	if err != nil {
-		return err
-	}
 	mt, err := newestMtime(r.certPath, r.keyPath)
 	if err != nil {
 		return err
+	}
+	cert, err := certs.LoadPair(r.certPath, r.keyPath)
+	if err != nil {
+		return err
+	}
+	// Serve it either way - refusing would mean no panel at all - but say
+	// so. A rotation that produces an expired pair, or the empty
+	// subjectAltName px5g used to write, arrives by this path without ever
+	// passing the gate in Settings, and the symptom is a browser that will
+	// not open the panel with nothing in the log to explain it.
+	if err := certs.Usable(r.certPath, r.keyPath, time.Now()); err != nil {
+		log.Printf("tls: serving %s even though %v", r.certPath, err)
 	}
 	r.cert = &cert
 	r.mtime = mt
@@ -117,8 +145,17 @@ func (r *CertReloader) reload() error {
 	return nil
 }
 
-// newestMtime es el mtime más reciente de los dos ficheros: basta con que uno
-// se mueva para que el par sea otro.
+// forgetStatCache makes the next handshake look at the disk again. Only the
+// tests use it: they rewrite a pair in the same instant they check it, which
+// is not something a router does.
+func (r *CertReloader) forgetStatCache() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.lastCheck = time.Time{}
+}
+
+// newestMtime is the more recent mtime of the two files: one of them moving is
+// enough for the pair to be a different one.
 func newestMtime(paths ...string) (time.Time, error) {
 	var newest time.Time
 	for _, p := range paths {
@@ -133,100 +170,55 @@ func newestMtime(paths ...string) (time.Time, error) {
 	return newest, nil
 }
 
-// loadPair lee el par en cualquiera de las dos codificaciones.
+// certCandidates are the pairs to try, in the order a user would expect: what
+// they asked for explicitly; failing that, the one they generated from the
+// panel; failing that, uhttpd's, which a router always has.
 //
-// OpenWrt guarda el de uhttpd en DER: /etc/uhttpd.crt empieza por 30 82
-// (SEQUENCE ASN.1), no por "-----BEGIN", porque ustream-ssl lo lee así. La
-// biblioteca estándar de Go solo entiende PEM, de modo que cargar el par del
-// router - que es justo lo que hace útil esta opción - exige reconocer
-// ambas. Comprobado en un router, no deducido: con solo PEM el panel se
-// negaba a arrancar.
-func loadPair(certPath, keyPath string) (tls.Certificate, error) {
-	certBytes, err := os.ReadFile(certPath)
-	if err != nil {
-		return tls.Certificate{}, err
-	}
-	keyBytes, err := os.ReadFile(keyPath)
-	if err != nil {
-		return tls.Certificate{}, err
-	}
-	if bytes.Contains(certBytes, []byte("-----BEGIN")) {
-		return tls.X509KeyPair(certBytes, keyBytes)
-	}
-	leaf, err := x509.ParseCertificate(certBytes)
-	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("certificate is neither PEM nor DER: %w", err)
-	}
-	key, err := parseDERKey(keyBytes)
-	if err != nil {
-		return tls.Certificate{}, err
-	}
-	return tls.Certificate{Certificate: [][]byte{certBytes}, PrivateKey: key, Leaf: leaf}, nil
-}
-
-// parseDERKey acepta las tres formas en que una clave puede venir en DER;
-// px5g escribe EC (SEC1) con la configuración por defecto de OpenWrt, pero un
-// par propio puede ser PKCS#8 o RSA.
-func parseDERKey(der []byte) (crypto.PrivateKey, error) {
-	if k, err := x509.ParseECPrivateKey(der); err == nil {
-		return k, nil
-	}
-	if k, err := x509.ParsePKCS8PrivateKey(der); err == nil {
-		return k, nil
-	}
-	if k, err := x509.ParsePKCS1PrivateKey(der); err == nil {
-		return k, nil
-	}
-	return nil, errors.New("private key is neither PEM nor DER (EC, PKCS#8 or PKCS#1)")
-}
-
-// certCandidates son los pares a probar, en el orden en que un usuario lo
-// esperaría: lo que pidió explícitamente; si no, el que generó desde el
-// panel; si no, el de uhttpd, que en un router siempre está.
-//
-// El par propio va antes que el de uhttpd a propósito: generarlo es un acto
-// deliberado desde Ajustes, y quien lo hizo esperaba que se usara.
+// The panel's own comes before uhttpd's deliberately: generating it is a
+// deliberate act from Settings, and whoever did it expected it to be used.
 func certCandidates(certPath, keyPath string) [][2]string {
 	var out [][2]string
 	if certPath != "" && keyPath != "" {
 		out = append(out, [2]string{certPath, keyPath})
 	}
+	panelCert, panelKey := panelPair()
+	routerCert, routerKey := routerPair()
 	return append(out,
-		[2]string{PanelCertPath, PanelKeyPath},
-		[2]string{DefaultCertPath, DefaultKeyPath},
+		[2]string{panelCert, panelKey},
+		[2]string{routerCert, routerKey},
 	)
 }
 
-// ResolveCertPaths es el par que se serviría: el primero que exista.
+// ResolveCertPaths is the pair that would be served: the first that exists.
 func ResolveCertPaths(certPath, keyPath string) (string, string) {
 	for _, c := range certCandidates(certPath, keyPath) {
 		if fileExists(c[0]) && fileExists(c[1]) {
 			return c[0], c[1]
 		}
 	}
-	return DefaultCertPath, DefaultKeyPath
+	return routerPair()
 }
 
-// OpenCertificate abre el primer par utilizable y dice cuál fue.
+// OpenCertificate opens the first usable pair and says which one it was.
 //
-// Que el par configurado falte o no cargue no es razón para dejar el panel
-// sin arrancar: un certificado borrado, un fichero a medio escribir o una
-// ruta que apunta a donde ya no hay nada dejarían el router sin panel hasta
-// que alguien entre por SSH. Se sirve otro y se avisa. Lo que no se hace
-// nunca es caer a texto plano: si ninguno sirve, esto devuelve error y quien
-// llama se niega a arrancar.
-func OpenCertificate(certPath, keyPath string) (r *CertReloader, usedCert, usedKey string, err error) {
+// A configured pair being missing or unloadable is no reason to leave the
+// panel unstarted: a deleted certificate, a half-written file or a path
+// pointing at something no longer there would leave the router with no panel
+// until somebody comes in over SSH. Another is served and the fact is logged.
+// What never happens is falling back to plaintext: if none of them serve, this
+// returns an error and the caller refuses to start.
+func OpenCertificate(certPath, keyPath string) (r *CertReloader, usedCert string, err error) {
 	var firstErr error
 	for _, c := range certCandidates(certPath, keyPath) {
 		r, err := NewCertReloader(c[0], c[1])
 		if err == nil {
-			return r, c[0], c[1], nil
+			return r, c[0], nil
 		}
 		if firstErr == nil {
 			firstErr = err
 		}
 	}
-	return nil, "", "", firstErr
+	return nil, "", firstErr
 }
 
 func fileExists(p string) bool {

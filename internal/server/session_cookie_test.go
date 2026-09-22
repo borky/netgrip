@@ -2,6 +2,7 @@ package server
 
 import (
 	"net/http"
+	"net/http/httptest"
 	"testing"
 )
 
@@ -89,10 +90,40 @@ func TestSessionCookieIsReadUnderEitherName(t *testing.T) {
 		for _, name := range []string{sessionCookie, secureSessionCookie} {
 			r, _ := http.NewRequest("GET", "/", nil)
 			r.AddCookie(&http.Cookie{Name: name, Value: "token"})
-			c, err := s.sessionCookie(r)
+			c, fallback, err := s.sessionCookie(r)
 			if err != nil || c.Value != "token" {
 				t.Errorf("secure=%v, cookie %q: got %v, %v", secure, name, c, err)
+				continue
+			}
+			if want := name != s.sessionCookieName(); fallback != want {
+				t.Errorf("secure=%v, cookie %q: fallback = %v, want %v", secure, name, fallback, want)
 			}
 		}
+	}
+}
+
+// Accepting the other name is what keeps a session alive across the switch,
+// but over TLS it must not leave the session on the weaker cookie: a token
+// issued in clear may have been read off the LAN, and the __Secure- prefix is
+// worth nothing while the plain name stays a permanent alias for it.
+func TestALegacyCookieIsMovedToTheSecureNameOverTLS(t *testing.T) {
+	s := &Server{secure: true}
+	w := httptest.NewRecorder()
+	s.reissueUnderCurrentName(w, "token")
+
+	var reissued, expired *http.Cookie
+	for _, c := range w.Result().Cookies() {
+		switch c.Name {
+		case secureSessionCookie:
+			reissued = c
+		case sessionCookie:
+			expired = c
+		}
+	}
+	if reissued == nil || reissued.Value != "token" || !reissued.Secure {
+		t.Errorf("the session was not reissued under the secure name: %v", reissued)
+	}
+	if expired == nil || expired.MaxAge >= 0 {
+		t.Errorf("the plaintext cookie must be expired, got %v", expired)
 	}
 }
