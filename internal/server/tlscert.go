@@ -9,7 +9,12 @@
 package server
 
 import (
+	"bytes"
+	"crypto"
 	"crypto/tls"
+	"crypto/x509"
+	"errors"
+	"fmt"
 	"os"
 	"sync"
 	"time"
@@ -88,7 +93,7 @@ func (r *CertReloader) GetCertificate(*tls.ClientHelloInfo) (*tls.Certificate, e
 // reload repuebla la caché desde disco. Debe llamarse con r.mu tomado, salvo
 // en el constructor.
 func (r *CertReloader) reload() error {
-	cert, err := tls.LoadX509KeyPair(r.certPath, r.keyPath)
+	cert, err := loadPair(r.certPath, r.keyPath)
 	if err != nil {
 		return err
 	}
@@ -116,4 +121,51 @@ func newestMtime(paths ...string) (time.Time, error) {
 		}
 	}
 	return newest, nil
+}
+
+// loadPair lee el par en cualquiera de las dos codificaciones.
+//
+// OpenWrt guarda el de uhttpd en DER: /etc/uhttpd.crt empieza por 30 82
+// (SEQUENCE ASN.1), no por "-----BEGIN", porque ustream-ssl lo lee así. La
+// biblioteca estándar de Go solo entiende PEM, de modo que cargar el par del
+// router - que es justo lo que hace útil esta opción - exige reconocer
+// ambas. Comprobado en un router, no deducido: con solo PEM el panel se
+// negaba a arrancar.
+func loadPair(certPath, keyPath string) (tls.Certificate, error) {
+	certBytes, err := os.ReadFile(certPath)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	keyBytes, err := os.ReadFile(keyPath)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	if bytes.Contains(certBytes, []byte("-----BEGIN")) {
+		return tls.X509KeyPair(certBytes, keyBytes)
+	}
+	leaf, err := x509.ParseCertificate(certBytes)
+	if err != nil {
+		return tls.Certificate{}, fmt.Errorf("certificate is neither PEM nor DER: %w", err)
+	}
+	key, err := parseDERKey(keyBytes)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	return tls.Certificate{Certificate: [][]byte{certBytes}, PrivateKey: key, Leaf: leaf}, nil
+}
+
+// parseDERKey acepta las tres formas en que una clave puede venir en DER;
+// px5g escribe EC (SEC1) con la configuración por defecto de OpenWrt, pero un
+// par propio puede ser PKCS#8 o RSA.
+func parseDERKey(der []byte) (crypto.PrivateKey, error) {
+	if k, err := x509.ParseECPrivateKey(der); err == nil {
+		return k, nil
+	}
+	if k, err := x509.ParsePKCS8PrivateKey(der); err == nil {
+		return k, nil
+	}
+	if k, err := x509.ParsePKCS1PrivateKey(der); err == nil {
+		return k, nil
+	}
+	return nil, errors.New("private key is neither PEM nor DER (EC, PKCS#8 or PKCS#1)")
 }
