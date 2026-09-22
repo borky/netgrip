@@ -39,6 +39,7 @@ export function AccessCard({ index = 2 }: { index?: number }) {
   const [hasRouterCert, setHasRouterCert] = useState(false);
   // Lo que se está sirviendo ahora mismo, que no tiene por qué ser lo
   // configurado: si el par configurado falta, el panel sirve otro y lo dice.
+  const [servingTls, setServingTls] = useState(false);
   const [serving, setServing] = useState<"" | "panel" | "router" | "custom">("");
   // Lo aplicado, para saber al guardar si algo cambió de verdad: sólo
   // entonces hay que reiniciar el panel y llevarse el navegador con él.
@@ -68,7 +69,8 @@ export function AccessCard({ index = 2 }: { index?: number }) {
       setAppliedHttps(s.enabled);
       setPanelCert(s.cert);
       setAppliedCert(s.cert);
-      setServing(s.serving ? s.serving_source : "");
+      setServingTls(s.serving);
+      setServing(s.serving_source ?? "");
     }).catch(() => {});
   };
   useEffect(reload, []);
@@ -206,10 +208,13 @@ export function AccessCard({ index = 2 }: { index?: number }) {
                 </div>
               )}
               <div className="flex items-center gap-2">
-                <ShieldCheck size={14} className={serving ? "text-ok" : "text-faint"} aria-hidden="true" />
+                <ShieldCheck size={14} className={servingTls ? "text-ok" : "text-faint"} aria-hidden="true" />
                 <span className="text-small flex-1">
-                  {serving
+                  {servingTls
                     ? t("access.servingWith", {
+                        // An unknown source still means TLS is on: say so
+                        // rather than claiming plain HTTP, which is the one
+                        // thing that must never be shown wrongly.
                         cert:
                           serving === "panel" ? t("access.certOwn")
                             : serving === "router" ? t("access.certRouter")
