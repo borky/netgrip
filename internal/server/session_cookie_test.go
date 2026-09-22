@@ -70,6 +70,14 @@ func TestSessionCookieNameFollowsTheTransport(t *testing.T) {
 	if plain.Name == tls.Name {
 		t.Fatalf("both transports use %q; the secure one blocks the other", plain.Name)
 	}
+	// Neither may be the name the panel used to issue. That name may
+	// already exist in a browser carrying Secure, and a plaintext origin
+	// can neither overwrite nor delete such a cookie - which locked the
+	// user out of their own panel with the correct password.
+	if plain.Name == legacySessionCookie || tls.Name == legacySessionCookie {
+		t.Errorf("a name that was once issued with Secure is unusable from HTTP; "+
+			"plain=%q tls=%q legacy=%q", plain.Name, tls.Name, legacySessionCookie)
+	}
 	if tls.Name != secureSessionCookie {
 		t.Errorf("TLS cookie = %q, want the __Secure- prefixed name", tls.Name)
 	}
@@ -87,10 +95,18 @@ func TestSessionCookieNameFollowsTheTransport(t *testing.T) {
 func TestSessionCookieIsReadUnderEitherName(t *testing.T) {
 	for _, secure := range []bool{false, true} {
 		s := &Server{secure: secure}
-		for _, name := range []string{sessionCookie, secureSessionCookie} {
+		for _, name := range []string{httpSessionCookie, secureSessionCookie, legacySessionCookie} {
 			r, _ := http.NewRequest("GET", "/", nil)
 			r.AddCookie(&http.Cookie{Name: name, Value: "token"})
 			c, fallback, err := s.sessionCookie(r)
+			// A browser never sends a __Secure- cookie over plain HTTP,
+			// so that combination cannot arrive and is not looked for.
+			if !secure && name == secureSessionCookie {
+				if err == nil {
+					t.Errorf("a __Secure- cookie must not be honoured over plain HTTP")
+				}
+				continue
+			}
 			if err != nil || c.Value != "token" {
 				t.Errorf("secure=%v, cookie %q: got %v, %v", secure, name, c, err)
 				continue
@@ -116,7 +132,7 @@ func TestALegacyCookieIsMovedToTheSecureNameOverTLS(t *testing.T) {
 		switch c.Name {
 		case secureSessionCookie:
 			reissued = c
-		case sessionCookie:
+		case httpSessionCookie:
 			expired = c
 		}
 	}
@@ -125,5 +141,36 @@ func TestALegacyCookieIsMovedToTheSecureNameOverTLS(t *testing.T) {
 	}
 	if expired == nil || expired.MaxAge >= 0 {
 		t.Errorf("the plaintext cookie must be expired, got %v", expired)
+	}
+}
+
+// A session from before the names changed must survive, and must not be left
+// on the old name: it is read once and moved onto the current one.
+func TestALegacySessionIsMovedOntoTheCurrentName(t *testing.T) {
+	for _, secure := range []bool{false, true} {
+		s := &Server{secure: secure}
+		r, _ := http.NewRequest("GET", "/", nil)
+		r.AddCookie(&http.Cookie{Name: legacySessionCookie, Value: "token"})
+
+		c, fallback, err := s.sessionCookie(r)
+		if err != nil || c.Value != "token" {
+			t.Fatalf("secure=%v: a legacy session must still be read: %v", secure, err)
+		}
+		if !fallback {
+			t.Errorf("secure=%v: reading the legacy name must be reported as a fallback, "+
+				"or the session is never moved off it", secure)
+		}
+
+		w := httptest.NewRecorder()
+		s.reissueUnderCurrentName(w, c.Value)
+		var reissued *http.Cookie
+		for _, got := range w.Result().Cookies() {
+			if got.Name == s.sessionCookieName() {
+				reissued = got
+			}
+		}
+		if reissued == nil || reissued.Value != "token" {
+			t.Errorf("secure=%v: session not reissued under %q", secure, s.sessionCookieName())
+		}
 	}
 }

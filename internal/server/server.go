@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"log"
 	"mime"
+	"net"
 	"net/http"
 	"path"
 	"strings"
@@ -25,22 +26,38 @@ import (
 //go:embed all:dist
 var distFS embed.FS
 
+// The session cookie has one name per transport, and neither of them is the
+// name it used to have.
+//
+// A browser will not let an insecure origin overwrite a cookie marked Secure
+// ("leave secure cookies alone", RFC 6265bis 5.4). With a single name,
+// turning HTTPS off left the old Secure cookie blocking the new one: the
+// login got the password right, the server sent its cookie, the browser
+// silently discarded it, and the panel came straight back to the login form
+// with nothing anywhere saying why.
+//
+// Two names fix that going forward, but only if NEITHER is the old one. A
+// name that has ever been set with Secure is unusable from HTTP for as long
+// as that cookie lives, and no server can clear it - the same rule that
+// blocks the overwrite blocks the deletion. So the plaintext cookie is
+// renamed too, and legacySessionCookie is read but never written: a session
+// that predates this survives, and is moved onto the right name on its next
+// request.
 const (
-	sessionCookie = "netgrip_session"
-	// secureSessionCookie: the same job under a different name when the
-	// panel is served over TLS.
-	//
-	// A browser will not let an insecure origin overwrite a cookie marked
-	// Secure ("leave secure cookies alone", RFC 6265bis 5.4), so with a
-	// single name, turning HTTPS off left the old HTTPS cookie blocking the
-	// new one: the login got the password right, the server sent its
-	// cookie, the browser silently discarded it and the session never
-	// existed. Different names cannot collide, and changing scheme stops
-	// breaking access. The __Secure- prefix also makes the browser refuse
-	// the cookie if it ever arrives without Secure or over HTTP.
+	// httpSessionCookie: served over plain HTTP. Named for its transport so
+	// it cannot collide with a cookie some HTTPS origin set earlier.
+	httpSessionCookie = "netgrip_http_session"
+
+	// secureSessionCookie: served over TLS. The __Secure- prefix makes the
+	// browser refuse it if it ever arrives without Secure or over HTTP.
 	secureSessionCookie = "__Secure-netgrip_session"
-	sessionTTL          = 12 * time.Hour
-	leasesPath          = "/tmp/dhcp.leases"
+
+	// legacySessionCookie: what both used to be called. Accepted on the way
+	// in, never issued.
+	legacySessionCookie = "netgrip_session"
+
+	sessionTTL = 12 * time.Hour
+	leasesPath = "/tmp/dhcp.leases"
 )
 
 type Server struct {
@@ -402,6 +419,12 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !ok {
+		// Logged because this is the router's root password: a panel that
+		// accepts it should say when it was offered and refused. It is
+		// also the only way to tell a rejected attempt from one that never
+		// arrived, which is a real question when a browser is holding a
+		// cookie it will not replace.
+		log.Printf("login: refused for %q from %s", req.Username, clientAddr(r))
 		writeError(w, http.StatusUnauthorized, "invalid credentials")
 		return
 	}
@@ -411,8 +434,20 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "session token")
 		return
 	}
-	http.SetCookie(w, s.sessionCookieFor(token, int(ttl.Seconds())))
+	cookie := s.sessionCookieFor(token, int(ttl.Seconds()))
+	http.SetCookie(w, cookie)
+	log.Printf("login: accepted for %q from %s, session cookie %q (secure=%v)",
+		req.Username, clientAddr(r), cookie.Name, cookie.Secure)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// clientAddr is the peer address without the port, for the log.
+func clientAddr(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
 }
 
 // sessionCookie reads the session cookie under the name that belongs to the
@@ -426,8 +461,17 @@ func (s *Server) sessionCookie(r *http.Request) (*http.Cookie, bool, error) {
 	if c, err := r.Cookie(s.sessionCookieName()); err == nil {
 		return c, false, nil
 	}
-	c, err := r.Cookie(s.otherSessionCookieName())
-	return c, err == nil, err
+	// Any other name we have ever issued. Whichever answers, the session is
+	// real and is moved onto the current name by the caller.
+	var lastErr error
+	for _, name := range s.otherSessionCookieNames() {
+		c, err := r.Cookie(name)
+		if err == nil {
+			return c, true, nil
+		}
+		lastErr = err
+	}
+	return nil, false, lastErr
 }
 
 // sessionCookieName is the name that belongs to the current transport.
@@ -435,14 +479,17 @@ func (s *Server) sessionCookieName() string {
 	if s.secure {
 		return secureSessionCookie
 	}
-	return sessionCookie
+	return httpSessionCookie
 }
 
-func (s *Server) otherSessionCookieName() string {
+// otherSessionCookieNames are the names a session may still arrive under.
+func (s *Server) otherSessionCookieNames() []string {
 	if s.secure {
-		return sessionCookie
+		return []string{httpSessionCookie, legacySessionCookie}
 	}
-	return secureSessionCookie
+	// Not secureSessionCookie: a browser never sends a __Secure- cookie
+	// over plain HTTP, so asking for it would only ever find nothing.
+	return []string{legacySessionCookie}
 }
 
 // reissueUnderCurrentName moves a session to the cookie name this transport
@@ -455,15 +502,20 @@ func (s *Server) otherSessionCookieName() string {
 func (s *Server) reissueUnderCurrentName(w http.ResponseWriter, token string) {
 	ttl := time.Duration(modules.PanelSessionTTLMinutes()) * time.Minute
 	http.SetCookie(w, s.sessionCookieFor(token, int(ttl.Seconds())))
-	http.SetCookie(w, &http.Cookie{
-		Name:     s.otherSessionCookieName(),
-		Value:    "",
-		Path:     "/",
-		HttpOnly: true,
-		Secure:   !s.secure,
-		SameSite: http.SameSiteLaxMode,
-		MaxAge:   -1,
-	})
+	for _, name := range s.otherSessionCookieNames() {
+		// Best effort: a Secure cookie cannot be expired from a plaintext
+		// origin, which is the whole reason the names changed. The one
+		// that can be cleared is, and the session is on the right name
+		// either way.
+		http.SetCookie(w, &http.Cookie{
+			Name:     name,
+			Value:    "",
+			Path:     "/",
+			HttpOnly: true,
+			SameSite: http.SameSiteLaxMode,
+			MaxAge:   -1,
+		})
+	}
 }
 
 // sessionCookieFor builds the session cookie. Secure follows the transport
@@ -2948,7 +3000,10 @@ func (s *Server) handlePushConfigGet(w http.ResponseWriter, _ *http.Request) {
 // trigger it remotely.
 func (s *Server) handleAgentRestart(w http.ResponseWriter, r *http.Request) {
 	authorized := false
-	if c, err := r.Cookie(sessionCookie); err == nil && auth.ValidSessionToken(c.Value) && !s.isRevoked(c.Value) {
+	// Through the same helper as every other handler: reading one
+	// hardcoded name meant this endpoint stopped recognising a UI session
+	// the moment the cookie's name followed the transport.
+	if c, _, err := s.sessionCookie(r); err == nil && auth.ValidSessionToken(c.Value) && !s.isRevoked(c.Value) {
 		authorized = true
 	}
 	if !authorized {
