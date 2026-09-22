@@ -87,7 +87,13 @@ func main() {
 			// quietly serving the password in clear after HTTPS was asked
 			// for is worse than one that refuses to start, because nothing
 			// says so.
-			log.Fatalf("-https: no usable certificate (%s and %s): %v", wanted, wantedKey, err)
+			// Two lines, because the second is the one somebody can act
+			// on. procd gives up after a bounded number of retries, so
+			// this is what is left in the log when the panel is down -
+			// it has to say how to get it back without reading source.
+			log.Printf("-https: no usable certificate (%s and %s): %v", wanted, wantedKey, err)
+			log.Fatal("-https: the panel will not serve the router's password in clear, so it is not starting. " +
+				"To bring it back on HTTP: uci set netgrip.main.https=0; uci commit netgrip; /etc/init.d/netgrip restart")
 		}
 		if certFile != wanted {
 			log.Printf("-https: %s could not be used, serving %s instead", wanted, certFile)
