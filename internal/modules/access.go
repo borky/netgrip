@@ -355,7 +355,30 @@ const (
 	sslDir   = "/etc/netgrip/ssl"
 	certPath = sslDir + "/cert.pem"
 	keyPath  = sslDir + "/key.pem"
+
+	// El par de uhttpd, el que sirve LuCI.
+	routerCertPath = "/etc/uhttpd.crt"
+	routerKeyPath  = "/etc/uhttpd.key"
 )
+
+func fileReadable(p string) bool {
+	fi, err := os.Stat(p)
+	return err == nil && !fi.IsDir()
+}
+
+// HasRouterCert dice si el par de uhttpd está disponible para elegirlo.
+func HasRouterCert() bool {
+	return fileReadable(routerCertPath) && fileReadable(routerKeyPath)
+}
+
+// CertSource dice cuál de los dos pares está configurado, mirando las rutas
+// en vez de adivinarlo por lo que haya en disco.
+func CertSource() string {
+	if c, _ := HTTPSCertPaths(); c == routerCertPath {
+		return CertSourceRouter
+	}
+	return CertSourcePanel
+}
 
 func HasSelfSignedCert() bool {
 	_, err1 := os.Stat(certPath)
@@ -399,8 +422,25 @@ func HTTPSEnabled() bool {
 	return uciGet("netgrip.main.https") == "1"
 }
 
-func EnableHTTPS() error {
-	if !HasSelfSignedCert() {
+// Certificate sources the panel can serve. Named rather than inferred: the
+// fallback order used to decide it silently, so clearing the configured
+// paths still served the panel's own pair because the files were on disk,
+// which is not what "use the router's certificate" means to anybody.
+const (
+	CertSourcePanel  = "panel"  // el par propio del panel, con las IPs en el SAN
+	CertSourceRouter = "router" // el de uhttpd, el mismo que sirve LuCI
+)
+
+// EnableHTTPS turns the panel's TLS on with the chosen certificate, writing
+// the paths explicitly so what is served is what was asked for.
+func EnableHTTPS(source string) error {
+	certFile, keyFile := certPath, keyPath
+	if source == CertSourceRouter {
+		certFile, keyFile = routerCertPath, routerKeyPath
+		if !fileReadable(certFile) || !fileReadable(keyFile) {
+			return fmt.Errorf("the router's certificate is not at %s and %s", certFile, keyFile)
+		}
+	} else if !HasSelfSignedCert() {
 		if err := GenerateSelfSignedCert(); err != nil {
 			return err
 		}
@@ -414,8 +454,8 @@ func EnableHTTPS() error {
 	}
 	ops := []executor.Op{
 		{Kind: "uci_set", Args: []string{"netgrip.main.https", "1"}},
-		{Kind: "uci_set", Args: []string{"netgrip.main.https_cert", certPath}},
-		{Kind: "uci_set", Args: []string{"netgrip.main.https_key", keyPath}},
+		{Kind: "uci_set", Args: []string{"netgrip.main.https_cert", certFile}},
+		{Kind: "uci_set", Args: []string{"netgrip.main.https_key", keyFile}},
 		{Kind: "uci_commit", Args: []string{"netgrip"}},
 	}
 	return executor.Apply(ops, nil)

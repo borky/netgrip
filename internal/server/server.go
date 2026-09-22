@@ -2024,6 +2024,10 @@ func (s *Server) handleHistoryGet(w http.ResponseWriter, _ *http.Request) {
 func (s *Server) handleHTTPSGet(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, map[string]any{
 		"has_cert": modules.HasSelfSignedCert(),
+		// cert: which pair is configured, and whether the router's is even
+		// available to choose.
+		"cert":        modules.CertSource(),
+		"router_cert": modules.HasRouterCert(),
 		// enabled is what the configuration says; serving is how this
 		// process was started. Between a change and the restart that
 		// applies it the two differ, and the UI has to be able to say so.
@@ -2034,6 +2038,10 @@ func (s *Server) handleHTTPSGet(w http.ResponseWriter, _ *http.Request) {
 
 type httpsRequest struct {
 	Enabled *bool `json:"enabled"`
+	// Cert: "panel" (el par propio, con las IPs del router en el SAN) o
+	// "router" (el de uhttpd, el mismo que sirve LuCI). Vacío conserva el
+	// que ya estuviera configurado.
+	Cert string `json:"cert"`
 }
 
 // handleHTTPSSet turns the panel's own TLS on or off. It takes effect on the
@@ -2055,7 +2063,11 @@ func (s *Server) handleHTTPSSet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := modules.EnableHTTPS(); err != nil {
+	source := req.Cert
+	if source == "" {
+		source = modules.CertSource()
+	}
+	if err := modules.EnableHTTPS(source); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}

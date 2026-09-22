@@ -86,6 +86,7 @@ const state = {
   portTemplates: [...D.demoPortTemplates],
   hasCert: true,
   panelHttps: false,
+  panelCert: "panel" as "panel" | "router",
   history: D.buildDemoHistory(),
   netifyd: { ...D.demoNetifyd },
 };
@@ -716,10 +717,14 @@ export const demoApi: typeof api = {
   },
   remoteAccess: () => get(state.remote),
   setRemoteAccess: async (opts) => { Object.assign(state.remote, opts); return write(state.remote); },
-  httpsState: () => get({ has_cert: state.hasCert, enabled: state.panelHttps, serving: state.panelHttps }),
-  setPanelHttps: async (enabled: boolean) => {
+  httpsState: () => get({
+    has_cert: state.hasCert, enabled: state.panelHttps, serving: state.panelHttps,
+    cert: state.panelCert, router_cert: true,
+  }),
+  setPanelHttps: async (enabled: boolean, cert?: "panel" | "router") => {
     await wait(800, 1500);
-    if (enabled) state.hasCert = true;
+    if (cert) state.panelCert = cert;
+    if (enabled && state.panelCert === "panel") state.hasCert = true;
     state.panelHttps = enabled;
     return { status: enabled ? "enabled" : "disabled", https: enabled, restarting: false };
   },

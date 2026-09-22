@@ -557,11 +557,14 @@ const realApi = {
   history: () =>
     request<{ entries: import("./types").HistoryEntry[] }>("/api/history"),
   httpsState: () =>
-    request<{ has_cert: boolean; enabled: boolean; serving: boolean }>("/api/https"),
-  setPanelHttps: (enabled: boolean) =>
+    request<{
+      has_cert: boolean; enabled: boolean; serving: boolean;
+      cert: "panel" | "router"; router_cert: boolean;
+    }>("/api/https"),
+  setPanelHttps: (enabled: boolean, cert?: "panel" | "router") =>
     request<{ status: string; https: boolean; restarting: boolean }>("/api/https", {
       method: "POST",
-      body: JSON.stringify({ enabled }),
+      body: JSON.stringify({ enabled, cert }),
     }),
   wakeOnLan: (mac: string) =>
     request<{ status: string }>("/api/wol", {

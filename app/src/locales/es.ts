@@ -1379,6 +1379,11 @@ export default {
     panelHttpsHint: "Usa el certificado propio del panel si lo hay y, si no, el del router. El panel se reinicia para aplicarlo.",
     panelHttpsConfirm: "El panel se reiniciará y pasará a {{url}}. ¿Continuar?",
     panelHttpsRestarting: "Reiniciando el panel; te llevo a la nueva dirección…",
+    certSource: "Certificado",
+    certOwn: "El propio del panel",
+    certRouter: "El del router (LuCI)",
+    certOwnHint: "Generado aquí con las direcciones de este router, así el navegador no se queja del nombre. Autofirmado: hay que aceptarlo una vez.",
+    certRouterHint: "El mismo que sirve LuCI. Un aviso menos si ya lo aceptaste ahí, aunque nombra al equipo y no a la dirección.",
   },
   remote: {
     title: "Acceso desde Internet",

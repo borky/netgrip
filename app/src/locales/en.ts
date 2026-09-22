@@ -1379,6 +1379,11 @@ export default {
     panelHttpsHint: "Uses the panel's own certificate if there is one, otherwise the router's. The panel restarts to apply it.",
     panelHttpsConfirm: "The panel will restart and move to {{url}}. Continue?",
     panelHttpsRestarting: "Restarting the panel, taking you to the new address…",
+    certSource: "Certificate",
+    certOwn: "The panel's own",
+    certRouter: "The router's (LuCI)",
+    certOwnHint: "Generated here, naming this router's addresses, so the browser does not complain about the name. Self-signed: accept it once.",
+    certRouterHint: "The same certificate LuCI serves. One warning fewer if you already accepted it there, though it names the host rather than the address.",
   },
   remote: {
     title: "Access from the Internet",
