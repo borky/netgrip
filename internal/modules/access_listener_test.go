@@ -61,3 +61,59 @@ func TestEmptyOrGarbageTable(t *testing.T) {
 		}
 	}
 }
+
+// The bug the user hit: unchecking "enable SSH" answered "dropbear
+// healthcheck failed, rolled back" every time, so SSH could not be turned
+// off from the panel at all.
+//
+// The check asked whether dropbear was running before it looked at what had
+// been asked for. A stopped dropbear is precisely what disabling SSH means,
+// so the one outcome that proved success was read as failure. The two
+// directions are opposite questions about the port, and this is the table
+// that says so.
+func TestSSHHealthyAsksTheRightQuestionForEachDirection(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		want      bool // what the user asked for
+		listening bool // what /proc/net/tcp says
+		running   bool // what the init script says
+		healthy   bool
+		why       string
+	}{
+		{"enabled and listening", true, true, true, true, "the ordinary success"},
+		{"enabled but nothing listening", true, false, true, false, "the service is up but unreachable"},
+		{"enabled, listening, service not up", true, true, false, false, "something else holds the port"},
+		{"disabled and the port is free", false, false, false, true,
+			"this is the case that was rolled back: success looks like a stopped service"},
+		{"disabled but still listening", false, true, false, false, "the restart did not take it down"},
+		{"disabled, port free, service somehow up", false, false, true, true,
+			"nothing answers on the port, which is what was asked for"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := sshHealthyFor(tc.want, tc.listening, tc.running); got != tc.healthy {
+				t.Errorf("got %v, want %v (%s)", got, tc.healthy, tc.why)
+			}
+		})
+	}
+}
+
+// Turning SSH off must never be judged by whether dropbear is running: that
+// is the one thing guaranteed to be false when it worked.
+func TestDisablingSSHIsNotJudgedByTheServiceBeingUp(t *testing.T) {
+	for _, running := range []bool{true, false} {
+		if !sshHealthyFor(false, false, running) {
+			t.Errorf("with the port free and running=%v, disabling SSH must count as healthy", running)
+		}
+	}
+}
+
+func TestSSHPortFallsBackTo22(t *testing.T) {
+	for _, v := range []string{"", "no", "0", "70000", "-1"} {
+		if got := sshPortOrDefault(v); got != 22 {
+			t.Errorf("port %q: got %d, want 22", v, got)
+		}
+	}
+	if got := sshPortOrDefault("2222"); got != 2222 {
+		t.Errorf("a valid port must be kept, got %d", got)
+	}
+}
