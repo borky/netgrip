@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ArrowRight, Lock } from "lucide-react";
-import { api, enableDemo, UnauthorizedError } from "../api";
+import { api, enableDemo, RateLimitedError, UnauthorizedError } from "../api";
 import { Banner, Button, Card, Field, HelpTip, LangToggle, ThemeToggle } from "../components/ui";
 import { Logo } from "../components/ui/illustrations";
 
@@ -12,7 +12,8 @@ import { Logo } from "../components/ui/illustrations";
 export function Login({ onSuccess }: { onSuccess: () => void }) {
   const { t } = useTranslation();
   const [password, setPassword] = useState("");
-  const [error, setError] = useState<"credentials" | "network">();
+  const [error, setError] = useState<"credentials" | "network" | "throttled">();
+  const [retryAfter, setRetryAfter] = useState(0);
   const [busy, setBusy] = useState(false);
   const [backendDown, setBackendDown] = useState(false);
   const [shake, setShake] = useState(false);
@@ -32,6 +33,17 @@ export function Login({ onSuccess }: { onSuccess: () => void }) {
       await api.login(password);
       onSuccess();
     } catch (err) {
+      // Three outcomes, not two: the panel being unreachable and the panel
+      // refusing to talk to you for a while look identical from here unless
+      // they are told apart, and "backend down" for a throttled login sends
+      // people to check a router that is working.
+      if (err instanceof RateLimitedError) {
+        setRetryAfter(err.retryAfter);
+        setError("throttled");
+        setShake(true);
+        setTimeout(() => setShake(false), 260);
+        return;
+      }
       const kind = err instanceof UnauthorizedError ? "credentials" : "network";
       setError(kind);
       if (kind === "network") setBackendDown(true);
@@ -70,7 +82,7 @@ export function Login({ onSuccess }: { onSuccess: () => void }) {
               <Field
                 label={t("login.password")}
                 icon={Lock}
-                hint={error === "credentials" ? undefined : t("login.passwordHint")}
+                hint={error ? undefined : t("login.passwordHint")}
                 inputProps={{
                   type: "password",
                   value: password,
@@ -83,7 +95,11 @@ export function Login({ onSuccess }: { onSuccess: () => void }) {
               />
               {error && (
                 <Banner tone="danger" className="mt-3">
-                  {error === "credentials" ? t("login.error") : t("login.errorNetwork")}
+                  {error === "credentials"
+                    ? t("login.error")
+                    : error === "throttled"
+                      ? t("login.errorThrottled", { seconds: retryAfter })
+                      : t("login.errorNetwork")}
                 </Banner>
               )}
               <Button type="submit" loading={busy} disabled={!password} className="w-full mt-4">

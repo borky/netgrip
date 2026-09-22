@@ -22,6 +22,7 @@ export default {
     submitting: "Checking…",
     error: "Wrong password. Try again.",
     errorNetwork: "We couldn't reach the router. Is it on and connected?",
+    errorThrottled: "Too many attempts. Try again in {{seconds}} seconds.",
     demoCta: "Explore demo mode",
     demoDivider: "No router at hand?",
     viewDemo: "View demo",
