@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"path"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -79,6 +80,9 @@ type Server struct {
 	mux     *http.ServeMux
 	mu      sync.Mutex
 	revoked map[string]bool
+	// logins slows password guessing. The panel's login takes the
+	// router's root password and had no rate limit at all.
+	logins *loginThrottle
 }
 
 // New builds the panel. secure says it will be served over TLS, and
@@ -88,6 +92,7 @@ func New(rpcdURL, version string, secure bool, servingCert string) *Server {
 		rpcdURL:     rpcdURL,
 		version:     version,
 		servingCert: servingCert,
+		logins:      newLoginThrottle(),
 		secure:      secure,
 		mux:         http.NewServeMux(),
 		revoked:     make(map[string]bool),
@@ -403,6 +408,14 @@ type loginRequest struct {
 }
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
+	addr := clientAddr(r)
+	if wait := s.logins.retryAfter(addr); wait > 0 {
+		seconds := int(wait.Seconds()) + 1
+		w.Header().Set("Retry-After", strconv.Itoa(seconds))
+		writeError(w, http.StatusTooManyRequests,
+			fmt.Sprintf("too many attempts, try again in %d seconds", seconds))
+		return
+	}
 	var req loginRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid json")
@@ -423,7 +436,11 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		// also the only way to tell a rejected attempt from one that never
 		// arrived, which is a real question when a browser is holding a
 		// cookie it will not replace.
-		log.Printf("login: refused for %q from %s", req.Username, clientAddr(r))
+		if wait := s.logins.failed(addr); wait > 0 {
+			log.Printf("login: refused for %q from %s, throttled for %s", req.Username, addr, wait)
+		} else {
+			log.Printf("login: refused for %q from %s", req.Username, addr)
+		}
 		writeError(w, http.StatusUnauthorized, "invalid credentials")
 		return
 	}
@@ -433,10 +450,11 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "session token")
 		return
 	}
+	s.logins.succeeded(addr)
 	cookie := s.sessionCookieFor(token, int(ttl.Seconds()))
 	http.SetCookie(w, cookie)
 	log.Printf("login: accepted for %q from %s, session cookie %q (secure=%v)",
-		req.Username, clientAddr(r), cookie.Name, cookie.Secure)
+		req.Username, addr, cookie.Name, cookie.Secure)
 	w.WriteHeader(http.StatusNoContent)
 }
 

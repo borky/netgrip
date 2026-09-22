@@ -22,6 +22,7 @@ export default {
     submitting: "Comprobando…",
     error: "Contraseña incorrecta. Prueba otra vez.",
     errorNetwork: "No pudimos hablar con el router. ¿Está encendido y enchufado?",
+    errorThrottled: "Demasiados intentos. Vuelve a probar en {{seconds}} segundos.",
     demoCta: "Explorar el modo demo",
     demoDivider: "¿Sin router a mano?",
     viewDemo: "Ver demo",
