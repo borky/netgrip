@@ -32,15 +32,22 @@ const (
 type Server struct {
 	rpcdURL string
 	version string
+	// secure: el panel se sirve por TLS, así que la cookie de sesión lleva
+	// el flag Secure. Se pasa desde el arranque en vez de deducirlo de la
+	// petición: detrás de un proxy r.TLS es nil y la cookie saldría sin el
+	// flag justo donde más falta hace.
+	secure  bool
 	mux     *http.ServeMux
 	mu      sync.Mutex
 	revoked map[string]bool
 }
 
-func New(rpcdURL, version string) *Server {
+// New construye el panel. secure indica que se servirá por TLS.
+func New(rpcdURL, version string, secure bool) *Server {
 	s := &Server{
 		rpcdURL: rpcdURL,
 		version: version,
+		secure:  secure,
 		mux:     http.NewServeMux(),
 		revoked: make(map[string]bool),
 	}
@@ -384,6 +391,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		Value:    token,
 		Path:     "/",
 		HttpOnly: true,
+		Secure:   s.secure,
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   int(ttl.Seconds()),
 	})
