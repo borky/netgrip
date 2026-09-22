@@ -56,7 +56,6 @@ const (
 	// in, never issued.
 	legacySessionCookie = "netgrip_session"
 
-	sessionTTL = 12 * time.Hour
 	leasesPath = "/tmp/dhcp.leases"
 )
 
@@ -463,15 +462,14 @@ func (s *Server) sessionCookie(r *http.Request) (*http.Cookie, bool, error) {
 	}
 	// Any other name we have ever issued. Whichever answers, the session is
 	// real and is moved onto the current name by the caller.
-	var lastErr error
 	for _, name := range s.otherSessionCookieNames() {
-		c, err := r.Cookie(name)
-		if err == nil {
+		if c, err := r.Cookie(name); err == nil {
 			return c, true, nil
 		}
-		lastErr = err
 	}
-	return nil, false, lastErr
+	// Never (nil, nil): the caller reads c.Value straight after checking
+	// the error, so a nil error with no cookie would panic the handler.
+	return nil, false, http.ErrNoCookie
 }
 
 // sessionCookieName is the name that belongs to the current transport.
@@ -544,6 +542,16 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	// only when the name, path and flags match, so clearing it with any
 	// others would leave the session alive in the browser.
 	http.SetCookie(w, s.sessionCookieFor("", -1))
+	// And every other name it might have arrived under. Revocation alone
+	// is not enough: s.revoked lives in memory and does not survive the
+	// restart this feature causes, so a cookie left behind would
+	// authenticate again afterwards.
+	for _, name := range s.otherSessionCookieNames() {
+		http.SetCookie(w, &http.Cookie{
+			Name: name, Value: "", Path: "/", HttpOnly: true,
+			SameSite: http.SameSiteLaxMode, MaxAge: -1,
+		})
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -2263,6 +2271,16 @@ func (s *Server) respondHTTPSChange(w http.ResponseWriter, https bool) {
 	status := "disabled"
 	if https {
 		status = "enabled"
+	}
+	// The transport is changing, so every session issued under the old one
+	// dies with it. This matters in the plaintext-to-TLS direction: those
+	// tokens crossed the LAN in clear and may have been read off it, and
+	// without this they would be carried over and promoted into the Secure
+	// cookie - protected in transit from then on, but belonging to whoever
+	// captured them. Everyone logs in again on the new scheme, which is
+	// what the change of address asks of them anyway.
+	if https != s.secure {
+		auth.BumpEpoch()
 	}
 	writeJSON(w, map[string]any{"status": status, "https": https, "restarting": true})
 	go func() {
