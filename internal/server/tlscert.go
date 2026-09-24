@@ -9,7 +9,9 @@
 package server
 
 import (
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"log"
 	"os"
 	"sync"
@@ -143,6 +145,19 @@ func (r *CertReloader) reload() error {
 	r.mtime = mt
 	r.lastFail = time.Time{}
 	return nil
+}
+
+// SPKI is the hex SHA-256 of the SubjectPublicKeyInfo of the certificate being
+// served, the form the monitoring side pins. It goes through GetCertificate,
+// so it answers for the pair a handshake would get right now, including one
+// rotated since the last connection.
+func (r *CertReloader) SPKI() string {
+	cert, _ := r.GetCertificate(nil)
+	if cert == nil || cert.Leaf == nil {
+		return ""
+	}
+	sum := sha256.Sum256(cert.Leaf.RawSubjectPublicKeyInfo)
+	return hex.EncodeToString(sum[:])
 }
 
 // forgetStatCache makes the next handshake look at the disk again. Only the
