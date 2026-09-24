@@ -22,6 +22,9 @@ disturbs them.
 
 ```sh
 git fetch upstream
+# Read what the new commits send out of the network BEFORE anything moves -
+# see "No call home" below. Once main is fast-forwarded there is nothing
+# left to compare.
 git checkout main && git merge --ff-only upstream/main && git push origin main
 git rebase -i upstream/main develop
 ```
@@ -60,6 +63,61 @@ why a rebase dropped all thirteen of this branch's copies automatically).
 | behaviour | decision |
 |---|---|
 | The panel polls `https://netgrip.cloudless.club/announcements.json` every 6 hours and renders the result as a ribbon (upstream #389) | **Left alone, deliberately.** It means this build makes a recurring outbound call to upstream's domain and upstream can show text and a link inside the panel. Acceptable while the only user is the person who builds it — and it is how a security notice would arrive. No patch is needed to change course later: upstream already honours `NETGRIP_ANNOUNCEMENTS_URL`, so the init script can point it elsewhere, or at something unreachable to silence it (there is no explicit off switch). Revisit if the fork gets other users. |
+| The embedded agent registers the executor token with the configured NetPulse server at every start (upstream #412) | **Left alone.** It stays inside the network, going only to the server the owner configured. Two things to know: it uses a plain HTTP client rather than the agent's pinned transport, so against a NetPulse server on HTTPS with a self-signed certificate it fails its TLS check; and the matching handler, `/api/agents/executor-token`, is not in NetPulse's upstream yet, so expect a harmless 404 or TLS line in the log at every start until it is. Holding that token also lets NetPulse re-point this router's MQTT (`mqtt.configure`, upstream #410). |
+
+## No call home
+
+This fork sends no identifying data anywhere. The sibling project upstream
+added an anonymous daily instance ping carrying a persistent id (netpulse
+#822, on by default); NetPulse's fork keeps it unwired, and nothing like it
+exists here. Two things keep it that way.
+
+**An outbound check at every sync.** Upstream adds outbound calls without the
+subject line saying so. Right after `git fetch upstream`, before the
+fast-forward:
+
+```sh
+base=$(git merge-base origin/develop upstream/main)   # the develop you last pushed
+pat='[a-z][a-z0-9+.-]*://[a-zA-Z0-9.%/_?=&:-]+'   # any scheme: MQTT is tcp://
+git grep -hoE "$pat" "$base"       -- '*.go' '*.ts' '*.tsx' ':!*_test.go' ':!*.test.ts' ':!*.test.tsx' | sort -u > /tmp/ng-before
+git grep -hoE "$pat" upstream/main -- '*.go' '*.ts' '*.tsx' ':!*_test.go' ':!*.test.ts' ':!*.test.tsx' | sort -u > /tmp/ng-after
+diff /tmp/ng-before /tmp/ng-after
+```
+
+It compares against the base of the `develop` you last pushed, which
+does not move until you push again, so it still gives the right answer
+partway through a sync - after the fast-forward, even after the rebase.
+Once the new `develop` is pushed there is nothing left to compare, so run
+it before then. Read every new endpoint
+before merging: what it sends, whether it is on by default, and whether it
+carries anything that identifies the installation. The NetPulse agent this
+panel embeds is covered by the same check in NetPulse's fork.
+
+What it cannot see is a URL assembled at runtime. The executor-token call
+(#412) is one: it is built from the configured server address, so on the sync
+that added it this check reported only MQTT's `tcp://%s:%d`, and the call was
+found by reading the diff. For anything touching the agent, networking or
+`http.` in the upstream range, read the code, not just this output.
+
+**Two guard tests**, both new fork-only files, so neither can conflict:
+
+- `cmd/netgrip/no_call_home_test.go` reads every non-test `.go` file and fails
+  on any mention of the projects' domain, `cloudless.club`, other than the
+  announcements feed, and on any reference to NetPulse's telemetry switch. The
+  domain rule catches a new host and a host name split across strings; the
+  allowed feed is matched as a whole quoted literal, so nothing can be tacked
+  onto it in the source. It reads source rather than asking the toolchain what
+  it would link, because a dependency-graph check sees only the host platform,
+  and this binary ships for ARM and MIPS routers. It fails if it scans
+  implausibly few files, since a guard that reads nothing passes everything -
+  an early version of NetPulse's did exactly that.
+- `internal/modules/no_call_home_announcements_test.go` covers what a source
+  scan cannot: something built onto the feed's request in code. It drives the
+  real `StartAnnouncements` against a local server and fails unless the
+  request is a plain GET of the static file - no query string, no body, only
+  the expected user agent. Proven against an id appended by the caller, an
+  extra header, and an id folded into the user agent. If upstream renames the
+  function, the test stops compiling: loud, and a one-line fix.
 
 ## Waiting on upstream, not fork-only
 
