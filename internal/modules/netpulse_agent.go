@@ -526,6 +526,8 @@ func applyNetPulseAgent(p netpulsePaths) {
 		Kind:         "netgrip",
 		SelfMQTT:     netPulseSelfMQTT,
 		PanelPort:    panelPort,
+		PanelTLS:     panelServesTLS,
+		PanelSPKI:    panelSPKIHook,
 		// The uplink policy this panel manages travels with the push, so
 		// the monitoring side shows the connection actually in use rather
 		// than the one holding the cheapest route.

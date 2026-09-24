@@ -55,6 +55,14 @@ func main() {
 	}
 
 	addr := fmt.Sprintf("%s:%d", *listen, *port)
+	// Where and how this panel answers, recorded before anything starts: the
+	// embedded agent reads both when it builds its first report, and the
+	// monitoring side links to the panel and sends it an executor token based
+	// on that report. Set any later, the first report said port 8090 whatever
+	// -port was, and plain HTTP for a panel serving HTTPS - which is how a
+	// token ended up in clear on a TLS port.
+	modules.SetPanelPort(*port)
+	modules.SetPanelServesTLS(*useTLS)
 	modules.StartHistoryCollector()
 	modules.StartMonitor()
 	modules.StartNetPulseAgent(version)
@@ -62,9 +70,6 @@ func main() {
 	modules.StartSelfUpdateScheduler(version)
 	modules.StartParentalScheduler()
 	modules.StartQuotaScheduler()
-	// The monitoring side links to this panel, so it has to know where it
-	// answers rather than assume a default.
-	modules.SetPanelPort(*port)
 	modules.StartFleetDiscovery(version, *port)
 	modules.StartPoEWatchdog()
 	modules.StartBanipWarmup()
@@ -99,6 +104,10 @@ func main() {
 			log.Printf("-https: %s could not be used, serving %s instead", wanted, certFile)
 		}
 		reloader, servingCert = reloaded, certFile
+		// The monitoring side reaches this panel too, with a token that can
+		// change the router. It pins the key the agent reports, since a
+		// self-signed certificate cannot be checked by name.
+		modules.SetPanelTLS(reloader.SPKI)
 	}
 	panel := server.New(resolvedRPCd, version, *useTLS, servingCert)
 	scheme, srv := "http", &http.Server{Addr: addr, Handler: panel}
