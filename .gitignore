@@ -5,6 +5,6 @@
 *.test
 /app/tsconfig.tsbuildinfo
 /netgrip
-/netgrip-armv7
+/netgrip-armv7*
 /go.work
 /go.work.sum
