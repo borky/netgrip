@@ -1282,6 +1282,7 @@ export interface NetPulseState {
   enabled: boolean;
   configured: boolean;
   server: string;
+  serverFp?: string; // FORK: the pin for an https server
   slug: string;
   phase: string; // "connected" | "searching" (always-on, #146)
   discovery?: NetPulseDiscovery;

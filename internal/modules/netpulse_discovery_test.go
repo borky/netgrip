@@ -53,7 +53,7 @@ func TestNetPulseStatusConnectedRule(t *testing.T) {
 }
 
 // withFakeDiscovery intercambia probe/enroll por fakes y restaura al final.
-func withFakeDiscovery(t *testing.T, probe func(port int, timeout time.Duration) *netPulseDiscoveryResult, enroll func(p netpulsePaths, server, token string) error) {
+func withFakeDiscovery(t *testing.T, probe func(port int, timeout time.Duration) *netPulseDiscoveryResult, enroll func(p netpulsePaths, server, pin, token string) error) {
 	t.Helper()
 	oldProbe, oldEnroll := npProbe, npEnroll
 	npProbe, npEnroll = probe, enroll
@@ -101,7 +101,7 @@ func TestDiscoveryEnrollsOnIncompleteConfig(t *testing.T) {
 			return &netPulseDiscoveryResult{V: 1, Type: "netpulse-server",
 				URL: "http://192.168.1.50:3000", Autoenroll: true, PairingToken: "ptok"}
 		},
-		func(p netpulsePaths, server, token string) error {
+		func(p netpulsePaths, server, pin, token string) error {
 			mu.Lock()
 			gotServer, gotToken = server, token
 			mu.Unlock()
@@ -134,7 +134,7 @@ func TestDiscoverySkipsWhenConnected(t *testing.T) {
 			probed.Add(1)
 			return nil
 		},
-		func(p netpulsePaths, server, token string) error { return nil })
+		func(p netpulsePaths, server, pin, token string) error { return nil })
 
 	storeNetPulseStatus(runtime.Status{Running: true, PushOk: true, LastPush: time.Now()})
 	netPulseTryDiscovery(p)
@@ -154,7 +154,7 @@ func TestDiscoverySkipsSameServer(t *testing.T) {
 			return &netPulseDiscoveryResult{V: 1, Type: "netpulse-server",
 				URL: "http://192.168.1.50:3000/", Autoenroll: true, PairingToken: "ptok"}
 		},
-		func(p netpulsePaths, server, token string) error {
+		func(p netpulsePaths, server, pin, token string) error {
 			t.Error("mismo server configurado: no debe re-enrollar")
 			return nil
 		})
@@ -191,7 +191,7 @@ func TestDiscoveryDifferentServerNeedsStale(t *testing.T) {
 			return &netPulseDiscoveryResult{V: 1, Type: "netpulse-server",
 				URL: "http://192.168.1.50:3000", Autoenroll: true, PairingToken: "ptok"}
 		},
-		func(p netpulsePaths, server, token string) error {
+		func(p netpulsePaths, server, pin, token string) error {
 			enrolled.Add(1)
 			return nil
 		})
@@ -269,14 +269,17 @@ func TestEnrollNetPulseRetrySuffixOnSlugTaken(t *testing.T) {
 	slugs = append(slugs, netPulseSanitizeSlug(netPulseHostname()))
 	mu.Unlock()
 
-	if err := enrollNetPulse(p, srv.URL, "ptok"); err != nil {
+	if err := enrollNetPulse(p, srv.URL, "", "ptok"); err != nil {
 		t.Fatalf("enroll: %v", err)
 	}
 	cfg, err := ReadNetPulseConfig(p.env)
 	if err != nil {
 		t.Fatalf("env tras enroll: %v", err)
 	}
-	if cfg.Server != srv.URL || cfg.Token != "tok-nuevo-64hex" || cfg.ServerFP != "FP01" {
+	// FORK: over plain http the reply's server_fp is not kept: anyone could
+	// have put it there, and it would become the pin once the URL moved to
+	// https.
+	if cfg.Server != srv.URL || cfg.Token != "tok-nuevo-64hex" || cfg.ServerFP != "" {
 		t.Fatalf("config tras enroll: %+v", cfg)
 	}
 	if cfg.Slug == slugs[0] {
@@ -300,7 +303,7 @@ func TestEnrollNetPulseRejectsBadToken(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	if err := enrollNetPulse(p, srv.URL, "malo"); err == nil {
+	if err := enrollNetPulse(p, srv.URL, "", "malo"); err == nil {
 		t.Fatal("401 debe devolver error")
 	}
 	if fileExists(p.env) {
