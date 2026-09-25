@@ -124,8 +124,11 @@ botones actúan: Home Assistant manda la orden por `netgrip/<router>/command/...
 y el router contesta en `netgrip/<router>/result`.
 
 Se configura desde la tarjeta MQTT de la página Sistema, o escribiendo
-`/etc/netgrip/mqtt.env` (permisos 600). Sin TLS: pensado para un broker de tu
-red local. No se publica nada hasta que lo actives.
+`/etc/netgrip/mqtt.env` (permisos 600). La tarjeta prueba la conexión antes
+de guardar, y un servidor de NetPulse puede enviarle la configuración del
+broker al router (aplicada con el mismo snapshot-y-rollback que cualquier
+otro cambio). Sin TLS: pensado para un broker de tu red local. No se
+publica nada hasta que lo actives.
 
 ## Ponlo en tu router
 
@@ -235,9 +238,10 @@ Toda escritura exige cookie de sesión.
 
 ## Qué viene
 
-Reciente: análisis de tráfico por aplicación con timeline, límites de ancho
-de banda por dispositivo sobre nftables y soporte de release ampliado para
-ARM y MIPS. Lo siguiente: un feed de paquetes propio para que owut/ASU conserve
+Reciente: integración con Home Assistant sobre MQTT (estado, sensores e
+interruptores/botones que actúan, descubiertos automáticamente), límites de
+ancho de banda por dispositivo sobre nftables y soporte de release ampliado
+para ARM y MIPS. Lo siguiente: un feed de paquetes propio para que owut/ASU conserve
 NetGrip dentro de tu imagen de firmware
 ([#63](https://github.com/gnacho/netgrip/issues/63)) y mantener la demo
 pública al día del panel. Las ideas y reportes en los

@@ -121,8 +121,11 @@ Home Assistant sends the command on `netgrip/<router>/command/...` and the
 router replies on `netgrip/<router>/result`.
 
 It is configured from the MQTT card on the System page, or by writing
-`/etc/netgrip/mqtt.env` (mode 600). No TLS: meant for a broker on your local
-network. Nothing is published until you enable it.
+`/etc/netgrip/mqtt.env` (mode 600). The card tests the connection before
+saving, and a NetPulse server can push the broker settings to the router
+(applied with the same snapshot-and-rollback as any other change). No TLS:
+meant for a broker on your local network. Nothing is published until you
+enable it.
 
 ## Get it on your router
 
@@ -231,9 +234,10 @@ shape. Every write requires a session cookie.
 
 ## What's next
 
-Done recently: application-level traffic analysis with a per-app timeline,
-per-device bandwidth limits over nftables, and broader ARM and MIPS release
-support. Coming next: a custom packages feed so owut/ASU can keep NetGrip
+Done recently: Home Assistant integration over MQTT (state, sensors and
+switches/buttons that act, discovered automatically), per-device bandwidth
+limits over nftables, and broader ARM and MIPS release support. Coming next:
+a custom packages feed so owut/ASU can keep NetGrip
 inside your firmware image ([#63](https://github.com/gnacho/netgrip/issues/63)),
 and keeping the public demo in step with the panel. Ideas and reports in the
 [issues](https://github.com/gnacho/netgrip/issues) steer what gets built.
