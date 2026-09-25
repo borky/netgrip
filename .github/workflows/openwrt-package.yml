@@ -1,8 +1,7 @@
 name: openwrt-package
 
-# Builds the OpenWrt packages for NetGrip and attaches them to the release:
-# .ipk (24.10 SDK) and .apk (25.12 SDK), for aarch64_cortex-a53
-# (covers qualcommax/ipq807x and mediatek/filogic routers) and x86_64.
+# Builds the frontend once, fans it into seven generic Go ABI binaries, then
+# packages those binaries with the OpenWrt 24.10 (.ipk) and 25.12 (.apk) SDKs.
 #
 # Triggered on v* tag pushes only: every release path (CLI, UI, workflow)
 # creates the tag, and the tag push is the one event that always fires
@@ -30,6 +29,8 @@ permissions:
 jobs:
   create-release:
     runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
       - name: Resolve release tag
@@ -51,8 +52,94 @@ jobs:
           # ANTES (antes se creaba a mano y el primer job en llegar moría 404).
           gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --generate-notes
 
+  frontend:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      - name: Build frontend once
+        working-directory: app
+        run: npm ci && npm run build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: internal/server/dist/
+          if-no-files-found: error
+
+  binaries:
+    needs: [create-release, frontend]
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - linux-amd64
+          - linux-arm64
+          - linux-armv7
+          - linux-armv6
+          - linux-armv5
+          - linux-mipsle
+          - linux-mips
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: internal/server/dist
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: true
+      - name: Build ${{ matrix.target }}
+        env:
+          VERSION: ${{ needs.create-release.outputs.tag }}
+        run: sh deploy/build-binaries.sh "${{ matrix.target }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: netgrip-binary-${{ matrix.target }}
+          path: dist/netgrip-${{ matrix.target }}
+          if-no-files-found: error
+      - name: Upload binary to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.create-release.outputs.tag }}
+        run: gh release upload "$TAG" "dist/netgrip-${{ matrix.target }}" --clobber
+
+  size-report:
+    needs: [frontend, binaries]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: netgrip-binary-*
+          path: binaries
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend
+      - name: Write size report
+        run: |
+          frontend_bytes=$(find frontend -type f -printf '%s\n' | awk '{ total += $1 } END { print total + 0 }')
+          human() { numfmt --to=iec --suffix=B "$1"; }
+          {
+            echo "## Release size report"
+            echo
+            echo "| Asset | Go/server | Frontend | Total |"
+            echo "| --- | ---: | ---: | ---: |"
+            for binary in binaries/netgrip-linux-*; do
+              total_bytes=$(stat -c %s "$binary")
+              core_bytes=$((total_bytes - frontend_bytes))
+              echo "| $(basename "$binary") | $(human "$core_bytes") | $(human "$frontend_bytes") | $(human "$total_bytes") |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
   package:
-    needs: create-release
+    needs: [create-release, binaries]
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -61,96 +148,84 @@ jobs:
           - sdk-version: 24.10.5
             sdk-target: qualcommax/ipq807x
             format: ipk
-            arch: arm64
-            goarch: arm64
+            binary: linux-arm64
             pkgarch: aarch64_cortex-a53
-            upload-binary: false
           - sdk-version: 25.12.5
             sdk-target: qualcommax/ipq807x
             format: apk
-            arch: arm64
-            goarch: arm64
-            upload-binary: true
+            binary: linux-arm64
+            pkgarch: aarch64_cortex-a53
           - sdk-version: 24.10.5
             sdk-target: x86/64
             format: ipk
-            arch: amd64
-            goarch: amd64
+            binary: linux-amd64
             pkgarch: x86_64
-            upload-binary: false
           - sdk-version: 25.12.5
             sdk-target: x86/64
             format: apk
-            arch: amd64
-            goarch: amd64
-            upload-binary: true
+            binary: linux-amd64
+            pkgarch: x86_64
           - sdk-version: 24.10.5
             sdk-target: ramips/mt7621
             format: ipk
-            arch: mipsle
-            goarch: mipsle
+            binary: linux-mipsle
             pkgarch: mipsel_24kc
-            upload-binary: true
+          - sdk-version: 25.12.5
+            sdk-target: ramips/mt7621
+            format: apk
+            binary: linux-mipsle
+            pkgarch: mipsel_24kc
+          - sdk-version: 24.10.5
+            sdk-target: ath79/generic
+            format: ipk
+            binary: linux-mips
+            pkgarch: mips_24kc
+          - sdk-version: 25.12.5
+            sdk-target: ath79/generic
+            format: apk
+            binary: linux-mips
+            pkgarch: mips_24kc
           - sdk-version: 24.10.5
             sdk-target: ipq40xx/generic
             format: ipk
-            arch: armv7
-            goarch: arm
+            binary: linux-armv7
             pkgarch: arm_cortex-a7_neon-vfpv4
-            upload-binary: true
           - sdk-version: 25.12.5
             sdk-target: ipq40xx/generic
             format: apk
-            arch: armv7
-            goarch: arm
+            binary: linux-armv7
             pkgarch: arm_cortex-a7_neon-vfpv4
-            upload-binary: false
+          - sdk-version: 24.10.5
+            sdk-target: bcm27xx/bcm2708
+            format: ipk
+            binary: linux-armv6
+            pkgarch: arm_arm1176jzf-s_vfp
+          - sdk-version: 25.12.5
+            sdk-target: bcm27xx/bcm2708
+            format: apk
+            binary: linux-armv6
+            pkgarch: arm_arm1176jzf-s_vfp
+          - sdk-version: 24.10.5
+            sdk-target: kirkwood/generic
+            format: ipk
+            binary: linux-armv5
+            pkgarch: arm_xscale
+          - sdk-version: 25.12.5
+            sdk-target: kirkwood/generic
+            format: apk
+            binary: linux-armv5
+            pkgarch: arm_xscale
 
     steps:
       - uses: actions/checkout@v4
-
-      - name: Resolve release tag
-        id: tag
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "tag=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
-          elif [ "${{ github.event_name }}" = "push" ]; then
-            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "tag=${{ github.release.tag_name }}" >> "$GITHUB_OUTPUT"
-          fi
-
-      - uses: actions/setup-node@v4
+      - uses: actions/download-artifact@v4
         with:
-          node-version: 24
-
-      - name: Build frontend
-        run: npm ci && npm run build
-        working-directory: app
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version: stable
-
-      - name: Cross-compile netgrip (${{ matrix.arch }})
-        env:
-          TAG: ${{ steps.tag.outputs.tag }}
-        run: |
-          # armv7 (ipq40xx) needs GOARM=7; mips needs soft-float. Other arches
-          # ignore both (GOMIPS only affects mips, GOARM only arm).
-          if [ "${{ matrix.goarch }}" = "arm" ]; then
-            export GOARM=7
-          else
-            export GOMIPS=softfloat
-          fi
-          GOOS=linux GOARCH=${{ matrix.goarch }} CGO_ENABLED=0 go build \
-            -ldflags "-s -w -X main.version=${TAG}" -o /tmp/netgrip ./cmd/netgrip
-          ls -la /tmp/netgrip
-          file /tmp/netgrip
+          name: netgrip-binary-${{ matrix.binary }}
+          path: /tmp/netgrip-binary
 
       - name: Package ${{ matrix.format }} (SDK ${{ matrix.sdk-version }})
         env:
-          TAG: ${{ steps.tag.outputs.tag }}
+          TAG: ${{ needs.create-release.outputs.tag }}
           PKG_ARCH: ${{ matrix.pkgarch }}
         run: |
           chmod +x deploy/openwrt/package.sh
@@ -161,33 +236,27 @@ jobs:
             "${{ matrix.sdk-target }}" \
             "" \
             "${{ matrix.format }}" \
-            /tmp/netgrip
+            "/tmp/netgrip-binary/netgrip-${{ matrix.binary }}"
 
       - name: Upload to release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ steps.tag.outputs.tag }}
+          TAG: ${{ needs.create-release.outputs.tag }}
         run: |
           echo "Packages generated:"
           ls -la dist/packages/
-          # Rename APK to include arch to avoid clobber between arm64 and amd64
+          # The SDK selects the exact package architecture; the release suffix
+          # identifies the generic Go ABI binary carried by the package.
           for apk in dist/packages/*.apk; do
             [ -f "$apk" ] || continue
             base="$(basename "$apk" .apk)"
-            newname="${base}-${{ matrix.arch }}.apk"
+            asset_arch="${{ matrix.binary }}"
+            asset_arch="${asset_arch#linux-}"
+            newname="${base}-${asset_arch}.apk"
             mv "$apk" "dist/packages/$newname"
             echo "Renamed: $newname"
           done
           gh release upload "$TAG" dist/packages/*.${{ matrix.format }} --clobber
-          # Binary artifact for manual deploys; the OpenWrt package is
-          # still the recommended install path because it survives sysupgrade.
-          # Only ONE job per arch uploads it: apk and ipk jobs of the same
-          # arch would race the upload and the loser dies with 422 even
-          # with --clobber (check-then-put is not atomic).
-          if [ "${{ matrix.upload-binary }}" = "true" ]; then
-            cp /tmp/netgrip /tmp/netgrip-linux-${{ matrix.arch }}
-            gh release upload "$TAG" /tmp/netgrip-linux-${{ matrix.arch }} --clobber
-          fi
 
   package-luci:
     needs: create-release
@@ -199,45 +268,16 @@ jobs:
           - sdk-version: 24.10.5
             sdk-target: qualcommax/ipq807x
             format: ipk
-            arch: arm64
           - sdk-version: 25.12.5
             sdk-target: qualcommax/ipq807x
             format: apk
-            arch: arm64
-          - sdk-version: 24.10.5
-            sdk-target: x86/64
-            format: ipk
-            arch: amd64
-          - sdk-version: 25.12.5
-            sdk-target: x86/64
-            format: apk
-            arch: amd64
-          - sdk-version: 24.10.5
-            sdk-target: ipq40xx/generic
-            format: ipk
-            arch: armv7
-          - sdk-version: 25.12.5
-            sdk-target: ipq40xx/generic
-            format: apk
-            arch: armv7
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Resolve release tag
-        id: tag
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "tag=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
-          elif [ "${{ github.event_name }}" = "push" ]; then
-            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "tag=${{ github.event.release.tag_name }}" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Package luci-app ${{ matrix.format }} (SDK ${{ matrix.sdk-version }})
         env:
-          TAG: ${{ steps.tag.outputs.tag }}
+          TAG: ${{ needs.create-release.outputs.tag }}
         run: |
           chmod +x deploy/openwrt/package-luci.sh
           export PKG_VERSION="${TAG#v}"
@@ -251,28 +291,10 @@ jobs:
       - name: Upload to release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ steps.tag.outputs.tag }}
+          TAG: ${{ needs.create-release.outputs.tag }}
         run: |
           echo "LuCI packages generated:"
           ls -la dist/packages/
-          # The luci-app ipk is arch-all: every 24.10 leg would upload the
-          # same filename concurrently and race on the release assets.
-          # Upload it once, from the arm64 leg (#214); the other ipk legs
-          # (x86_64, mipsel, armv7) skip.
-          if [ "${{ matrix.format }}" = "ipk" ] && [ "${{ matrix.arch }}" != "arm64" ]; then
-            echo "luci ipk is arch-all; already uploaded by the arm64 leg, skipping."
-            exit 0
-          fi
-          # luci-app is arch-all, but multiple matrix jobs would otherwise upload
-          # the same filename; include the target arch to avoid collisions.
-          for pkg in dist/packages/*.apk; do
-            [ -f "$pkg" ] || continue
-            base="$(basename "$pkg" .apk)"
-            arch="${{ matrix.arch }}"
-            newname="${base}-${arch}.apk"
-            mv "$pkg" "dist/packages/$newname"
-            echo "Renamed: $newname"
-          done
           gh release upload "$TAG" dist/packages/*.${{ matrix.format }} --clobber
 
   apk-feed:
@@ -368,4 +390,3 @@ jobs:
           publish_dir: ./feed
           publish_branch: gh-pages
           force_push: true
-

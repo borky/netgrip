@@ -1,7 +1,8 @@
 #!/bin/bash
 # package-luci.sh builds luci-app-netgrip as .ipk or .apk using the SDK.
 # The package is files-only (PKGARCH all), so one artifact serves every
-# aarch64 router. The .apk is built with the REAL apk mkpkg from the SDK
+# router for a given package format. The .apk is built with the REAL apk
+# mkpkg from the SDK
 # (an .ipk renamed to .apk does NOT install on apk v3).
 #
 # Usage:

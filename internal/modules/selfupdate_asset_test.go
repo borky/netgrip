@@ -38,6 +38,15 @@ const releaseWithAsset = `{"tag_name":"v9.9.9","body":"release notes","assets":[
 	`{"name":"netgrip-linux-arm64","browser_download_url":"http://example.com/netgrip-linux-arm64","size":1234},` +
 	`{"name":"netgrip-linux-amd64","browser_download_url":"http://example.com/netgrip-linux-amd64","size":1234}]}`
 
+func TestBinaryAssetNameUsesReleaseArchitecture(t *testing.T) {
+	original := releaseArch
+	releaseArch = "armv5"
+	t.Cleanup(func() { releaseArch = original })
+	if got := binaryAssetName(); got != "netgrip-linux-armv5" {
+		t.Fatalf("binaryAssetName = %q, want netgrip-linux-armv5", got)
+	}
+}
+
 func stubUpdater(t *testing.T) (*atomic.Bool, *[]string) {
 	t.Helper()
 	called := &atomic.Bool{}

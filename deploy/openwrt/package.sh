@@ -6,15 +6,15 @@
 #   package.sh <SDK_VERSION> <SDK_TARGET> <SDK_SUBTARGET> <FORMAT> <BINARY_PATH>
 #
 #   SDK_VERSION:   24.10.5 or 25.12.5
-#   SDK_TARGET:    mediatek/filogic or qualcommax/ipq807x
+#   SDK_TARGET:    an OpenWrt target/subtarget, e.g. mediatek/filogic
 #   SDK_SUBTARGET: (empty, kept for CLI compatibility)
 #   FORMAT:        ipk or apk
-#   BINARY_PATH:   path to the prebuilt netgrip binary (arm64)
+#   BINARY_PATH:   path to the matching generic Go ABI binary
 #
 # PKG_VERSION / PKG_RELEASE can be overridden through env vars (CI uses the
 # release tag). PKG_ARCH sets the ipk architecture field (defaults to the
-# aarch64_cortex-a53 of the qualcommax/mediatek targets; x86/64 builds must
-# pass x86_64 or the ipk gets misnamed and clobbers the arm64 one, #214).
+# aarch64_cortex-a53 of the qualcommax/mediatek targets. Other IPK builds
+# must pass their exact package architecture or the artifact is mislabeled.
 #
 # Example:
 #   package.sh 25.12.5 qualcommax/ipq807x "" apk ./netgrip-arm64

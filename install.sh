@@ -25,43 +25,41 @@ die() { code=$1; shift; say "ERROR: $*" >&2; exit "$code"; }
 
 [ "$(id -u)" = 0 ] || die 1 "run as root on the router (ssh root@<router>)"
 
-# ------------------------------------------------------------------ arch --
-case "$(uname -m)" in
-  aarch64|arm64)
-    ASSET_ARCH=arm64
-    IPK_ARCH=aarch64_cortex-a53
-    ;;
-  x86_64|amd64)
-    ASSET_ARCH=amd64
-    IPK_ARCH=x86_64
-    ;;
-  armv7l|armv7)
-    ASSET_ARCH=armv7
-    IPK_ARCH=arm_cortex-a7_neon-vfpv4
-    ;;
-  mips)
-    # uname -m is "mips" on both endiannesses; ask opkg which flavor this
-    # router actually runs (there are no apk-only mips targets yet).
-    if command -v opkg >/dev/null 2>&1 && opkg print-architecture 2>/dev/null | grep -q '^arch mipsel'; then
-      ASSET_ARCH=mipsle
-      IPK_ARCH=mipsel_24kc
-    else
-      die 3 "unsupported architecture: mips big-endian (assets exist for aarch64, x86_64, armv7 and mipsel)"
-    fi
-    ;;
-  *)
-    die 3 "unsupported architecture: $(uname -m) (assets exist for aarch64, x86_64, armv7 and mipsel)"
-    ;;
-esac
-
 # ---------------------------------------------------------- pkg manager --
 if command -v apk >/dev/null 2>&1; then
   PKGR=apk
+  PKG_ARCH=$(apk --print-arch 2>/dev/null || true)
 elif command -v opkg >/dev/null 2>&1; then
   PKGR=opkg
+  # Select the installable native architecture with the highest priority.
+  PKG_ARCH=$(opkg print-architecture 2>/dev/null | awk '
+    tolower($1) == "arch" && $2 != "all" && $2 != "noarch" {
+      priority = $3 + 0
+      if (!found || priority >= best) { arch = $2; best = priority; found = 1 }
+    }
+    END { print arch }
+  ')
 else
   die 3 "neither apk nor opkg found (OpenWrt 24.10 or newer required)"
 fi
+[ -n "$PKG_ARCH" ] || die 3 "could not determine the native package architecture"
+
+# ----------------------------------------------------------- Go ABI arch --
+# Package architectures are target-specific; release binaries use the much
+# smaller set of Go ABI families. Packages retain the exact package architecture
+# so several packages can reuse one generic release binary without collisions.
+case "$PKG_ARCH" in
+  x86_64) ASSET_ARCH=amd64 ;;
+  aarch64|aarch64_*) ASSET_ARCH=arm64 ;;
+  arm_arm926ej-s*|arm_xscale*|arm_fa526*) ASSET_ARCH=armv5 ;;
+  arm_arm1176jzf-s*|arm_mpcore*) ASSET_ARCH=armv6 ;;
+  armv7|arm_cortex-*|arm_*) ASSET_ARCH=armv7 ;;
+  mipsel|mipsel_*) ASSET_ARCH=mipsle ;;
+  mips|mips_*) ASSET_ARCH=mips ;;
+  *)
+    die 3 "unsupported package architecture: $PKG_ARCH"
+    ;;
+esac
 
 # -------------------------------------------------------------- download --
 fetch() {
@@ -107,7 +105,7 @@ if [ -z "$VERSION" ]; then
     *) die 4 "could not resolve the latest release tag; set NETGRIP_VERSION=vX.Y.Z" ;;
   esac
 fi
-say "installing netgrip $VERSION ($ASSET_ARCH, $PKGR)"
+say "installing netgrip $VERSION ($PKG_ARCH -> $ASSET_ARCH, $PKGR)"
 
 # --------------------------------------------------------------- package --
 VER_NUM=${VERSION#v}
@@ -117,7 +115,7 @@ fi
 if [ "$PKGR" = apk ]; then
   ASSET="netgrip-${VER_NUM}-r1-${ASSET_ARCH}.apk"
 else
-  ASSET="netgrip_${VER_NUM}-1_${IPK_ARCH}.ipk"
+  ASSET="netgrip_${VER_NUM}-1_${PKG_ARCH}.ipk"
 fi
 URL="${ASSET_BASE%/}/${ASSET}"
 

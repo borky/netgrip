@@ -129,10 +129,11 @@ red local. No se publica nada hasta que lo actives.
 
 ## Ponlo en tu router
 
-Requisitos: un router ARM (`aarch64_cortex-a53`, cubre MediaTek
-filogic y Qualcomm ipq807x; u `arm_cortex-a7_neon-vfpv4`, cubre
-Qualcomm ipq40xx) o x86_64, con OpenWrt 24.10 o 25.12. El panel
-escucha en el puerto 8090 y entra con tus credenciales de LuCI.
+Requisitos: un target amd64, ARM64, ARMv5/6/7, MIPS little-endian o MIPS
+big-endian compatible, con OpenWrt 24.10 o 25.12. El instalador consulta al
+gestor de paquetes la arquitectura exacta del router y elige el paquete y ABI
+Go genérico correspondientes. El panel escucha en el puerto 8090 y entra con
+tus credenciales de LuCI.
 
 SSH al router y ejecuta:
 
@@ -157,10 +158,10 @@ Descarga el paquete correcto desde la página de
 router:
 
 ```sh
-# OpenWrt 25.12 (apk)
+# OpenWrt 25.12 (apk; el sufijo es la arquitectura genérica del binario)
 apk add netgrip-<version>-r1-arm64.apk
 
-# OpenWrt 24.10 (ipk)
+# OpenWrt 24.10 (ipk; el sufijo es la arquitectura exacta del paquete)
 opkg install netgrip_<version>-1_aarch64_cortex-a53.ipk
 
 /etc/init.d/netgrip enable && /etc/init.d/netgrip start
@@ -190,9 +191,13 @@ Compilar desde fuente requiere Go 1.24+ y Node 22+:
 ```sh
 git clone https://github.com/gnacho/netgrip.git
 cd netgrip
-cd app && npm ci && cd ..
-CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o netgrip ./cmd/netgrip
+cd app && npm ci && npm run build && cd ..
+VERSION=dev sh deploy/build-binaries.sh
 ```
+
+Ese comando compila el frontend una vez y genera binarios genéricos para amd64,
+ARM64, ARMv5/6/7, mipsle y mips en `dist/`. Puedes pasar uno o más targets,
+como `linux-armv7` o `linux-mipsle`, para compilar solo esos binarios.
 
 </details>
 
@@ -231,8 +236,8 @@ Toda escritura exige cookie de sesión.
 ## Qué viene
 
 Reciente: análisis de tráfico por aplicación con timeline, límites de ancho
-de banda por dispositivo sobre nftables y soporte mipsle para hardware
-antiguo. Lo siguiente: un feed de paquetes propio para que owut/ASU conserve
+de banda por dispositivo sobre nftables y soporte de release ampliado para
+ARM y MIPS. Lo siguiente: un feed de paquetes propio para que owut/ASU conserve
 NetGrip dentro de tu imagen de firmware
 ([#63](https://github.com/gnacho/netgrip/issues/63)) y mantener la demo
 pública al día del panel. Las ideas y reportes en los
@@ -250,8 +255,10 @@ go build -o netgrip ./cmd/netgrip
 go test ./...
 ```
 
-El CI compila el frontend, cross-compila y empaqueta `.apk`/`.ipk` con el
-SDK de OpenWrt en cada tag de release.
+En cada tag de release, el CI compila y precomprime el frontend una sola vez,
+cross-compila siete binarios para ABI Go genéricos y los distribuye en paquetes
+`.apk`/`.ipk` específicos de cada target mediante el SDK de OpenWrt. El resumen
+de la release muestra el tamaño de cada binario y del frontend comprimido.
 
 ## Licencia
 

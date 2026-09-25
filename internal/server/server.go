@@ -1,11 +1,16 @@
 package server
 
 import (
+	"bytes"
+	"compress/gzip"
 	"embed"
 	"encoding/json"
+	"io"
 	"io/fs"
 	"log"
+	"mime"
 	"net/http"
+	"path"
 	"strings"
 	"sync"
 	"time"
@@ -284,6 +289,9 @@ func (s *Server) handleSPA(w http.ResponseWriter, r *http.Request) {
 			http.FileServer(http.FS(dist)).ServeHTTP(w, r)
 			return
 		}
+		if serveCompressedAsset(w, r, dist, path) {
+			return
+		}
 	}
 	data, err := fs.ReadFile(dist, "index.html")
 	if err != nil {
@@ -297,6 +305,48 @@ func (s *Server) handleSPA(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache, must-revalidate")
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Write(data)
+}
+
+func serveCompressedAsset(w http.ResponseWriter, r *http.Request, files fs.FS, name string) bool {
+	compressed, err := fs.ReadFile(files, name+".gz")
+	if err != nil {
+		return false
+	}
+	if contentType := mime.TypeByExtension(path.Ext(name)); contentType != "" {
+		w.Header().Set("Content-Type", contentType)
+	}
+	w.Header().Set("Vary", "Accept-Encoding")
+	if strings.HasPrefix(name, "assets/") {
+		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	}
+	if acceptsGzip(r.Header.Get("Accept-Encoding")) {
+		w.Header().Set("Content-Encoding", "gzip")
+		_, _ = w.Write(compressed)
+		return true
+	}
+	reader, err := gzip.NewReader(bytes.NewReader(compressed))
+	if err != nil {
+		http.Error(w, "invalid embedded asset", http.StatusInternalServerError)
+		return true
+	}
+	defer reader.Close()
+	_, _ = io.Copy(w, reader)
+	return true
+}
+
+func acceptsGzip(header string) bool {
+	for _, value := range strings.Split(header, ",") {
+		parts := strings.Split(strings.TrimSpace(value), ";")
+		if strings.EqualFold(strings.TrimSpace(parts[0]), "gzip") {
+			for _, parameter := range parts[1:] {
+				if strings.TrimSpace(parameter) == "q=0" {
+					return false
+				}
+			}
+			return true
+		}
+	}
+	return false
 }
 
 type loginRequest struct {

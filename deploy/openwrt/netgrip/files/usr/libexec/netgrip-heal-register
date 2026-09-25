@@ -48,12 +48,18 @@ log "registry entry lost (running ${ver:-unknown}): restoring"
 # Resolve the release asset for this flavor and architecture.
 if command -v apk >/dev/null 2>&1; then
 	arch=$(apk --print-arch 2>/dev/null)
+	[ -n "$arch" ] || { log "cannot determine apk architecture"; exit 1; }
 	case "$arch" in
-		aarch64*) pattern='netgrip-[^/]*-arm64\.apk$' ;;
-		x86_64*) pattern='netgrip-[^/]*-amd64\.apk$' ;;
-		arm_cortex-a7*) pattern='netgrip-[^/]*-armv7\.apk$' ;;
+		x86_64|amd64) asset_arch=amd64 ;;
+		aarch64|aarch64_*|arm64) asset_arch=arm64 ;;
+		armv5|arm_arm926ej-s*|arm_xscale*|arm_fa526*) asset_arch=armv5 ;;
+		armv6|arm_arm1176jzf-s*|arm_mpcore*) asset_arch=armv6 ;;
+		armv7|arm_cortex-*|arm_*) asset_arch=armv7 ;;
+		mipsel|mipsel_*|mipsle) asset_arch=mipsle ;;
+		mips|mips_*) asset_arch=mips ;;
 		*) log "no release asset for apk arch $arch"; exit 1 ;;
 	esac
+	pattern="netgrip-[^/]*-${asset_arch}\\.apk$"
 	pkgfile=/tmp/netgrip-heal.apk
 else
 	# print-architecture lists pseudo-archs (all, noarch) first; the arch of
