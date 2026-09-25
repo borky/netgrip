@@ -19,6 +19,8 @@ type PushConfig struct {
 	ServerURL string `json:"server_url"`
 	RouterID  string `json:"router_id"`
 	Token     string `json:"token"`
+	// FORK: ServerFP pins an https ServerURL (NETPULSE_SERVER_FP format).
+	ServerFP string `json:"server_fp,omitempty"`
 }
 
 type PushResult struct {
@@ -81,7 +83,10 @@ func PushLatestSnapshot() PushResult {
 		req.Header.Set("Authorization", "Bearer "+cfg.Token)
 	}
 
-	client := &http.Client{Timeout: pushTimeout}
+	client, err := snapshotPushClient(cfg)
+	if err != nil {
+		return PushResult{Error: err.Error()}
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return PushResult{Error: fmt.Sprintf("push failed: %s", err)}
@@ -93,4 +98,26 @@ func PushLatestSnapshot() PushResult {
 	}
 
 	return PushResult{Ok: true, SnapshotID: latest.ID}
+}
+
+// snapshotPushClient is the client for the backup push. FORK: the upload
+// carries the executor token, which can change this router, so on https it
+// is pinned: to the push config's own fingerprint, else to the embedded
+// agent's when both address the same server. With no pin at all it checks
+// the server against the system's CAs, as before - right for a server with a
+// public certificate, and never an unverified connection.
+func snapshotPushClient(cfg PushConfig) (*http.Client, error) {
+	pins := cfg.ServerFP
+	if pins == "" {
+		if agent, err := ReadNetPulseConfig(prodNetPulsePaths().env); err == nil && sameNetPulseServer(agent.Server, cfg.ServerURL) {
+			pins = agent.ServerFP
+		}
+	}
+	if pins == "" || !strings.HasPrefix(cfg.ServerURL, "https://") {
+		return &http.Client{
+			Timeout:       pushTimeout,
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		}, nil
+	}
+	return netPulseClient(cfg.ServerURL, pins, pushTimeout)
 }
