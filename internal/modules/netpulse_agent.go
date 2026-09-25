@@ -77,6 +77,7 @@ type NetPulseInfo struct {
 	Configured           bool // server+slug+token presentes
 	Server               string
 	Slug                 string
+	ServerFP             string // FORK: the pin, shown so the admin can check it
 	Status               runtime.Status
 	Phase                string // connected | searching (no hay estado off)
 	Discovery            netPulseDiscoveryState
@@ -197,6 +198,7 @@ func NetPulseInfoNow() NetPulseInfo {
 		Enabled:              cfg.Enabled,
 		Configured:           cfg.Server != "" && cfg.Slug != "" && cfg.Token != "",
 		Server:               cfg.Server,
+		ServerFP:             cfg.ServerFP,
 		Slug:                 cfg.Slug,
 		Status:               st,
 		Phase:                netPulsePhaseOf(st),
@@ -285,9 +287,17 @@ func RestartNetPulseAgent() error {
 // setNetPulseConfigAt es SetNetPulseConfig con rutas inyectables (tests y
 // enrollment zero-touch sobre un env de prueba).
 func setNetPulseConfigAt(p netpulsePaths, cfg NetPulseConfig) error {
-	if cfg.Token == "" {
+	if cfg.Token == "" || cfg.ServerFP == "" {
 		if old, err := ReadNetPulseConfig(p.env); err == nil {
-			cfg.Token = old.Token
+			if cfg.Token == "" {
+				cfg.Token = old.Token
+			}
+			// FORK: kept like the token. A form that does not send it would
+			// otherwise erase the pin, and an agent on https would stop at
+			// its next start. Over plain http a pin is simply unused.
+			if cfg.ServerFP == "" {
+				cfg.ServerFP = old.ServerFP
+			}
 		}
 	}
 	if err := writeNetPulseEnv(p.env, cfg); err != nil {
@@ -546,7 +556,7 @@ func applyNetPulseAgent(p netpulsePaths) {
 		interval = runtime.DefaultInterval
 	}
 	log.Printf("netpulse: embedded agent starting (slug=%s server=%s interval=%s)", opts.Slug, opts.Server, interval)
-	go registerExecutorToken(cfg.Server, cfg.Slug, cfg.Token)
+	go registerExecutorToken(cfg.Server, cfg.ServerFP, cfg.Slug, cfg.Token)
 	go func() {
 		if err := runtime.Run(ctx, opts); err != nil {
 			log.Printf("netpulse: agent stopped: %v", err)

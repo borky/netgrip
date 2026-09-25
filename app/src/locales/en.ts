@@ -2308,6 +2308,8 @@ export default {
     slug: "Device slug",
     token: "Token",
     tokenSet: "Token stored; kept if left empty",
+    serverFp: "Server fingerprint",
+    serverFpHint: "For an https server: the agent pin shown in NetPulse under Settings > HTTPS. Kept if left empty.",
     save: "Save",
     saved: "Configuration saved",
     restartAgent: "Restart agent",

@@ -2308,6 +2308,8 @@ export default {
     slug: "Slug del equipo",
     token: "Token",
     tokenSet: "Token guardado; se conserva si lo dejas vacío",
+    serverFp: "Huella del servidor",
+    serverFpHint: "Para un servidor https: el pin para agentes que muestra NetPulse en Ajustes > HTTPS. Se conserva si se deja vacío.",
     save: "Guardar",
     saved: "Configuración guardada",
     restartAgent: "Reiniciar agente",

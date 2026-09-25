@@ -22,6 +22,7 @@ import (
 	"github.com/gnacho/netgrip/internal/executor"
 	"github.com/gnacho/netgrip/internal/modules"
 	"github.com/gnacho/netgrip/internal/ubus"
+	"github.com/gnacho/netpulse/agent/runtime"
 )
 
 //go:embed all:dist
@@ -2802,6 +2803,7 @@ func netPulseState() map[string]any {
 		"enabled":    info.Enabled,
 		"configured": info.Configured,
 		"server":     info.Server,
+		"serverFp":   info.ServerFP,
 		"slug":       info.Slug,
 		"phase":      info.Phase,
 		"discovery": map[string]any{
@@ -2852,6 +2854,13 @@ func (s *Server) handleNetPulseSet(w http.ResponseWriter, r *http.Request) {
 	if req.Token == "" && req.Enabled {
 		if old, err := modules.ReadNetPulseConfig("/etc/netgrip/netpulse.env"); err != nil || old.Token == "" {
 			writeError(w, http.StatusBadRequest, "token required")
+			return
+		}
+	}
+	// FORK: a malformed pin would only fail when the agent starts.
+	if req.ServerFP != "" {
+		if err := runtime.ValidatePins(req.ServerFP); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 	}

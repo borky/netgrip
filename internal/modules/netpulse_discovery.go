@@ -51,6 +51,12 @@ type netPulseDiscoveryResult struct {
 	URL          string `json:"url"`
 	Autoenroll   bool   `json:"autoenroll"`
 	PairingToken string `json:"pairing_token"`
+	// FORK: with HTTPS on, where to reach it and the key to pin. Nothing in
+	// a UDP reply is authenticated: these are only as trustworthy as
+	// whoever answered, but pairing over them keeps the tokens out of view
+	// of anyone merely listening, which plain http does not.
+	URLHTTPS string `json:"url_https"`
+	ServerFP string `json:"server_fp"`
 }
 
 // netPulseDiscoveryState expone el último hallazgo para la UI/API.
@@ -68,7 +74,7 @@ var (
 	npStartedAt time.Time
 	// inyectables en tests
 	npProbe  func(port int, timeout time.Duration) *netPulseDiscoveryResult = probeNetPulseServers
-	npEnroll func(p netpulsePaths, server, pairingToken string) error       = enrollNetPulse
+	npEnroll func(p netpulsePaths, server, pin, pairingToken string) error  = enrollNetPulse
 )
 
 var netPulseSlugStrip = regexp.MustCompile(`[^a-z0-9-]+`)
@@ -239,8 +245,20 @@ func netPulseTryDiscovery(p netpulsePaths) {
 		cfg = NetPulseConfig{}
 	}
 	complete := cfg.Server != "" && cfg.Slug != "" && cfg.Token != ""
-	if complete && strings.TrimRight(cfg.Server, "/") == strings.TrimRight(res.URL, "/") {
+	if complete && (sameNetPulseServer(cfg.Server, res.URL) || sameNetPulseServer(cfg.Server, res.URLHTTPS)) {
 		return // mismo server configurado: el agente reintentará el push
+	}
+	// FORK: an agent pinned to an https server is never moved by a UDP
+	// reply, however long its server has been silent: the stale-server
+	// fallback below would hand it to whoever answers the probe, pin and
+	// all. Changing a pin needs something authenticated.
+	if complete && cfg.ServerFP != "" && strings.HasPrefix(cfg.Server, "https://") {
+		return
+	}
+	// FORK: enrol over https when the server offers it.
+	target, pin := res.URL, ""
+	if res.URLHTTPS != "" && res.ServerFP != "" {
+		target, pin = res.URLHTTPS, res.ServerFP
 	}
 	if complete {
 		// Server configurado distinto del descubierto: solo se cambia si
@@ -270,7 +288,7 @@ func netPulseTryDiscovery(p netpulsePaths) {
 			npEnrolling = false
 			npDiscMu.Unlock()
 		}()
-		err := npEnroll(p, res.URL, res.PairingToken)
+		err := npEnroll(p, target, pin, res.PairingToken)
 		npDiscMu.Lock()
 		npDisc.LastEnrollAt = time.Now()
 		if err != nil {
@@ -280,7 +298,7 @@ func netPulseTryDiscovery(p netpulsePaths) {
 		}
 		npDiscMu.Unlock()
 		if err != nil {
-			log.Printf("netpulse: enrollment contra %s falló: %v", res.URL, err)
+			log.Printf("netpulse: enrollment contra %s falló: %v", target, err)
 		}
 	}()
 }
@@ -288,8 +306,18 @@ func netPulseTryDiscovery(p netpulsePaths) {
 // enrollNetPulse: pairing contra el server descubierto con slug derivado
 // del hostname y reintentos con sufijo si el slug está ocupado. Al conseguir
 // token persiste la config completa (conserva interval/targets previos).
-func enrollNetPulse(p netpulsePaths, server, pairingToken string) error {
+//
+// FORK: pin, for an https server, is the key to pin - from the discovery
+// reply, so trusted on first use, and logged as such.
+func enrollNetPulse(p netpulsePaths, server, pin, pairingToken string) error {
 	server = strings.TrimRight(strings.TrimSpace(server), "/")
+	hc, err := netPulseClient(server, pin, 10*time.Second)
+	if err != nil {
+		return err
+	}
+	if pin != "" {
+		log.Printf("netpulse: enrolling over https, pinning %s as the discovery reply gave it (not authenticated)", pin)
+	}
 	base := netPulseSanitizeSlug(netPulseHostname())
 	var lastErr error
 	for i := 0; i < netPulseSlugAttempts; i++ {
@@ -303,7 +331,6 @@ func enrollNetPulse(p netpulsePaths, server, pairingToken string) error {
 			return err
 		}
 		req.Header.Set("Content-Type", "application/json")
-		hc := &http.Client{Timeout: 10 * time.Second}
 		res, err := hc.Do(req)
 		if err != nil {
 			return err
@@ -321,11 +348,19 @@ func enrollNetPulse(p netpulsePaths, server, pairingToken string) error {
 				return fmt.Errorf("respuesta de pairing inválida: %s", strings.TrimSpace(string(data)))
 			}
 			old, _ := ReadNetPulseConfig(p.env)
+			// FORK: the pin is the one this connection verified. The reply's
+			// own server_fp came over the same connection - over plain http,
+			// anyone could have put it there, and it would become the pin
+			// the day the URL moved to https.
+			fp := ""
+			if strings.HasPrefix(server, "https://") {
+				fp = pin
+			}
 			cfg := NetPulseConfig{
 				Server:        server,
 				Slug:          pr.Slug,
 				Token:         pr.Token,
-				ServerFP:      pr.ServerFP,
+				ServerFP:      fp,
 				Interval:      old.Interval,
 				WanTarget:     old.WanTarget,
 				GwTarget:      old.GwTarget,
