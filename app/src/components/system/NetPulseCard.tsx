@@ -19,6 +19,8 @@ export function NetPulseCard({ index = 0 }: { index?: number }) {
   const [server, setServer] = useState("");
   const [slug, setSlug] = useState("");
   const [token, setToken] = useState("");
+  // FORK: the pin for an https server (NETPULSE_SERVER_FP).
+  const [serverFp, setServerFp] = useState("");
   const [enabled, setEnabled] = useState(false);
   const [saving, setSaving] = useState(false);
   const [restarting, setRestarting] = useState(false);
@@ -29,6 +31,7 @@ export function NetPulseCard({ index = 0 }: { index?: number }) {
       setState(s);
       setServer((prev) => (prev === "" ? s.server : prev));
       setSlug((prev) => (prev === "" ? s.slug : prev));
+      setServerFp((prev) => (prev === "" ? s.serverFp ?? "" : prev));
       setEnabled(s.enabled);
     }).catch(() => {});
   };
@@ -44,7 +47,7 @@ export function NetPulseCard({ index = 0 }: { index?: number }) {
   const save = async () => {
     setSaving(true);
     try {
-      const s = await api.setNetPulse({ server, slug, token, enabled });
+      const s = await api.setNetPulse({ server, slug, token, enabled, ...(serverFp.trim() ? { serverFp: serverFp.trim() } : {}) });
       setState(s);
       setToken("");
       push({ tone: "ok", text: t("netpulse.saved") });
@@ -89,6 +92,18 @@ export function NetPulseCard({ index = 0 }: { index?: number }) {
           }}
         />
       </div>
+      {server.trim().startsWith("https://") && (
+        <div className="mt-3">
+          <Field
+            label={t("netpulse.serverFp")}
+            hint={t("netpulse.serverFpHint")}
+            inputProps={{
+              mono: true, value: serverFp, placeholder: "sha256 (64 hex)",
+              onChange: (e) => setServerFp(e.target.value),
+            }}
+          />
+        </div>
+      )}
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mt-3">
         <Field
           label={t("netpulse.token")}
