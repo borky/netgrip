@@ -238,11 +238,10 @@ Toda escritura exige cookie de sesión.
 
 ## Qué viene
 
-Reciente: integración con Home Assistant sobre MQTT (llegada en v0.72.20),
-ahora con prueba de conexión en la tarjeta MQTT y configuración del broker
-enviada desde un servidor de NetPulse; interfaz bilingüe cuyo idioma del
-documento sigue al idioma activo; y soporte de release ampliado para ARM y
-MIPS. Lo siguiente: un feed de paquetes propio para que owut/ASU conserve
+Reciente: integración con Home Assistant sobre MQTT (estado, sensores e
+interruptores/botones que actúan, descubiertos automáticamente), siete ABI
+Go genéricos por release de amd64 a MIPS, e interfaz bilingüe cuyo idioma
+del documento sigue al idioma activo. Lo siguiente: un feed de paquetes propio para que owut/ASU conserve
 NetGrip dentro de tu imagen de firmware
 ([#63](https://github.com/gnacho/netgrip/issues/63)) y mantener la demo
 pública al día del panel. Las ideas y reportes en los
