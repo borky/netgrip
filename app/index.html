@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="es">
+<html lang="en">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -14,6 +14,12 @@
           if (dark) document.documentElement.classList.add("dark");
           var d = localStorage.getItem("netgrip:density");
           document.documentElement.dataset.density = d === "compact" ? "compact" : "comfortable";
+          // Language before the first paint, for the same reason as the
+          // theme: the static attribute is only the fallback, and the
+          // browser may read it before i18next starts. Same detection as
+          // i18n.ts: what was chosen, else the browser's.
+          var l = localStorage.getItem("netgrip-lang") || navigator.language || "";
+          document.documentElement.lang = l.slice(0, 2).toLowerCase() === "es" ? "es" : "en";
         } catch (e) { /* sin tema */ }
       })();
     </script>
