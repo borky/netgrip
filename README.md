@@ -234,9 +234,10 @@ shape. Every write requires a session cookie.
 
 ## What's next
 
-Done recently: Home Assistant integration over MQTT (state, sensors and
-switches/buttons that act, discovered automatically), per-device bandwidth
-limits over nftables, and broader ARM and MIPS release support. Coming next:
+Done recently: Home Assistant integration over MQTT (shipped in v0.72.20),
+now with a connection test on the MQTT card and broker settings pushed from a
+NetPulse server; a bilingual UI whose document language follows the active
+language; and broader ARM and MIPS release support. Coming next:
 a custom packages feed so owut/ASU can keep NetGrip
 inside your firmware image ([#63](https://github.com/gnacho/netgrip/issues/63)),
 and keeping the public demo in step with the panel. Ideas and reports in the
