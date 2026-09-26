@@ -646,14 +646,11 @@ func ProbeMultiWAN() *MultiWanProbe {
 		// cost the best part of a second between them on this class of
 		// hardware, which is a lot to spend every time somebody opens the
 		// page - and they only report what is derived here anyway.
-		if _, online, ok := mwanLiveState(); ok {
-			for name := range cfg.Ifaces {
-				state := "offline"
-				if online[name] {
-					state = "online"
-				}
-				live[name] = mwanLive{Online: state, Tracking: "active"}
+		if _, states, ok := mwanLiveState(); ok {
+			for name, iface := range cfg.Ifaces {
+				live[name] = mwanLiveOf(name, iface, states)
 			}
+			online := mwanOnline(states)
 			if active := pickMwanActive(cfg, online); active != "" {
 				policy = policyOfActiveRule(cfg)
 				shares = mwanShares(cfg, online)
@@ -1157,12 +1154,12 @@ func MwanActiveUplink() string {
 		return mwanActive.name
 	}
 	mwanActive.at = time.Now()
-	cfg, online, ok := mwanLiveState()
+	cfg, states, ok := mwanLiveState()
 	if !ok {
 		mwanActive.name = ""
 		return ""
 	}
-	mwanActive.name = pickMwanActive(cfg, online)
+	mwanActive.name = pickMwanActive(cfg, mwanOnline(states))
 	return mwanActive.name
 }
 
@@ -1171,7 +1168,11 @@ func MwanActiveUplink() string {
 // word per file under its run directory. Everything else mwan3 can tell us
 // costs a shell script and the best part of a second — measured, on the
 // class of hardware this runs on — so nothing on a polled path uses it.
-func mwanLiveState() (mwanConfig, map[string]bool, bool) {
+//
+// The states map holds each state file's word as mwan3 wrote it (online,
+// offline, connecting, ...). An interface mwan3 is not tracking - disabled in
+// its config, or not started - has no file and no entry.
+func mwanLiveState() (mwanConfig, map[string]string, bool) {
 	if _, err := os.Stat(mwanStateDir); err != nil {
 		return mwanConfig{}, nil, false
 	}
@@ -1183,14 +1184,42 @@ func mwanLiveState() (mwanConfig, map[string]bool, bool) {
 	if err != nil {
 		return mwanConfig{}, nil, false
 	}
-	online := map[string]bool{}
+	states := map[string]string{}
 	for _, e := range entries {
 		b, err := os.ReadFile(mwanStateDir + "/" + e.Name())
-		if err == nil && strings.TrimSpace(string(b)) == "online" {
-			online[e.Name()] = true
+		if err != nil {
+			continue
+		}
+		if st := strings.TrimSpace(string(b)); st != "" {
+			states[e.Name()] = st
 		}
 	}
-	return readMwanConfig(string(show)), online, true
+	return readMwanConfig(string(show)), states, true
+}
+
+// mwanOnline is the set of interfaces the tracker has online.
+func mwanOnline(states map[string]string) map[string]bool {
+	online := map[string]bool{}
+	for name, st := range states {
+		if st == "online" {
+			online[name] = true
+		}
+	}
+	return online
+}
+
+// mwanLiveOf is what `mwan3 interfaces` would say about name, from its state
+// file alone. An interface mwan3 does not track - disabled in the mwan3
+// config, or with no state file - is "unknown" and its tracking "down", as
+// the script prints it: reading it as offline would paint a link nobody is
+// monitoring as failed. One that is tracked reports the state the tracker
+// recorded.
+func mwanLiveOf(name string, iface mwanIface, states map[string]string) mwanLive {
+	st, tracked := states[name]
+	if !iface.Enabled || !tracked {
+		return mwanLive{Online: "unknown", Tracking: "down"}
+	}
+	return mwanLive{Online: st, Tracking: "active"}
 }
 
 // pickMwanActive works out which member is carrying traffic from the config
@@ -1232,6 +1261,13 @@ func pickMwanActive(cfg mwanConfig, online map[string]bool) string {
 
 // policyOfActiveRule names the policy a rule actually points at, which is
 // what `mwan3 policies` would print as the one in force.
+//
+// mwan3 policies are per rule, so "the active policy" is a simplification:
+// with several rules pointing at different policies this returns the
+// alphabetically first one any rule uses. That is exact for the
+// configurations NetGrip writes, which steer everything through a single
+// policy; a hand-made multi-policy setup gets one of its policies, not the
+// whole picture.
 func policyOfActiveRule(cfg mwanConfig) string {
 	names := []string{}
 	for rule, policy := range cfg.RulePolicies {

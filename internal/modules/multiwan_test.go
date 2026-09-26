@@ -941,3 +941,36 @@ mwan3.` + mwanPolicyName + `=policy
 		t.Fatal("a rule that does not pin must not be reported as sticky")
 	}
 }
+
+// What each link reports without running `mwan3 interfaces`: the same words
+// the script prints. A link mwan3 is not tracking - disabled in its config,
+// or with no state file - is unknown and not tracked, never offline: the UI
+// paints "offline" as a failed link.
+func TestMwanLiveOfReportsWhatTheTrackerKnows(t *testing.T) {
+	states := map[string]string{"rds": "online", "lte": "offline", "wg": "connecting"}
+	for _, tc := range []struct {
+		name  string
+		iface mwanIface
+		want  mwanLive
+	}{
+		{"rds", mwanIface{Enabled: true}, mwanLive{Online: "online", Tracking: "active"}},
+		{"lte", mwanIface{Enabled: true}, mwanLive{Online: "offline", Tracking: "active"}},
+		{"wg", mwanIface{Enabled: true}, mwanLive{Online: "connecting", Tracking: "active"}},
+		// Present in the config and in network, but enabled '0' in mwan3,
+		// so no state file: `mwan3 interfaces` says "unknown and tracking is
+		// down".
+		{"wan", mwanIface{Enabled: false}, mwanLive{Online: "unknown", Tracking: "down"}},
+		// Enabled, but the tracker has not written a file for it (yet).
+		{"spare", mwanIface{Enabled: true}, mwanLive{Online: "unknown", Tracking: "down"}},
+		// Disabled in the config wins over a stale file left behind.
+		{"rds", mwanIface{Enabled: false}, mwanLive{Online: "unknown", Tracking: "down"}},
+	} {
+		if got := mwanLiveOf(tc.name, tc.iface, states); got != tc.want {
+			t.Errorf("%s (enabled=%v): %+v, want %+v", tc.name, tc.iface.Enabled, got, tc.want)
+		}
+	}
+	online := mwanOnline(states)
+	if len(online) != 1 || !online["rds"] {
+		t.Errorf("online set: %v, want only rds", online)
+	}
+}
