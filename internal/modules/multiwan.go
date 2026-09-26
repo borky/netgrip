@@ -640,11 +640,24 @@ func ProbeMultiWAN() *MultiWanProbe {
 	}
 	running := installed && executor.ServiceRunning(mwanPkg)
 	if running {
-		if out, err := exec.Command(mwanPkg, "interfaces").Output(); err == nil {
-			live = parseMwanInterfaces(string(out))
-		}
-		if out, err := exec.Command(mwanPkg, "policies").Output(); err == nil {
-			policy, shares = parseMwanPolicies(string(out))
+		// The tracker's verdict and the split come from its state files and
+		// the member weights, not from `mwan3 interfaces` and `mwan3
+		// policies`. Those two shell scripts walk the whole rule set and
+		// cost the best part of a second between them on this class of
+		// hardware, which is a lot to spend every time somebody opens the
+		// page - and they only report what is derived here anyway.
+		if _, states, ok := mwanLiveState(); ok {
+			for name, iface := range cfg.Ifaces {
+				live[name] = mwanLiveOf(name, iface, states)
+			}
+			online := mwanOnline(states)
+			if active := pickMwanActive(cfg, online); active != "" {
+				policy = policyOfActiveRule(cfg)
+				shares = mwanShares(cfg, online)
+				if len(shares) == 0 {
+					shares = map[string]int{active: 100}
+				}
+			}
 		}
 	}
 	return buildMultiWanProbe(candidates, installed, installed && executor.ServiceEnabled(mwanPkg),
@@ -1141,29 +1154,72 @@ func MwanActiveUplink() string {
 		return mwanActive.name
 	}
 	mwanActive.at = time.Now()
-	mwanActive.name = ""
-
-	if _, err := os.Stat(mwanStateDir); err != nil {
+	cfg, states, ok := mwanLiveState()
+	if !ok {
+		mwanActive.name = ""
 		return ""
+	}
+	mwanActive.name = pickMwanActive(cfg, mwanOnline(states))
+	return mwanActive.name
+}
+
+// mwanLiveState is the cheap half of the picture: the config, which `uci`
+// answers instantly, and the tracker's verdict on each link, which is one
+// word per file under its run directory. Everything else mwan3 can tell us
+// costs a shell script and the best part of a second — measured, on the
+// class of hardware this runs on — so nothing on a polled path uses it.
+//
+// The states map holds each state file's word as mwan3 wrote it (online,
+// offline, connecting, ...). An interface mwan3 is not tracking - disabled in
+// its config, or not started - has no file and no entry.
+func mwanLiveState() (mwanConfig, map[string]string, bool) {
+	if _, err := os.Stat(mwanStateDir); err != nil {
+		return mwanConfig{}, nil, false
 	}
 	show, err := exec.Command("uci", "show", mwanPkg).Output()
 	if err != nil {
-		return ""
+		return mwanConfig{}, nil, false
 	}
-	cfg := readMwanConfig(string(show))
-	online := map[string]bool{}
 	entries, err := os.ReadDir(mwanStateDir)
 	if err != nil {
-		return ""
+		return mwanConfig{}, nil, false
 	}
+	states := map[string]string{}
 	for _, e := range entries {
 		b, err := os.ReadFile(mwanStateDir + "/" + e.Name())
-		if err == nil && strings.TrimSpace(string(b)) == "online" {
-			online[e.Name()] = true
+		if err != nil {
+			continue
+		}
+		if st := strings.TrimSpace(string(b)); st != "" {
+			states[e.Name()] = st
 		}
 	}
-	mwanActive.name = pickMwanActive(cfg, online)
-	return mwanActive.name
+	return readMwanConfig(string(show)), states, true
+}
+
+// mwanOnline is the set of interfaces the tracker has online.
+func mwanOnline(states map[string]string) map[string]bool {
+	online := map[string]bool{}
+	for name, st := range states {
+		if st == "online" {
+			online[name] = true
+		}
+	}
+	return online
+}
+
+// mwanLiveOf is what `mwan3 interfaces` would say about name, from its state
+// file alone. An interface mwan3 does not track - disabled in the mwan3
+// config, or with no state file - is "unknown" and its tracking "down", as
+// the script prints it: reading it as offline would paint a link nobody is
+// monitoring as failed. One that is tracked reports the state the tracker
+// recorded.
+func mwanLiveOf(name string, iface mwanIface, states map[string]string) mwanLive {
+	st, tracked := states[name]
+	if !iface.Enabled || !tracked {
+		return mwanLive{Online: "unknown", Tracking: "down"}
+	}
+	return mwanLive{Online: st, Tracking: "active"}
 }
 
 // pickMwanActive works out which member is carrying traffic from the config
@@ -1201,4 +1257,78 @@ func pickMwanActive(cfg mwanConfig, online map[string]bool) string {
 		}
 	}
 	return best
+}
+
+// policyOfActiveRule names the policy a rule actually points at, which is
+// what `mwan3 policies` would print as the one in force.
+//
+// mwan3 policies are per rule, so "the active policy" is a simplification:
+// with several rules pointing at different policies this returns the
+// alphabetically first one any rule uses. That is exact for the
+// configurations NetGrip writes, which steer everything through a single
+// policy; a hand-made multi-policy setup gets one of its policies, not the
+// whole picture.
+func policyOfActiveRule(cfg mwanConfig) string {
+	names := []string{}
+	for rule, policy := range cfg.RulePolicies {
+		if len(rule) > mwanMaxSectionLen || len(policy) > mwanMaxSectionLen {
+			continue
+		}
+		if cfg.All[policy] == "policy" {
+			names = append(names, policy)
+		}
+	}
+	if len(names) == 0 {
+		return ""
+	}
+	sort.Strings(names)
+	return names[0]
+}
+
+// mwanShares is how traffic divides between the uplinks, worked out the way
+// mwan3 does it rather than asked for: only the lowest metric group with
+// something online carries anything, and inside it the split follows the
+// weights. Deriving it keeps the number fresh on every push, where asking
+// `mwan3 policies` would cost a third of a second each time.
+func mwanShares(cfg mwanConfig, online map[string]bool) map[string]int {
+	type member struct {
+		iface  string
+		weight int
+	}
+	lowest, group := 0, []member{}
+	for _, m := range cfg.Members {
+		if m.Interface == "" || !online[m.Interface] {
+			continue
+		}
+		switch {
+		case len(group) == 0 || m.Metric < lowest:
+			lowest, group = m.Metric, []member{{m.Interface, m.Weight}}
+		case m.Metric == lowest:
+			group = append(group, member{m.Interface, m.Weight})
+		}
+	}
+	shares := map[string]int{}
+	total := 0
+	for _, m := range group {
+		total += m.weight
+	}
+	if total == 0 {
+		return shares
+	}
+	// Heaviest first, so the rounding remainder lands there rather than
+	// leaving the column short of 100.
+	sort.Slice(group, func(i, j int) bool {
+		if group[i].weight != group[j].weight {
+			return group[i].weight > group[j].weight
+		}
+		return group[i].iface < group[j].iface
+	})
+	assigned := 0
+	for _, m := range group[1:] {
+		pct := m.weight * 100 / total
+		shares[m.iface] = pct
+		assigned += pct
+	}
+	shares[group[0].iface] = 100 - assigned
+	return shares
 }
