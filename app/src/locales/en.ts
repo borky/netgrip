@@ -1884,6 +1884,7 @@ export default {
     actionFailed: "The AdGuard action failed",
     protectionOn: "DNS protection on",
     runningNoFilter: "Running, not filtering",
+    directDesc: "AdGuard Home is this network's DNS server: it answers on port 53 itself, so every client is filtered without NetGrip handing dnsmasq to it. It is managed outside NetGrip, and stopping it here would leave the network without DNS.",
     protectionSwitch: "DNS protection",
     protectionOnDesc: "The whole network resolves through AdGuard Home. The previous DNS config is saved and restored when you switch it off.",
     protectionOffDesc: "Turn it on to start the service and hand every DNS query from dnsmasq to AdGuard Home.",

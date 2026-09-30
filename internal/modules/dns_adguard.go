@@ -32,6 +32,9 @@ const (
 	adGuardBackupPath     = "/etc/netgrip/adguard_dns_backup.json"
 	adGuardConfigPath     = "/etc/adguardhome.yaml"
 	adGuardDefaultDNSPort = 5353
+	// adGuardDefaultWebPort is AdGuard's own default for its web UI, used
+	// only when neither its config nor its sockets say otherwise.
+	adGuardDefaultWebPort = 3000
 	adGuardProbeDomain    = "example.com"
 )
 
@@ -127,10 +130,92 @@ func parseAdGuardDNSPort(data []byte) int {
 	return 0
 }
 
+// adGuardConfigFile is the AdGuard Home config the service actually uses.
+// FORK: the OpenWrt package names it in UCI (adguardhome.config.config_file,
+// /etc/adguardhome/adguardhome.yaml on OpenWrt 25.12); older packages pass
+// /etc/adguardhome.yaml to the binary directly. Reading only the old path
+// missed the whole config on current installs - DNS port, web port, DoH.
+func adGuardConfigFile() string {
+	if out, err := exec.Command("uci", "-q", "get", "adguardhome.config.config_file").Output(); err == nil {
+		if p := strings.TrimSpace(string(out)); p != "" {
+			return p
+		}
+	}
+	return adGuardConfigPath
+}
+
+// adGuardServesDNSNow reports whether the running AdGuard Home process
+// listens on :53 itself. FORK.
+func adGuardServesDNSNow() bool {
+	l, ok := probeAdGuardListeners()
+	return ok && (l.UDP[53] || l.TCP[53])
+}
+
+// writeAdGuardConfig writes AdGuard's config so that AdGuard can still read
+// it. FORK: current OpenWrt packages run AdGuard as its own user with the
+// config private to it (0600), so a file root rewrote or created would lock
+// it out. An existing file keeps its owner; a new one takes the owner of its
+// directory, which the package creates for that user.
+func writeAdGuardConfig(path string, data []byte) error {
+	owner, statErr := os.Stat(path)
+	if statErr != nil {
+		owner, _ = os.Stat(filepath.Dir(path))
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		return err
+	}
+	if owner != nil {
+		if uid, gid, ok := fileOwner(owner); ok {
+			if err := os.Chown(path, uid, gid); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// parseAdGuardWebPort returns the port of AdGuard's web UI from its yaml
+// config: http.address ("0.0.0.0:8080") on current versions, the top-level
+// bind_port on older ones; 0 when neither is there. FORK.
+func parseAdGuardWebPort(data []byte) int {
+	inHTTP := false
+	for _, line := range strings.Split(string(data), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		top := !strings.HasPrefix(line, " ") && !strings.HasPrefix(line, "\t")
+		if top {
+			inHTTP = trimmed == "http:"
+			if rest, ok := strings.CutPrefix(trimmed, "bind_port:"); ok {
+				if p, err := strconv.Atoi(strings.TrimSpace(rest)); err == nil && p > 0 && p < 65536 {
+					return p
+				}
+			}
+			continue
+		}
+		if !inHTTP {
+			continue
+		}
+		if rest, ok := strings.CutPrefix(trimmed, "address:"); ok {
+			addr := strings.Trim(strings.TrimSpace(rest), `"'`)
+			if i := strings.LastIndexByte(addr, ':'); i >= 0 {
+				if p, err := strconv.Atoi(addr[i+1:]); err == nil && p > 0 && p < 65536 {
+					return p
+				}
+			}
+		}
+	}
+	return 0
+}
+
 // adGuardResolvedPort returns the DNS port AdGuard Home listens on: the one
 // in its yaml config when present, the conventional 5353 otherwise.
 func adGuardResolvedPort() int {
-	if data, err := os.ReadFile(adGuardConfigPath); err == nil {
+	if data, err := os.ReadFile(adGuardConfigFile()); err == nil {
 		if p := parseAdGuardDNSPort(data); p > 0 {
 			return p
 		}
@@ -276,16 +361,21 @@ func adGuardEnable(st dnsmasqState) (*DNSConfig, bool, error) {
 	if adGuardProtected(st) {
 		return ProbeDNS(), false, fmt.Errorf("DNS protection is already active")
 	}
+	// FORK: AdGuard already answering :53 itself filters every client
+	// already; handing dnsmasq to it on top would only add a hop.
+	if adGuardServesDNSNow() {
+		return ProbeDNS(), false, fmt.Errorf("AdGuard Home already answers DNS on port 53 directly; it is filtering without the handoff")
+	}
 	port := adGuardResolvedPort()
 
 	// The AdGuard config may not exist yet (first launch defers to the web
 	// wizard, which cannot finish because dnsmasq owns :53). Write a minimal
 	// config that moves the DNS listener to the handoff port.
 	wroteYAML := false
-	if _, err := os.Stat(adGuardConfigPath); os.IsNotExist(err) {
+	if _, err := os.Stat(adGuardConfigFile()); os.IsNotExist(err) {
 		_ = executor.Run(executor.Op{Kind: "initd", Args: []string{"adguardhome", "stop"}})
-		if err := os.WriteFile(adGuardConfigPath, []byte(adGuardMinimalYAML(port)), 0o600); err != nil {
-			return ProbeDNS(), false, fmt.Errorf("writing %s: %w", adGuardConfigPath, err)
+		if err := writeAdGuardConfig(adGuardConfigFile(), []byte(adGuardMinimalYAML(port))); err != nil {
+			return ProbeDNS(), false, fmt.Errorf("writing %s: %w", adGuardConfigFile(), err)
 		}
 		wroteYAML = true
 	}
@@ -329,7 +419,7 @@ func adGuardEnable(st dnsmasqState) (*DNSConfig, bool, error) {
 func adGuardEnableRollback(st dnsmasqState, removeYAML bool) {
 	_ = adGuardApplyDNS(st)
 	if removeYAML {
-		_ = os.Remove(adGuardConfigPath)
+		_ = os.Remove(adGuardConfigFile())
 	}
 	_ = executor.Run(executor.Op{Kind: "initd", Args: []string{"adguardhome", "stop"}})
 	_ = os.Remove(adGuardBackupPath)

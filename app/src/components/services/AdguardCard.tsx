@@ -39,8 +39,12 @@ export function AdguardCard({ index = 0 }: { index?: number }) {
   if (!cfg) return <Card index={index} icon={Shield} iconTone="success" title={t("adguard.title")}><SkeletonRows rows={2} /></Card>;
   if (!cfg.applicable && !cfg.adguard_active) return null;
 
-  const dashboardUrl = `http://${window.location.hostname}:3000`;
+  // FORK: the port AdGuard's web UI actually listens on, not an assumed 3000.
+  const dashboardUrl = `http://${window.location.hostname}:${cfg.adguard_web_port || 3000}`;
   const protection = cfg.adguard_protection;
+  // FORK: AdGuard answering DNS on :53 itself filters just the same, without
+  // NetGrip's handoff - which it neither needs nor can undo.
+  const direct = !!cfg.adguard_serves_dns && !protection;
 
   const doEnable = async () => {
     setConfirmEnable(false);
@@ -160,7 +164,7 @@ export function AdguardCard({ index = 0 }: { index?: number }) {
       ) : (
         <>
           <div className="mt-3 flex items-center gap-2">
-            {protection ? (
+            {protection || direct ? (
               <Pill tone="ok" live>{t("adguard.protectionOn")}</Pill>
             ) : cfg.adguard_running ? (
               <Pill tone="warn">{t("adguard.runningNoFilter")}</Pill>
@@ -178,13 +182,17 @@ export function AdguardCard({ index = 0 }: { index?: number }) {
                 <ExternalLink size={12} aria-hidden="true" />
               </a>
             )}
-            {cfg.adguard_running && !protection && (
+            {cfg.adguard_running && !protection && !direct && (
               <Button variant="ghost" size="sm" className="text-danger hover:text-danger" disabled={busy} onClick={stopService}>
                 <Square size={14} aria-hidden="true" /> {t("adguard.stop")}
               </Button>
             )}
           </div>
 
+          {direct ? (
+            <p className="mt-3 text-caption text-muted">{t("adguard.directDesc")}</p>
+          ) : (
+          <>
           <div className="mt-3 flex items-center gap-2">
             <Toggle
               checked={protection}
@@ -201,6 +209,8 @@ export function AdguardCard({ index = 0 }: { index?: number }) {
                 ? t("adguard.protectionOffBackupDesc")
                 : t("adguard.protectionOffDesc")}
           </p>
+          </>
+          )}
           {busyWith && (
             <div className="mt-3 flex flex-col gap-1.5" role="status">
               <span className="text-small text-muted">

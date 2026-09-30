@@ -433,6 +433,10 @@ export interface DNSConfig {
   adguard_protection: boolean;
   adguard_has_backup: boolean;
   adguard_dns_port?: number;
+  // FORK: AdGuard itself answers DNS on :53 (filtering without the dnsmasq
+  // handoff), and the port its web UI actually listens on.
+  adguard_serves_dns?: boolean;
+  adguard_web_port?: number;
   /** DoH (#364): active upstreams, current list (capped at 8) and the
    *  provider presets the UI offers (backend single source of truth). */
   doh_enabled: boolean;
