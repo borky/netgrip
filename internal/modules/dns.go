@@ -36,6 +36,14 @@ type DNSConfig struct {
 	// "managed" (NetGrip provisioned it, the card can show and rotate it),
 	// "external" (users NetGrip did not write, never touched) or "none".
 	AdGuardCredentials string      `json:"adguard_credentials,omitempty"`
+	// FORK: AdGuardServesDNS is AdGuard itself answering DNS on :53, with
+	// dnsmasq moved aside - filtering without NetGrip's handoff, so nothing
+	// about it shows in dnsmasq's config. Read from the sockets the running
+	// process holds, not from its config.
+	AdGuardServesDNS bool `json:"adguard_serves_dns"`
+	// FORK: AdGuardWebPort is where its web UI actually is: the configured
+	// port the process listens on (see adGuardWebPort).
+	AdGuardWebPort int `json:"adguard_web_port,omitempty"`
 	// DoH (#364): whether AdGuard resolves through DNS-over-HTTPS upstreams,
 	// the current upstream list (capped at 8) and the provider presets the UI
 	// offers. Providers are a backend constant (single source of truth).
@@ -76,6 +84,13 @@ func ProbeDNS() *DNSConfig {
 		c.AdGuardRunning = executor.ServiceRunning("adguardhome")
 		c.AdGuardDnsPort = adGuardResolvedPort()
 		c.AdGuardCredentials = adGuardCredStateNow()
+		configured := 0
+		if data, err := os.ReadFile(adGuardConfigPathNow()); err == nil {
+			configured = parseAdGuardWebPort(data)
+		}
+		listeners, observed := probeAdGuardListeners()
+		c.AdGuardServesDNS = observed && (listeners.UDP[53] || listeners.TCP[53])
+		c.AdGuardWebPort = adGuardWebPort(configured, listeners, observed, 53, c.AdGuardDnsPort)
 		c.DohEnabled, c.DohUpstreams = probeDoHState()
 	}
 	return c
@@ -94,6 +109,11 @@ func AdGuardAction(action string) (*DNSConfig, bool, error) {
 	}
 	if !pkgInstalled("adguardhome") {
 		return ProbeDNS(), false, fmt.Errorf("adguardhome is not installed")
+	}
+	// FORK: when AdGuard itself answers DNS on :53, stopping it leaves the
+	// whole network without DNS - dnsmasq has been moved off that port.
+	if action == "stop" && adGuardServesDNSNow() {
+		return ProbeDNS(), false, fmt.Errorf("AdGuard Home is this network's DNS server (it answers on port 53); stopping it would leave every client without DNS")
 	}
 	rcAction := "enable"
 	if action == "stop" {
