@@ -231,6 +231,13 @@ func writeAdGuardYAML(path string, data []byte) error {
 	if err := os.WriteFile(tmp, data, 0o600); err != nil {
 		return err
 	}
+	// FORK: the rename puts a root-owned file in place; the package runs
+	// AdGuard as its own user with the config private to it, so give the
+	// new file the owner of the one it replaces (see writeAdGuardConfig).
+	if err := copyAdGuardOwner(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
 	return os.Rename(tmp, path)
 }
 
@@ -260,7 +267,7 @@ func adGuardProvisionUsers() (*adGuardCredFile, error) {
 	if err := saveAdGuardCred(cred); err != nil {
 		// Leave no users block without its plaintext: that combination reads
 		// as "external" and would lock the panel out of its own credential.
-		_ = os.WriteFile(adGuardConfigPathNow(), data, 0o600)
+		_ = writeAdGuardConfig(adGuardConfigPathNow(), data)
 		return nil, err
 	}
 	return cred, nil
