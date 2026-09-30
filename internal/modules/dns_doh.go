@@ -272,7 +272,7 @@ func adGuardDoHApply(doc map[string]any) error {
 	if err != nil {
 		return fmt.Errorf("rendering %s: %w", adGuardConfigPathNow(), err)
 	}
-	if err := os.WriteFile(adGuardConfigPathNow(), out, 0o600); err != nil {
+	if err := writeAdGuardConfig(adGuardConfigPathNow(), out); err != nil {
 		return fmt.Errorf("writing %s: %w", adGuardConfigPathNow(), err)
 	}
 	if err := executor.Apply([]executor.Op{{Kind: "initd", Args: []string{"adguardhome", "restart"}}}, nil); err != nil {
@@ -298,7 +298,7 @@ func adGuardDoHRestore(c dohConfig) {
 	}
 	applyDoHConfig(doc, c)
 	if out, err := renderAdGuardYAML(doc); err == nil {
-		_ = os.WriteFile(adGuardConfigPathNow(), out, 0o600)
+		_ = writeAdGuardConfig(adGuardConfigPathNow(), out)
 	}
 	_ = executor.Run(executor.Op{Kind: "initd", Args: []string{"adguardhome", "restart"}})
 }
