@@ -36,14 +36,7 @@ func ProbeMode() *ModeProbe {
 	if err == nil && strings.Contains(string(out), "master "+LANBridge()) {
 		p.WanInBridge = true
 	}
-	switch {
-	case p.WanInBridge:
-		p.Mode = "ap"
-	case p.WanConfigured:
-		p.Mode = "router"
-	default:
-		p.Mode = "ap"
-	}
+	p.Mode = classifyMode(p.WanInBridge, p.WanConfigured, p.DnsmasqOn, p.FirewallOn)
 
 	switch {
 	case !p.HasWifi && p.PortCount > 4:
@@ -52,6 +45,29 @@ func ProbeMode() *ModeProbe {
 		p.HardwareClass = p.Mode
 	}
 	return p
+}
+
+// classifyMode decides router or AP from what the box does.
+//
+// FORK: a WAN port inside the LAN bridge was the only sign of an access
+// point, and any interface holding the default route counted as a WAN. An AP
+// set up the other common way - its uplink port in a bridge of its own, a DHCP
+// client there, the LAN on a separate bridge - was then shown as the main
+// router. What makes a router is what it does for the network: filtering and
+// NAT (firewall), and addresses and names (dnsmasq). A box with both off does
+// neither, whatever its interfaces are called, so it is an AP. A router keeps
+// both on, even with dnsmasq moved to another port behind AdGuard.
+func classifyMode(wanInBridge, wanConfigured, dnsmasqOn, firewallOn bool) string {
+	switch {
+	case wanInBridge:
+		return "ap"
+	case !dnsmasqOn && !firewallOn:
+		return "ap"
+	case wanConfigured:
+		return "router"
+	default:
+		return "ap"
+	}
 }
 
 func hasWifiRadios() bool {
