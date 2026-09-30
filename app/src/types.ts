@@ -1309,6 +1309,7 @@ export interface FleetNodeStatus {
   latest_version: string;
   update_available: boolean;
   error?: string;
+  tls?: boolean; // FORK: the node's panel serves HTTPS
 }
 
 export interface DiscoveredFleetPeer {
@@ -1318,6 +1319,7 @@ export interface DiscoveredFleetPeer {
   address: string;
   port: number;
   seen_at: string;
+  tls?: boolean; // FORK: announced in its beacon
 }
 
 export interface NftQoSLimit {

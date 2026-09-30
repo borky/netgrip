@@ -39,6 +39,9 @@ type fleetBeacon struct {
 	Address string `json:"address"`
 	Port    int    `json:"port"`
 	TS      int64  `json:"ts"`
+	// FORK: the panel serves HTTPS on Port. Absent from older beacons,
+	// which then read as plain HTTP until a check finds otherwise.
+	TLS bool `json:"tls,omitempty"`
 }
 
 type DiscoveredFleetPeer struct {
@@ -48,6 +51,7 @@ type DiscoveredFleetPeer struct {
 	Address string    `json:"address"`
 	Port    int       `json:"port"`
 	SeenAt  time.Time `json:"seen_at"`
+	TLS     bool      `json:"tls,omitempty"` // FORK: see fleetBeacon.TLS
 }
 
 var (
@@ -187,6 +191,7 @@ func buildBeaconForPeer(peer net.IP) []byte {
 		Version: version,
 		Port:    port,
 		TS:      time.Now().Unix(),
+		TLS:     panelServesTLS,
 	}
 	if peer != nil {
 		b.Address = localAddressForPeer(peer.To4())
@@ -393,6 +398,7 @@ func recordFleetBeacon(src net.IP, data []byte) {
 		Address: addr,
 		Port:    b.Port,
 		SeenAt:  time.Now(),
+		TLS:     b.TLS,
 	}
 	fleetDiscMu.Unlock()
 }
@@ -492,7 +498,9 @@ func AdoptFleetPeer(id, name, address, password string) error {
 	}
 
 	node := FleetNode{ID: id, Name: name, Address: address, Password: password}
-	status := checkNodeUpdate(node)
+	// FORK: the check learns the node's HTTPS pin, if it serves HTTPS, into
+	// node, so it is saved with it.
+	status, _ := checkNodeUpdateLearning(&node)
 	if !status.Reachable {
 		return fmt.Errorf("unreachable: %s", status.Error)
 	}
