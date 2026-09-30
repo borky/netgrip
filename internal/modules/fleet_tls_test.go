@@ -22,6 +22,14 @@ import (
 // share one, which would make a "different key" test pass for nothing).
 func tlsPeer(t *testing.T) (*httptest.Server, string) {
 	t.Helper()
+	return tlsPeerServing(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	}))
+}
+
+// tlsPeerServing is tlsPeer answering with h.
+func tlsPeerServing(t *testing.T, h http.Handler) (*httptest.Server, string) {
+	t.Helper()
 	k, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	serial, _ := rand.Int(rand.Reader, big.NewInt(1<<62))
 	tmpl := &x509.Certificate{
@@ -32,9 +40,7 @@ func tlsPeer(t *testing.T) (*httptest.Server, string) {
 	}
 	der, _ := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &k.PublicKey, k)
 	c, _ := x509.ParseCertificate(der)
-	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte("ok"))
-	}))
+	srv := httptest.NewUnstartedServer(h)
 	srv.TLS = &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: k}}}
 	srv.StartTLS()
 	t.Cleanup(srv.Close)

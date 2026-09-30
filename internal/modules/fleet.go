@@ -1,10 +1,8 @@
 package modules
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"sync"
@@ -240,30 +238,13 @@ func checkNodeUpdateLearning(node *FleetNode) (FleetNodeStatus, bool) {
 }
 
 func nodeUpdateStatus(status FleetNodeStatus, node *FleetNode, base string, client *http.Client) (FleetNodeStatus, bool) {
-	loginReq := map[string]string{"password": node.Password}
-	loginBody, _ := json.Marshal(loginReq)
-	loginResp, err := client.Post(base+"/api/login", "application/json", bytes.NewReader(loginBody))
+	client, err := fleetPanelLogin(client, base, node.Password)
 	if err != nil {
-		status.Error = fmt.Sprintf("login: %v", err)
-		return status, false
-	}
-	defer loginResp.Body.Close()
-
-	if loginResp.StatusCode != 200 {
-		status.Error = "login failed"
-		return status, false
-	}
-
-	var loginResult struct {
-		Token string `json:"token"`
-	}
-	if err := json.NewDecoder(loginResp.Body).Decode(&loginResult); err != nil {
-		status.Error = "login decode"
+		status.Error = err.Error()
 		return status, false
 	}
 
 	checkReq, _ := http.NewRequest("GET", base+"/api/selfupdate", nil)
-	checkReq.Header.Set("Authorization", "Bearer "+loginResult.Token)
 	checkResp, err := client.Do(checkReq)
 	if err != nil {
 		status.Error = fmt.Sprintf("check: %v", err)
@@ -315,28 +296,12 @@ func UpdateFleetNode(id string) error {
 		saveFleetNodePin(*node)
 	}
 
-	loginReq := map[string]string{"password": node.Password}
-	loginBody, _ := json.Marshal(loginReq)
-	loginResp, err := client.Post(base+"/api/login", "application/json", bytes.NewReader(loginBody))
+	client, err = fleetPanelLogin(client, base, node.Password)
 	if err != nil {
-		return fmt.Errorf("login: %v", err)
-	}
-	defer loginResp.Body.Close()
-
-	if loginResp.StatusCode != 200 {
-		return fmt.Errorf("login failed")
-	}
-
-	var loginResult struct {
-		Token string `json:"token"`
-	}
-	body, _ := io.ReadAll(loginResp.Body)
-	if err := json.Unmarshal(body, &loginResult); err != nil {
-		return fmt.Errorf("login decode")
+		return err
 	}
 
 	updateReq, _ := http.NewRequest("POST", base+"/api/selfupdate", nil)
-	updateReq.Header.Set("Authorization", "Bearer "+loginResult.Token)
 	updateResp, err := client.Do(updateReq)
 	if err != nil {
 		return fmt.Errorf("update: %v", err)
