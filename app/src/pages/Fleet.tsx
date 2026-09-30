@@ -28,8 +28,9 @@ function roleIcon(name: string) {
 }
 
 /** address puede venir con o sin esquema; el panel vive en http(s)://address. */
-function panelUrl(address: string): string {
-  return /^https?:\/\//i.test(address) ? address : `http://${address}`;
+// FORK: https when the node's panel serves it, as its check found.
+function panelUrl(address: string, tls?: boolean): string {
+  return /^https?:\/\//i.test(address) ? address : `${tls ? "https" : "http"}://${address}`;
 }
 
 /** ID interno por defecto a partir del nombre (slug sin espacios). */
@@ -352,7 +353,7 @@ function NodeCard({ node, index, checkingAll, onChecked, onAskUpdate, onAskRemov
   const [checking, setChecking] = useState(false);
 
   const pulsing = checking || checkingAll;
-  const open = () => window.open(panelUrl(node.address), "_blank", "noopener,noreferrer");
+  const open = () => window.open(panelUrl(node.address, node.tls), "_blank", "noopener,noreferrer");
 
   const check = async () => {
     setChecking(true);

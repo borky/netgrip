@@ -21,6 +21,11 @@ type FleetNode struct {
 	Name     string `json:"name"`
 	Address  string `json:"address"`
 	Password string `json:"password,omitempty"`
+	// FORK: TLS is set once the node's panel was found serving HTTPS, and
+	// SPKI is the key it presented then: every later request is pinned to
+	// it (see fleet_tls.go).
+	TLS  bool   `json:"tls,omitempty"`
+	SPKI string `json:"spki,omitempty"`
 }
 
 type FleetConfig struct {
@@ -36,6 +41,8 @@ type FleetNodeStatus struct {
 	LatestVersion   string `json:"latest_version"`
 	UpdateAvailable bool   `json:"update_available"`
 	Error           string `json:"error,omitempty"`
+	// FORK: the node's panel serves HTTPS, so "Open" links to https://.
+	TLS bool `json:"tls,omitempty"`
 }
 
 type FleetStatus struct {
@@ -134,6 +141,7 @@ func ListFleet() ([]FleetNodeStatus, error) {
 				Address: n.Address,
 			}
 		}
+		status.TLS = n.TLS // from the saved node, which a check may have just learned
 		nodes = append(nodes, status)
 	}
 	fleetMu.RUnlock()
@@ -158,7 +166,10 @@ func CheckFleetNode(id string) (FleetNodeStatus, error) {
 		return FleetNodeStatus{}, fmt.Errorf("node not found")
 	}
 
-	status := checkNodeUpdate(*node)
+	status, learned := checkNodeUpdateLearning(node)
+	if learned {
+		saveFleetNodePin(*node)
+	}
 
 	fleetMu.Lock()
 	fleetStatuses[id] = status
@@ -180,7 +191,10 @@ func CheckAllFleet() ([]FleetNodeStatus, error) {
 		wg.Add(1)
 		go func(n FleetNode) {
 			defer wg.Done()
-			status := checkNodeUpdate(n)
+			status, learned := checkNodeUpdateLearning(&n)
+			if learned {
+				saveFleetNodePin(n)
+			}
 			results <- status
 		}(node)
 	}
@@ -202,26 +216,42 @@ func CheckAllFleet() ([]FleetNodeStatus, error) {
 }
 
 func checkNodeUpdate(node FleetNode) FleetNodeStatus {
+	status, _ := checkNodeUpdateLearning(&node)
+	return status
+}
+
+// checkNodeUpdateLearning is checkNodeUpdate that also reports whether it
+// learned the node's TLS pin on the way, filled into node. FORK.
+func checkNodeUpdateLearning(node *FleetNode) (FleetNodeStatus, bool) {
 	status := FleetNodeStatus{
 		ID:      node.ID,
 		Name:    node.Name,
 		Address: node.Address,
 	}
 
-	client := &http.Client{Timeout: 5 * time.Second}
+	base, client, learned, err := fleetPeerClient(node, 5*time.Second)
+	if err != nil {
+		status.Error = err.Error()
+		return status, false
+	}
+	status.TLS = node.TLS
+	status, ok := nodeUpdateStatus(status, node, base, client)
+	return status, learned && ok
+}
 
+func nodeUpdateStatus(status FleetNodeStatus, node *FleetNode, base string, client *http.Client) (FleetNodeStatus, bool) {
 	loginReq := map[string]string{"password": node.Password}
 	loginBody, _ := json.Marshal(loginReq)
-	loginResp, err := client.Post(fmt.Sprintf("http://%s/api/login", node.Address), "application/json", bytes.NewReader(loginBody))
+	loginResp, err := client.Post(base+"/api/login", "application/json", bytes.NewReader(loginBody))
 	if err != nil {
 		status.Error = fmt.Sprintf("login: %v", err)
-		return status
+		return status, false
 	}
 	defer loginResp.Body.Close()
 
 	if loginResp.StatusCode != 200 {
 		status.Error = "login failed"
-		return status
+		return status, false
 	}
 
 	var loginResult struct {
@@ -229,27 +259,27 @@ func checkNodeUpdate(node FleetNode) FleetNodeStatus {
 	}
 	if err := json.NewDecoder(loginResp.Body).Decode(&loginResult); err != nil {
 		status.Error = "login decode"
-		return status
+		return status, false
 	}
 
-	checkReq, _ := http.NewRequest("GET", fmt.Sprintf("http://%s/api/selfupdate", node.Address), nil)
+	checkReq, _ := http.NewRequest("GET", base+"/api/selfupdate", nil)
 	checkReq.Header.Set("Authorization", "Bearer "+loginResult.Token)
 	checkResp, err := client.Do(checkReq)
 	if err != nil {
 		status.Error = fmt.Sprintf("check: %v", err)
-		return status
+		return status, false
 	}
 	defer checkResp.Body.Close()
 
 	if checkResp.StatusCode != 200 {
 		status.Error = "check failed"
-		return status
+		return status, false
 	}
 
 	var update SelfUpdateCheck
 	if err := json.NewDecoder(checkResp.Body).Decode(&update); err != nil {
 		status.Error = "check decode"
-		return status
+		return status, false
 	}
 
 	status.Reachable = true
@@ -257,7 +287,7 @@ func checkNodeUpdate(node FleetNode) FleetNodeStatus {
 	status.LatestVersion = update.Latest
 	status.UpdateAvailable = update.Available
 
-	return status
+	return status, true
 }
 
 func UpdateFleetNode(id string) error {
@@ -277,11 +307,17 @@ func UpdateFleetNode(id string) error {
 		return fmt.Errorf("node not found")
 	}
 
-	client := &http.Client{Timeout: 10 * time.Second}
+	base, client, learned, err := fleetPeerClient(node, 10*time.Second)
+	if err != nil {
+		return err
+	}
+	if learned {
+		saveFleetNodePin(*node)
+	}
 
 	loginReq := map[string]string{"password": node.Password}
 	loginBody, _ := json.Marshal(loginReq)
-	loginResp, err := client.Post(fmt.Sprintf("http://%s/api/login", node.Address), "application/json", bytes.NewReader(loginBody))
+	loginResp, err := client.Post(base+"/api/login", "application/json", bytes.NewReader(loginBody))
 	if err != nil {
 		return fmt.Errorf("login: %v", err)
 	}
@@ -299,7 +335,7 @@ func UpdateFleetNode(id string) error {
 		return fmt.Errorf("login decode")
 	}
 
-	updateReq, _ := http.NewRequest("POST", fmt.Sprintf("http://%s/api/selfupdate", node.Address), nil)
+	updateReq, _ := http.NewRequest("POST", base+"/api/selfupdate", nil)
 	updateReq.Header.Set("Authorization", "Bearer "+loginResult.Token)
 	updateResp, err := client.Do(updateReq)
 	if err != nil {
