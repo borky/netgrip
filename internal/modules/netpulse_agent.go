@@ -545,7 +545,6 @@ func applyNetPulseAgent(p netpulsePaths) {
 		// the monitoring side shows the connection actually in use rather
 		// than the one holding the cheapest route.
 		MultiWan:  netpulseMultiWanHook,
-		OnStatus:  storeNetPulseStatus,
 		OnUpgrade: netPulseUpgradeTrigger,
 	}
 
@@ -628,6 +627,8 @@ func netPulseSelfMQTT() (bool, string) {
 	return true, mqttNodeID(cfg)
 }
 
+// storeNetPulseStatus records st unconditionally; tests use it to stage a
+// status. The running agent goes through statusCallbackGen.
 func storeNetPulseStatus(st runtime.Status) {
 	npMu.Lock()
 	npStatus = st
