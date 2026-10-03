@@ -226,14 +226,10 @@ func SetPoEWatchdog(cfg PoEWatchdogConfig) ([]PoEWatchdogState, error) {
 // ensurePoESection creates the netgrip.poe and per-port sections when they do
 // not exist yet (same approach as SetPoESchedule).
 func ensurePoESection(port string) {
-	if !uciSectionExists("netgrip.poe") {
-		cmd := exec.Command("uci", "import", "netgrip")
-		cmd.Stdin = strings.NewReader("config poe 'poe'\n")
-		_ = cmd.Run()
-	}
+	_ = EnsureNetgripSection("poe", "poe")
 	secName := sanitizeUCIKey(port)
 	if !uciSectionExists("netgrip.poe." + secName) {
-		cmd := exec.Command("uci", "import", "netgrip")
+		cmd := exec.Command("uci", "-m", "import", "netgrip")
 		cmd.Stdin = strings.NewReader("config poeport '" + secName + "'\n")
 		_ = cmd.Run()
 	}
