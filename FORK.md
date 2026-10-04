@@ -57,6 +57,12 @@ users who install binaries rather than build them.
 Nine PRs have merged upstream, including the whole multi-WAN feature
 (gnacho/netgrip#337, merged as a merge commit rather than a squash — which is
 why a rebase dropped all thirteen of this branch's copies automatically).
+Since then the multi-WAN probe performance (#387) and the panel's own HTTPS
+(#423, squashed from `feat/panel-https`) have merged too. A squash does not
+drop this branch's originals by itself: the sync of 2026-10-03 dropped the 24
+commits #423 covers by hand, after checking that its change was identical to
+the branch file by file, and kept the ones that also carried fork-only lines
+(the update source in `netgrip.init`, the NetPulse panel reporting).
 
 ## Upstream behaviour this fork accepts as-is
 
@@ -128,7 +134,7 @@ These would go upstream tomorrow if they could:
 | Reporting the panel port and the uplink policy to the monitoring agent | Needs `PanelPort` and `MultiWan` in a released `netpulse/agent`. Only builds with the local `go.work` until then. |
 | Reporting that the panel serves HTTPS, and the key of its certificate | Needs `PanelTLS` and `PanelSPKI` in a released `netpulse/agent`; same `go.work` arrangement. NetPulse pins that key before sending this panel its executor token, and links to the panel with https. HTTPS is reported from `-https` itself, recorded before the agent starts, so the panel never looks like plain HTTP while its certificate is still being opened; the key is read from the certificate reloader at every push, so it follows a rotation. The pin is only as trustworthy as the agent's channel to NetPulse: sound over https with the server's key pinned, not over plain http - where, as noted above, the executor token already crosses in clear by other routes. |
 | Reaching NetPulse over HTTPS: NetGrip's own requests (enrolment, the executor token, backup uploads) pinned like the embedded agent; enrolment over https when discovery offers it; a fingerprint field in the NetPulse card, kept when a save leaves it empty | Needs `runtime.ServerTransport` and `runtime.ValidatePins` in a released `netpulse/agent`; same `go.work` arrangement. A backup push to a server other than the agent's, with no fingerprint of its own, still checks system CAs as before. Enrolment's pin comes from an unauthenticated UDP reply, so it is trust on first use and is logged as such - and an agent already pinned to an https server is never re-enrolled from one, even by upstream's stale-server fallback; a pairing reply's own `server_fp` is no longer stored for a plain-http server, where anyone could have put it there. See NetPulse's `docs/https.md`. |
-| The multi-WAN half of the fork-per-item performance work | **No longer blocked**: the multi-WAN module merged upstream (gnacho/netgrip#337), so this is offered as its own PR. It needed porting rather than cherry-picking - upstream's merged version keeps the tracker-state reading inline in `MwanActiveUplink`, while this branch had already factored it out as `mwanLiveState` in the agent-reporting commit above. |
+| AdGuard Home as it is set up (`dns_adguard*.go`, `AdguardCard.tsx`): the web UI port from its sockets, AdGuard serving :53 itself counted as filtering, and every config write keeping the file's owner | Not offered yet. Upstream #427 now resolves the config path itself (its `adGuardConfigPathNow` replaced the fork's), but writes the config as root with mode 0600 - including the atomic rewrite that provisions the web credential - which locks out an AdGuard the package runs as its own user. The fork routes all of those writes through `writeAdGuardConfig`/`copyAdGuardOwner`. |
 
 ## The identifying-data hooks
 
