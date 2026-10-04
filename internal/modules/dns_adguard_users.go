@@ -287,6 +287,12 @@ func RegenerateAdGuardPassword() (*AdGuardCredentials, error) {
 	if state == adGuardCredExternal {
 		return nil, fmt.Errorf("credentials are managed from the AdGuard Home UI, not from here")
 	}
+	// FORK: provisioning stops AdGuard to write under it, and when AdGuard
+	// is the network's DNS server that takes DNS away from every client.
+	// Its credentials are then managed from its own UI, as the card says.
+	if state == adGuardCredNone && adGuardDirectSetup() {
+		return nil, fmt.Errorf("AdGuard Home is this network's DNS server; set its credentials from the AdGuard Home UI")
+	}
 	running := executor.ServiceRunning("adguardhome")
 	if state == adGuardCredNone && running {
 		// Provisioning writes the YAML underneath the service; do it stopped.
