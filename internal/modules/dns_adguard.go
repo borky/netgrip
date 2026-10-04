@@ -411,7 +411,7 @@ func adGuardEnable(st dnsmasqState) (*DNSConfig, bool, error) {
 	// FORK: AdGuard already answering :53 itself filters every client
 	// already; handing dnsmasq to it on top would only add a hop.
 	if adGuardDirectSetup() {
-		return ProbeDNS(), false, fmt.Errorf("AdGuard Home is set up to answer DNS on port 53 directly; it filters without the handoff")
+		return ProbeDNS(), false, fmt.Errorf("AdGuard Home is configured to answer DNS on port 53 itself; the dnsmasq handoff does not apply")
 	}
 	port := adGuardResolvedPort()
 
