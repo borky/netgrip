@@ -161,6 +161,15 @@ func adGuardServesDNSNow() bool {
 	return ok && (l.UDP[53] || l.TCP[53])
 }
 
+// adGuardDirectSetup is AdGuard set up as the network's DNS server, running
+// or not: answering :53 now, or configured to. The sockets alone miss the
+// window in which it is stopped or restarting, and a handoff or a
+// provisioning started then would rewrite the config of the only DNS server
+// the network has.
+func adGuardDirectSetup() bool {
+	return adGuardServesDNSNow() || adGuardResolvedPort() == 53
+}
+
 // writeAdGuardConfig writes AdGuard's config so that AdGuard can still read
 // it. FORK: current OpenWrt packages run AdGuard as its own user with the
 // config private to it (0600), so a file root rewrote or created would lock
@@ -182,12 +191,18 @@ func writeAdGuardConfig(path string, data []byte) error {
 	return chownLike(path, owner)
 }
 
-// copyAdGuardOwner gives dst the owner of ref, or of ref's directory when
-// ref does not exist yet.
+// copyAdGuardOwner gives dst the owner and mode of ref, or the owner of
+// ref's directory when ref does not exist yet.
 func copyAdGuardOwner(dst, ref string) error {
 	owner, err := os.Stat(ref)
 	if err != nil {
 		owner, _ = os.Stat(filepath.Dir(ref))
+		return chownLike(dst, owner)
+	}
+	// Replacing a file: keep its mode too, so a config AdGuard reads
+	// through its group is not narrowed to 0600 under it.
+	if err := os.Chmod(dst, owner.Mode().Perm()); err != nil {
+		return err
 	}
 	return chownLike(dst, owner)
 }
@@ -395,8 +410,8 @@ func adGuardEnable(st dnsmasqState) (*DNSConfig, bool, error) {
 	}
 	// FORK: AdGuard already answering :53 itself filters every client
 	// already; handing dnsmasq to it on top would only add a hop.
-	if adGuardServesDNSNow() {
-		return ProbeDNS(), false, fmt.Errorf("AdGuard Home already answers DNS on port 53 directly; it is filtering without the handoff")
+	if adGuardDirectSetup() {
+		return ProbeDNS(), false, fmt.Errorf("AdGuard Home is set up to answer DNS on port 53 directly; it filters without the handoff")
 	}
 	port := adGuardResolvedPort()
 
@@ -419,6 +434,10 @@ func adGuardEnable(st dnsmasqState) (*DNSConfig, bool, error) {
 			return ProbeDNS(), false, err
 		}
 		if err := writeAdGuardConfig(cfgPath, []byte(adGuardMinimalYAMLWithUsers(port, adGuardAdminUser, string(hash)))); err != nil {
+			// The file may exist even though the write failed (a failed
+			// chown): with users and no stored credential it would read as
+			// "external" and lock the panel out of its own credential.
+			_ = os.Remove(cfgPath)
 			return ProbeDNS(), false, fmt.Errorf("writing %s: %w", cfgPath, err)
 		}
 		if err := saveAdGuardCred(&adGuardCredFile{Username: adGuardAdminUser, Password: password}); err != nil {
