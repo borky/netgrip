@@ -112,7 +112,9 @@ func AdGuardAction(action string) (*DNSConfig, bool, error) {
 	}
 	// FORK: when AdGuard itself answers DNS on :53, stopping it leaves the
 	// whole network without DNS - dnsmasq has been moved off that port.
-	if action == "stop" && adGuardServesDNSNow() {
+	// The config counts too: stop also disables autostart, so stopping one
+	// that is only restarting would leave it off for good.
+	if action == "stop" && adGuardDirectSetup() {
 		return ProbeDNS(), false, fmt.Errorf("AdGuard Home is this network's DNS server (it answers on port 53); stopping it would leave every client without DNS")
 	}
 	rcAction := "enable"
