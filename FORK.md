@@ -44,7 +44,7 @@ only then tag.
 
 | patch | why it is not upstream |
 |---|---|
-| Configurable update source, defaulting to this fork (`selfupdate.go`, `cmd/netgrip/main.go`, `netgrip.init`) | Offered as gnacho/netgrip#345 and **declined**: upstream ties self-update to its own releases on purpose and would rather a non-upstream build switched self-update off than carry a config surface for a case it does not have. Kept anyway, for a narrower reason than the PR claimed: this fork is built from source and keeps the scheduler off (`netgrip.selfupdate.enabled='0'`), but that flag only governs the **scheduler** — `POST /api/selfupdate` applies an update without consulting it, so the panel would still offer upstream's release (a source build reports version `dev`, which compares as older than any tag) and one click would replace it. The patch removes the false "update available" and makes that click harmless. |
+| Configurable update source, defaulting to this fork (`selfupdate.go`, `cmd/netgrip/main.go`, `netgrip.init` and its embedded copy in `internal/modules/selfupdate_init/`) | Offered as gnacho/netgrip#345 and **declined**: upstream ties self-update to its own releases on purpose and would rather a non-upstream build switched self-update off than carry a config surface for a case it does not have. Kept anyway, for a narrower reason than the PR claimed: this fork is built from source and keeps the scheduler off (`netgrip.selfupdate.enabled='0'`), but that flag only governs the **scheduler** — `POST /api/selfupdate` applies an update without consulting it, so the panel would still offer upstream's release (a source build reports version `dev`, which compares as older than any tag) and one click would replace it. The patch removes the false "update available" and makes that click harmless. |
 | Manual NetPulse pairing card shown (`app/src/pages/System.tsx`) | Upstream hides it on purpose. We need it: the monitoring server is on another subnet, so the LAN-broadcast discovery can never find it. |
 | `.gitignore` for local build outputs and `go.work` | Only relevant to this working style. |
 
@@ -64,12 +64,33 @@ commits #423 covers by hand, after checking that its change was identical to
 the branch file by file, and kept the ones that also carried fork-only lines
 (the update source in `netgrip.init`, the NetPulse panel reporting).
 
+### The embedded init script
+
+Since upstream #469/#494/#544 the binary carries a copy of the init script
+and rewrites `/etc/init.d/netgrip` with it, at self-update and at every start,
+when the installed script has the `# netgrip init - managed` marker or
+byte-matches an old packaged one. That copy must be the fork's script: with
+upstream's, the rewrite drops `-update-repo` and the panel goes back to
+offering upstream's releases. Upstream's own
+`TestSelfUpdateEmbeddedInitMatchesPackaged` fails when the two drift, so a
+sync that touches `netgrip.init` shows it. Committing the copy needs
+`--no-verify`: the default update source is this fork's repository name,
+which the identifying-data hook matches.
+
+A script installed before the marker existed, carrying the fork's lines,
+matches neither rule and is never rewritten.
+
 ## Upstream behaviour this fork accepts as-is
 
 | behaviour | decision |
 |---|---|
 | The panel polls `https://netgrip.cloudless.club/announcements.json` every 6 hours and renders the result as a ribbon (upstream #389) | **Left alone, deliberately.** It means this build makes a recurring outbound call to upstream's domain and upstream can show text and a link inside the panel. Acceptable while the only user is the person who builds it — and it is how a security notice would arrive. No patch is needed to change course later: upstream already honours `NETGRIP_ANNOUNCEMENTS_URL`, so the init script can point it elsewhere, or at something unreachable to silence it (there is no explicit off switch). Revisit if the fork gets other users. |
 | The embedded agent registers the executor token with the configured NetPulse server at every start (upstream #412) | **Left alone.** It stays inside the network, going only to the server the owner configured - but with the agent on plain `http://` it goes **in clear**, as does the copy sent with every backup upload (`X-Executor-Token`). The remedy is the agent's channel, not this call: point `NETPULSE_SERVER` at https with `NETPULSE_SERVER_FP`. Two more things to know: it now goes through the agent's pinned transport (see "Reaching NetPulse over HTTPS" below), so on https it reaches only the server the agent trusts; NetPulse now handles it (`/api/agents/executor-token`, upstream #838), storing the token for delegation - including MQTT propagation, which sends the broker's credentials through that delegation (see NetPulse's FORK.md). Holding that token also lets NetPulse re-point this router's MQTT (`mqtt.configure`, upstream #410). |
+
+Read at the 2026-10-17 sync (v0.77.0): no new outbound address and no new
+runtime-built request. New features that install packages (miniupnpd, snmpd,
+`tc` for storm control) reach the OpenWrt package mirrors only when turned
+on; the MCP endpoint (#440) is inbound, off unless `netgrip.mcp.enabled=1`.
 
 ## No call home
 
