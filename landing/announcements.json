@@ -58,23 +58,23 @@
       "expires": "2026-12-31"
     },
     {
-      "id": "test-canal-2026-09",
+      "id": "v0760-2026-10",
       "urgency": "info",
       "title": {
-        "es": "Canal de anuncios en pruebas",
-        "en": "Announcement channel in testing"
+        "es": "Novedades de la v0.76.0",
+        "en": "What's new in v0.76.0"
       },
       "body": {
-        "es": "Si ves esto, tu instalación recibe anuncios desde netgrip.cloudless.club.",
-        "en": "If you see this, your install receives announcements from netgrip.cloudless.club."
+        "es": "Novedades de la v0.76.0: editor de reglas de tráfico con políticas visuales (origen, destino, puertos, protocolo y horario), gestión UPnP / NAT-PMP con tabla de mapeos activos y permisos por cliente, inventario de clientes L2 por FDB en switches, chasis de puertos con barras de velocidad y aviso de puertos degradados. Corregido: el panel ya no falla al pulsar una boca ethernet sin enlace.",
+        "en": "v0.76.0 highlights: a traffic rules editor with visual policies (source, destination, ports, protocol and schedule), UPnP / NAT-PMP management with an active-mappings table and per-client permissions, an L2 client inventory from the bridge FDB for switches, and a port chassis with speed bars and degraded-port warnings. Fixed: the panel no longer crashes when clicking an Ethernet port with no link."
       },
-      "url": "https://github.com/gnacho/netgrip",
+      "url": "https://github.com/gnacho/netgrip/releases/tag/v0.76.0",
       "urlLabel": {
-        "es": "Ver el repo",
-        "en": "See the repo"
+        "es": "Ver la release",
+        "en": "See the release"
       },
-      "starts": "2026-09-21",
-      "expires": "2026-09-22"
+      "starts": "2026-10-17",
+      "expires": "2026-12-31"
     }
   ]
 }
