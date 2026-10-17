@@ -1,80 +1,99 @@
 {
-  "announcements": [
-    {
-      "id": "v0750-2026-10",
-      "urgency": "info",
-      "title": {
-        "es": "Novedades de la v0.75.0",
-        "en": "What's new in v0.75.0"
-      },
-      "body": {
-        "es": "Claridad por rol: el panel te dice qué ha detectado en cada equipo y explica las secciones que el rol oculta en el menú. Además, toda vista es ya un enlace (#/ports, #/wifi...): F5 conserva la página y el botón atrás funciona. También llega el rediseño de Ajustes, horarios PoE que por fin se ejecutan y varias correcciones de estabilidad.",
-        "en": "Clarity by role: the panel tells you what it detected on each device and explains the sections the role hides from the menu. Plus every view is now a link (#/ports, #/wifi...): reload keeps the page and the back button works. Also included: the settings redesign, PoE schedules that finally run, and several stability fixes."
-      },
-      "url": "https://github.com/gnacho/netgrip/releases/tag/v0.75.0",
-      "urlLabel": {
-        "es": "Ver la release",
-        "en": "See the release"
-      },
-      "starts": "2026-10-16",
-      "expires": "2026-12-31"
-    },
-    {
-      "id": "v0731-2026-10",
-      "urgency": "info",
-      "title": {
-        "es": "Novedades de la v0.73.1",
-        "en": "What's new in v0.73.1"
-      },
-      "body": {
-        "es": "Novedades de la v0.73: la interfaz se reorganiza por rol (router, punto de acceso o switch), la sección Puertos y VLANs añade una matriz para ver y editar el estado de cada puerto de un vistazo, y el modo demo vuelve a funcionar en demo.netgrip.cloudless.club.",
-        "en": "v0.73 highlights: the interface is now organized by role (router, access point or switch), the Ports and VLANs section adds a matrix to see and edit every port's state at a glance, and demo mode works again at demo.netgrip.cloudless.club."
-      },
-      "url": "https://github.com/gnacho/netgrip/releases/tag/v0.73.1",
-      "urlLabel": {
-        "es": "Ver la release",
-        "en": "See the release"
-      },
-      "starts": "2026-10-10",
-      "expires": "2026-12-09"
-    },
-    {
-      "id": "v07232-2026-10",
-      "urgency": "info",
-      "title": {
-        "es": "Novedades de la v0.72.32",
-        "en": "What's new in v0.72.32"
-      },
-      "body": {
-        "es": "Novedades de la v0.72.32: endpoint MCP para asistentes de IA (10 herramientas de solo lectura, desactivado por defecto), modo avanzado opt-in (VLANs, SNMP, storm control, MAC ACL), recomendación de canal WiFi con datos RF reales, horarios semanales por SSID, menú agrupado por áreas según tu equipo y lecturas por socket ubus nativo, más rápidas. Corregido: el auto-actualizador ya refresca el init script al reiniciar.",
-        "en": "v0.72.32 highlights: an MCP endpoint for AI assistants (10 read-only tools, off by default), opt-in advanced mode (VLANs, SNMP, storm control, MAC ACLs), Wi-Fi channel recommendation from real RF data, weekly per-SSID schedules, a menu grouped by what your device has, and faster reads over the native ubus socket. Fixed: the self-updater now refreshes the init script on restart."
-      },
-      "url": "https://github.com/gnacho/netgrip/releases/tag/v0.72.32",
-      "urlLabel": {
-        "es": "Ver la release",
-        "en": "See the release"
-      },
-      "starts": "2026-10-07",
-      "expires": "2026-12-31"
-    },
-    {
-      "id": "v0760-2026-10",
-      "urgency": "info",
-      "title": {
-        "es": "Novedades de la v0.76.0",
-        "en": "What's new in v0.76.0"
-      },
-      "body": {
-        "es": "Novedades de la v0.76.0: editor de reglas de tráfico con políticas visuales (origen, destino, puertos, protocolo y horario), gestión UPnP / NAT-PMP con tabla de mapeos activos y permisos por cliente, inventario de clientes L2 por FDB en switches, chasis de puertos con barras de velocidad y aviso de puertos degradados. Corregido: el panel ya no falla al pulsar una boca ethernet sin enlace.",
-        "en": "v0.76.0 highlights: a traffic rules editor with visual policies (source, destination, ports, protocol and schedule), UPnP / NAT-PMP management with an active-mappings table and per-client permissions, an L2 client inventory from the bridge FDB for switches, and a port chassis with speed bars and degraded-port warnings. Fixed: the panel no longer crashes when clicking an Ethernet port with no link."
-      },
-      "url": "https://github.com/gnacho/netgrip/releases/tag/v0.76.0",
-      "urlLabel": {
-        "es": "Ver la release",
-        "en": "See the release"
-      },
-      "starts": "2026-10-17",
-      "expires": "2026-12-31"
-    }
-  ]
+ "announcements": [
+  {
+   "id": "v0770-2026-10",
+   "urgency": "info",
+   "title": {
+    "es": "Novedades de la v0.77.0",
+    "en": "What's new in v0.77.0"
+   },
+   "body": {
+    "es": "Separar bandas WiFi ya funciona: al desmarcar «Unificar bandas» el panel propone un nombre distinto por banda y el aviso de nombres iguales pasa a advertencia. Además el toggle HTTPS se cura solo: el script init se refresca en cada arranque, así que cualquier equipo actualizado a mano lo recupera.",
+    "en": "Separating Wi-Fi bands works now: unchecking “Unify bands” proposes a distinct name per band, and the identical-names note is a real warning. Plus the HTTPS toggle heals itself: the init script refreshes on every start, so any manually updated device recovers it."
+   },
+   "url": "https://github.com/gnacho/netgrip/releases/tag/v0.77.0",
+   "urlLabel": {
+    "es": "Ver la release",
+    "en": "See the release"
+   },
+   "starts": "2026-10-17",
+   "expires": "2026-12-31"
+  },
+  {
+   "id": "v0750-2026-10",
+   "urgency": "info",
+   "title": {
+    "es": "Novedades de la v0.75.0",
+    "en": "What's new in v0.75.0"
+   },
+   "body": {
+    "es": "Claridad por rol: el panel te dice qué ha detectado en cada equipo y explica las secciones que el rol oculta en el menú. Además, toda vista es ya un enlace (#/ports, #/wifi...): F5 conserva la página y el botón atrás funciona. También llega el rediseño de Ajustes, horarios PoE que por fin se ejecutan y varias correcciones de estabilidad.",
+    "en": "Clarity by role: the panel tells you what it detected on each device and explains the sections the role hides from the menu. Plus every view is now a link (#/ports, #/wifi...): reload keeps the page and the back button works. Also included: the settings redesign, PoE schedules that finally run, and several stability fixes."
+   },
+   "url": "https://github.com/gnacho/netgrip/releases/tag/v0.75.0",
+   "urlLabel": {
+    "es": "Ver la release",
+    "en": "See the release"
+   },
+   "starts": "2026-10-16",
+   "expires": "2026-12-31"
+  },
+  {
+   "id": "v0731-2026-10",
+   "urgency": "info",
+   "title": {
+    "es": "Novedades de la v0.73.1",
+    "en": "What's new in v0.73.1"
+   },
+   "body": {
+    "es": "Novedades de la v0.73: la interfaz se reorganiza por rol (router, punto de acceso o switch), la sección Puertos y VLANs añade una matriz para ver y editar el estado de cada puerto de un vistazo, y el modo demo vuelve a funcionar en demo.netgrip.cloudless.club.",
+    "en": "v0.73 highlights: the interface is now organized by role (router, access point or switch), the Ports and VLANs section adds a matrix to see and edit every port's state at a glance, and demo mode works again at demo.netgrip.cloudless.club."
+   },
+   "url": "https://github.com/gnacho/netgrip/releases/tag/v0.73.1",
+   "urlLabel": {
+    "es": "Ver la release",
+    "en": "See the release"
+   },
+   "starts": "2026-10-10",
+   "expires": "2026-12-09"
+  },
+  {
+   "id": "v07232-2026-10",
+   "urgency": "info",
+   "title": {
+    "es": "Novedades de la v0.72.32",
+    "en": "What's new in v0.72.32"
+   },
+   "body": {
+    "es": "Novedades de la v0.72.32: endpoint MCP para asistentes de IA (10 herramientas de solo lectura, desactivado por defecto), modo avanzado opt-in (VLANs, SNMP, storm control, MAC ACL), recomendación de canal WiFi con datos RF reales, horarios semanales por SSID, menú agrupado por áreas según tu equipo y lecturas por socket ubus nativo, más rápidas. Corregido: el auto-actualizador ya refresca el init script al reiniciar.",
+    "en": "v0.72.32 highlights: an MCP endpoint for AI assistants (10 read-only tools, off by default), opt-in advanced mode (VLANs, SNMP, storm control, MAC ACLs), Wi-Fi channel recommendation from real RF data, weekly per-SSID schedules, a menu grouped by what your device has, and faster reads over the native ubus socket. Fixed: the self-updater now refreshes the init script on restart."
+   },
+   "url": "https://github.com/gnacho/netgrip/releases/tag/v0.72.32",
+   "urlLabel": {
+    "es": "Ver la release",
+    "en": "See the release"
+   },
+   "starts": "2026-10-07",
+   "expires": "2026-12-31"
+  },
+  {
+   "id": "v0760-2026-10",
+   "urgency": "info",
+   "title": {
+    "es": "Novedades de la v0.76.0",
+    "en": "What's new in v0.76.0"
+   },
+   "body": {
+    "es": "Novedades de la v0.76.0: editor de reglas de tráfico con políticas visuales (origen, destino, puertos, protocolo y horario), gestión UPnP / NAT-PMP con tabla de mapeos activos y permisos por cliente, inventario de clientes L2 por FDB en switches, chasis de puertos con barras de velocidad y aviso de puertos degradados. Corregido: el panel ya no falla al pulsar una boca ethernet sin enlace.",
+    "en": "v0.76.0 highlights: a traffic rules editor with visual policies (source, destination, ports, protocol and schedule), UPnP / NAT-PMP management with an active-mappings table and per-client permissions, an L2 client inventory from the bridge FDB for switches, and a port chassis with speed bars and degraded-port warnings. Fixed: the panel no longer crashes when clicking an Ethernet port with no link."
+   },
+   "url": "https://github.com/gnacho/netgrip/releases/tag/v0.76.0",
+   "urlLabel": {
+    "es": "Ver la release",
+    "en": "See the release"
+   },
+   "starts": "2026-10-17",
+   "expires": "2026-12-31"
+  }
+ ]
 }
