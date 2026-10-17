@@ -33,9 +33,14 @@ type ModeProbe struct {
 // computeRole derives the device role from the probe facts (#447):
 // WAN uplink -> router; no WAN but radios -> access point; only switch
 // ports -> managed switch. Pure so the rules are unit-testable.
+//
+// FORK: "router" is classifyMode's answer, not a WAN uplink alone, so the
+// role the navigation follows never disagrees with the mode. An AP with its
+// uplink in a bridge of its own still has a wan* section, but with firewall
+// and dnsmasq off it routes nothing.
 func computeRole(p *ModeProbe) string {
 	switch {
-	case p.WanConfigured && !p.WanInBridge:
+	case classifyMode(p.WanInBridge, p.WanConfigured, p.DnsmasqOn, p.FirewallOn) == "router":
 		return "router"
 	case p.HasWifi:
 		return "ap"

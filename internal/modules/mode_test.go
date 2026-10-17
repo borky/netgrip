@@ -8,7 +8,9 @@ func TestComputeRole(t *testing.T) {
 		p    *ModeProbe
 		want string
 	}{
-		{"wan uplink is a router", &ModeProbe{WanConfigured: true}, "router"},
+		{"wan uplink is a router", &ModeProbe{WanConfigured: true, DnsmasqOn: true, FirewallOn: true}, "router"},
+		{"wan uplink with dnsmasq moved behind adguard is a router", &ModeProbe{WanConfigured: true, FirewallOn: true}, "router"},
+		{"wan uplink with firewall and dnsmasq off is an ap", &ModeProbe{WanConfigured: true, HasWifi: true}, "ap"},
 		{"wan in bridge is not a router", &ModeProbe{WanConfigured: true, WanInBridge: true, HasWifi: true}, "ap"},
 		{"no wan with radios is an ap", &ModeProbe{HasWifi: true}, "ap"},
 		{"no wan no radios is a switch regardless of port count", &ModeProbe{PortCount: 5}, "switch"},
