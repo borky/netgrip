@@ -85,6 +85,10 @@ environment, not as `-update-repo`: a binary without the fork's flag (an
 upstream one, after an update pointed there) would exit on the unknown flag
 and leave the panel down, while an unknown variable is ignored. The binary
 still accepts the flag, which scripts installed before this change pass.
+Such a pre-marker script is never rewritten, so on that router the
+unknown-flag risk remains: install the current script from
+`deploy/openwrt/netgrip/files/netgrip.init` once, and later ones arrive by
+themselves.
 
 **A local edit to a script with the marker is undone at the next start**,
 with the old one kept as `/etc/init.d/netgrip.bak-<version>`. To keep an edit,
@@ -167,6 +171,7 @@ These would go upstream tomorrow if they could:
 
 | patch | blocked by |
 |---|---|
+| Reporting the panel port and the uplink policy to the monitoring agent (`SetPanelPort`, `netpulseMultiWanHook`) | `PanelPort` and `MultiWan` are released in agent v1.5.2; the wiring is not offered upstream yet. |
 | Reporting that the panel serves HTTPS, and the key of its certificate | Needs `PanelTLS` and `PanelSPKI` in a released `netpulse/agent`; these are the only fields the panel still needs from an unreleased agent (`PanelPort`, `MultiWan`, `ServerTransport` and `ValidatePins` are in agent v1.5.2), so only they keep `go.work` necessary. NetPulse pins that key before sending this panel its executor token, and links to the panel with https. HTTPS is reported from `-https` itself, recorded before the agent starts, so the panel never looks like plain HTTP while its certificate is still being opened; the key is read from the certificate reloader at every push, so it follows a rotation. The pin is only as trustworthy as the agent's channel to NetPulse: sound over https with the server's key pinned, not over plain http - where, as noted above, the executor token already crosses in clear by other routes. |
 | Reaching NetPulse over HTTPS: NetGrip's own requests (enrolment, the executor token, backup uploads) pinned like the embedded agent; enrolment over https when discovery offers it; a fingerprint field in the NetPulse card, kept when a save leaves it empty | `runtime.ServerTransport` and `runtime.ValidatePins` are released in agent v1.5.2; not offered yet. A backup push to a server other than the agent's, with no fingerprint of its own, still checks system CAs as before. Enrolment's pin comes from an unauthenticated UDP reply, so it is trust on first use and is logged as such - and an agent already pinned to an https server is never re-enrolled from one, even by upstream's stale-server fallback; a pairing reply's own `server_fp` is no longer stored for a plain-http server, where anyone could have put it there. See NetPulse's `docs/https.md`. |
 | AdGuard Home as it is set up (`dns_adguard*.go`, `AdguardCard.tsx`): the web UI port from its sockets, AdGuard serving :53 itself counted as filtering, and every config write keeping the file's owner | Not offered yet. Upstream #427 now resolves the config path itself (its `adGuardConfigPathNow` replaced the fork's), but writes the config as root with mode 0600 - including the atomic rewrite that provisions the web credential - which locks out an AdGuard the package runs as its own user. The fork routes all of those writes through `writeAdGuardConfig`/`copyAdGuardOwner`. |
