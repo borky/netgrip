@@ -39,12 +39,9 @@ start_service() {
 	# arguments, and that also splits a certificate path containing a space,
 	# which loses the flag its argument without a word of complaint.
 	set --
-	if [ -n "$update_repo" ]; then
-		set -- -update-repo "$update_repo"
-	fi
 	case "$https" in
 		1|on|true|yes)
-			set -- "$@" -https
+			set -- -https
 			if [ -n "$https_cert" ]; then
 				set -- "$@" -https-cert "$https_cert"
 			fi
@@ -54,6 +51,11 @@ start_service() {
 			;;
 	esac
 	procd_set_param command /usr/sbin/netgrip -listen 0.0.0.0 -port "$port" "$@"
+	# The update source goes in the environment, not as -update-repo: a
+	# binary without the fork's flag (upstream's, after an update pointed
+	# there) would refuse to start on an unknown flag, and the panel would
+	# stay down. An unknown variable is ignored.
+	[ -n "$update_repo" ] && procd_set_param env NETGRIP_UPDATE_REPO="$update_repo"
 	# respawn <threshold> <timeout> <retry>. The retry count was 0, which
 	# procd reads as "forever": a panel that cannot start - a certificate
 	# that will not open, a port permanently taken - died and was restarted

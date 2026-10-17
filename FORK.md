@@ -70,7 +70,7 @@ Since upstream #469/#494/#544 the binary carries a copy of the init script
 and rewrites `/etc/init.d/netgrip` with it, at self-update and at every start,
 when the installed script has the `# netgrip init - managed` marker or
 byte-matches an old packaged one. That copy must be the fork's script: with
-upstream's, the rewrite drops `-update-repo` and the panel goes back to
+upstream's, the rewrite drops `NETGRIP_UPDATE_REPO` and the panel goes back to
 offering upstream's releases. Upstream's own
 `TestSelfUpdateEmbeddedInitMatchesPackaged` fails when the two drift, so a
 sync that touches `netgrip.init` shows it. Committing the copy needs
@@ -80,11 +80,26 @@ which the identifying-data hook matches.
 A script installed before the marker existed, carrying the fork's lines,
 matches neither rule and is never rewritten.
 
+The script hands the repository over as `NETGRIP_UPDATE_REPO` in the
+environment, not as `-update-repo`: a binary without the fork's flag (an
+upstream one, after an update pointed there) would exit on the unknown flag
+and leave the panel down, while an unknown variable is ignored. The binary
+still accepts the flag, which scripts installed before this change pass.
+
+**A local edit to a script with the marker is undone at the next start**,
+with the old one kept as `/etc/init.d/netgrip.bak-<version>`. To keep an edit,
+delete the marker line, which makes the script "customized" and leaves it
+alone - and also stops it receiving later init changes.
+
+The device role (upstream #457), which the navigation follows, is decided by
+`classifyMode` here, so a box with firewall and dnsmasq off is an access
+point in the menus too, not only in the mode card.
+
 ## Upstream behaviour this fork accepts as-is
 
 | behaviour | decision |
 |---|---|
-| The panel polls `https://netgrip.cloudless.club/announcements.json` every 6 hours and renders the result as a ribbon (upstream #389) | **Left alone, deliberately.** It means this build makes a recurring outbound call to upstream's domain and upstream can show text and a link inside the panel. Acceptable while the only user is the person who builds it — and it is how a security notice would arrive. No patch is needed to change course later: upstream already honours `NETGRIP_ANNOUNCEMENTS_URL`, so the init script can point it elsewhere, or at something unreachable to silence it (there is no explicit off switch). Revisit if the fork gets other users. |
+| The panel polls `https://netgrip.cloudless.club/announcements.json` every 6 hours and renders the result as a ribbon (upstream #389) | **Left alone, deliberately.** It means this build makes a recurring outbound call to upstream's domain and upstream can show text and a link inside the panel. Acceptable while the only user is the person who builds it — and it is how a security notice would arrive. No patch is needed to change course later: upstream already honours `NETGRIP_ANNOUNCEMENTS_URL`, so the init script can point it elsewhere (with its managed marker removed, or the next start reverts the edit), or at something unreachable to silence it (there is no explicit off switch). Revisit if the fork gets other users. |
 | The embedded agent registers the executor token with the configured NetPulse server at every start (upstream #412) | **Left alone.** It stays inside the network, going only to the server the owner configured - but with the agent on plain `http://` it goes **in clear**, as does the copy sent with every backup upload (`X-Executor-Token`). The remedy is the agent's channel, not this call: point `NETPULSE_SERVER` at https with `NETPULSE_SERVER_FP`. Two more things to know: it now goes through the agent's pinned transport (see "Reaching NetPulse over HTTPS" below), so on https it reaches only the server the agent trusts; NetPulse now handles it (`/api/agents/executor-token`, upstream #838), storing the token for delegation - including MQTT propagation, which sends the broker's credentials through that delegation (see NetPulse's FORK.md). Holding that token also lets NetPulse re-point this router's MQTT (`mqtt.configure`, upstream #410). |
 
 Read at the 2026-10-17 sync (v0.77.0): no new outbound address and no new
@@ -152,9 +167,8 @@ These would go upstream tomorrow if they could:
 
 | patch | blocked by |
 |---|---|
-| Reporting the panel port and the uplink policy to the monitoring agent | Needs `PanelPort` and `MultiWan` in a released `netpulse/agent`. Only builds with the local `go.work` until then. |
-| Reporting that the panel serves HTTPS, and the key of its certificate | Needs `PanelTLS` and `PanelSPKI` in a released `netpulse/agent`; same `go.work` arrangement. NetPulse pins that key before sending this panel its executor token, and links to the panel with https. HTTPS is reported from `-https` itself, recorded before the agent starts, so the panel never looks like plain HTTP while its certificate is still being opened; the key is read from the certificate reloader at every push, so it follows a rotation. The pin is only as trustworthy as the agent's channel to NetPulse: sound over https with the server's key pinned, not over plain http - where, as noted above, the executor token already crosses in clear by other routes. |
-| Reaching NetPulse over HTTPS: NetGrip's own requests (enrolment, the executor token, backup uploads) pinned like the embedded agent; enrolment over https when discovery offers it; a fingerprint field in the NetPulse card, kept when a save leaves it empty | Needs `runtime.ServerTransport` and `runtime.ValidatePins` in a released `netpulse/agent`; same `go.work` arrangement. A backup push to a server other than the agent's, with no fingerprint of its own, still checks system CAs as before. Enrolment's pin comes from an unauthenticated UDP reply, so it is trust on first use and is logged as such - and an agent already pinned to an https server is never re-enrolled from one, even by upstream's stale-server fallback; a pairing reply's own `server_fp` is no longer stored for a plain-http server, where anyone could have put it there. See NetPulse's `docs/https.md`. |
+| Reporting that the panel serves HTTPS, and the key of its certificate | Needs `PanelTLS` and `PanelSPKI` in a released `netpulse/agent`; these are the only fields the panel still needs from an unreleased agent (`PanelPort`, `MultiWan`, `ServerTransport` and `ValidatePins` are in agent v1.5.2), so only they keep `go.work` necessary. NetPulse pins that key before sending this panel its executor token, and links to the panel with https. HTTPS is reported from `-https` itself, recorded before the agent starts, so the panel never looks like plain HTTP while its certificate is still being opened; the key is read from the certificate reloader at every push, so it follows a rotation. The pin is only as trustworthy as the agent's channel to NetPulse: sound over https with the server's key pinned, not over plain http - where, as noted above, the executor token already crosses in clear by other routes. |
+| Reaching NetPulse over HTTPS: NetGrip's own requests (enrolment, the executor token, backup uploads) pinned like the embedded agent; enrolment over https when discovery offers it; a fingerprint field in the NetPulse card, kept when a save leaves it empty | `runtime.ServerTransport` and `runtime.ValidatePins` are released in agent v1.5.2; not offered yet. A backup push to a server other than the agent's, with no fingerprint of its own, still checks system CAs as before. Enrolment's pin comes from an unauthenticated UDP reply, so it is trust on first use and is logged as such - and an agent already pinned to an https server is never re-enrolled from one, even by upstream's stale-server fallback; a pairing reply's own `server_fp` is no longer stored for a plain-http server, where anyone could have put it there. See NetPulse's `docs/https.md`. |
 | AdGuard Home as it is set up (`dns_adguard*.go`, `AdguardCard.tsx`): the web UI port from its sockets, AdGuard serving :53 itself counted as filtering, and every config write keeping the file's owner | Not offered yet. Upstream #427 now resolves the config path itself (its `adGuardConfigPathNow` replaced the fork's), but writes the config as root with mode 0600 - including the atomic rewrite that provisions the web credential - which locks out an AdGuard the package runs as its own user. The fork routes all of those writes through `writeAdGuardConfig`/`copyAdGuardOwner`. |
 
 ## The identifying-data hooks
