@@ -1,6 +1,25 @@
 {
  "announcements": [
   {
+   "id": "v0771-2026-10",
+   "urgency": "info",
+   "title": {
+    "es": "Novedades de la v0.77.1",
+    "en": "What's new in v0.77.1"
+   },
+   "body": {
+    "es": "La auto-actualización vuelve a funcionar en dispositivos con poca flash: el chequeo de espacio cuenta ya el que se libera al reemplazar el binario, así que las actualizaciones desde el panel vuelven a aplicarse en equipos con overlays pequeños.",
+    "en": "Self-update works again on small-flash devices: the space check now counts the room freed by replacing the binary, so in-app updates apply again on devices with tiny overlays."
+   },
+   "url": "https://github.com/gnacho/netgrip/releases/tag/v0.77.1",
+   "urlLabel": {
+    "es": "Ver la release",
+    "en": "See the release"
+   },
+   "starts": "2026-10-20",
+   "expires": "2026-12-31"
+  },
+  {
    "id": "v0770-2026-10",
    "urgency": "info",
    "title": {
