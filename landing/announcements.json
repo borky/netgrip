@@ -1,6 +1,24 @@
 {
  "announcements": [
   {
+   "id": "v0773-2026-10",
+   "urgency": "info",
+   "title": {
+    "es": "Novedades de la v0.77.3",
+    "en": "What's new in v0.77.3"
+   },
+   "body": {
+    "es": "El agente NetPulse embebido sube a la v1.5.5: detecta el bridge LAN aunque no se llame br-lan/br0 (los switches con bridge propio vuelven a reportar sus clientes) y envía la configuración inalámbrica que alimenta la vista 802.11r. Y cuando el self-update lo dispara NetPulse desde la flota, ahora informa del resultado: la interfaz de NetPulse muestra el progreso y el motivo real si algo falla, en vez de quedarse en \"enviado\".",
+    "en": "The embedded NetPulse agent bumps to v1.5.5: it detects the LAN bridge even when it is not br-lan/br0 (switches with their own bridge report their clients again) and sends the wireless config that feeds the 802.11r view. And when NetPulse triggers the self-update from the fleet, it now reports the outcome: NetPulse shows the progress and the real reason when something fails, instead of sitting at \"sent\"."
+   },
+   "url": "https://github.com/gnacho/netgrip/releases/tag/v0.77.3",
+   "urlLabel": {
+    "es": "Ver la release",
+    "en": "See the release"
+   },
+   "starts": "2026-10-20"
+  },
+  {
    "id": "v0772-2026-10",
    "urgency": "info",
    "title": {
