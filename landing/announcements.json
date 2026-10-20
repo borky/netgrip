@@ -1,6 +1,25 @@
 {
  "announcements": [
   {
+   "id": "v0772-2026-10",
+   "urgency": "info",
+   "title": {
+    "es": "Novedades de la v0.77.2",
+    "en": "What's new in v0.77.2"
+   },
+   "body": {
+    "es": "El chasis marca ya cuál es el puerto de gestión con un candado: es la boca por la que se alcanza el panel y la que conviene mirar dos veces antes de espejar tráfico, recortar ancho de banda o tocar STP. La detección se carga después del primer pintado, sin penalizar switches densos.",
+    "en": "The chassis marks the management port with a lock badge: the port the panel itself is reached through, and the one to think twice about before mirroring traffic, trimming bandwidth or touching STP. Detection loads after the first paint, so dense switches stay snappy."
+   },
+   "url": "https://github.com/gnacho/netgrip/releases/tag/v0.77.2",
+   "urlLabel": {
+    "es": "Ver la release",
+    "en": "See the release"
+   },
+   "starts": "2026-10-20",
+   "expires": "2026-12-31"
+  },
+  {
    "id": "v0771-2026-10",
    "urgency": "info",
    "title": {
