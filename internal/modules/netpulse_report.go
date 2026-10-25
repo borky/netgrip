@@ -39,7 +39,14 @@ func npPostUpgradeReport(cfg NetPulseConfig, path string, body map[string]any) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+cfg.Token)
-	client := &http.Client{Timeout: 10 * time.Second}
+	// FORK: pinned like NetGrip's other requests to NetPulse. A plain client
+	// cannot reach a server on its private CA, and would not refuse a
+	// redirect carrying the agent token elsewhere.
+	client, err := netPulseClient(cfg.Server, cfg.ServerFP, 10*time.Second)
+	if err != nil {
+		log.Printf("netpulse: reporte de upgrade no entregado: %v", err)
+		return
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		log.Printf("netpulse: reporte de upgrade no entregado: %v", err)
