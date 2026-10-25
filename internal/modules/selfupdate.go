@@ -453,7 +453,7 @@ func installSelfUpdate(tmpPath, currentBin string) error {
 	// update; a false "enough" defers ENOSPC to the copy, which is already
 	// handled gracefully).
 	var freed uint64
-	if cur, err := os.Stat(currentBin); err == nil && cur.Size() > 0 {
+	if cur, err := os.Stat(currentBin); err == nil && cur.Size() > 0 && !isRunningBinary(cur) {
 		freed = uint64(cur.Size())
 	}
 
@@ -475,6 +475,25 @@ func installSelfUpdate(tmpPath, currentBin string) error {
 		return fmt.Errorf("write new binary: %w", err)
 	}
 	return os.Chmod(currentBin, 0755)
+}
+
+// isRunningBinary reports whether fi is this process's own executable.
+//
+// FORK: unlinking a running binary frees nothing until the process exits -
+// the inode stays alive for it, which is what keeps the service up - so a
+// self-update needs room for both copies at once. Counting the running
+// binary as freed (upstream #548) let an update pass the pre-check on a
+// near-full overlay, remove the old binary and then hit ENOSPC halfway
+// through the copy, leaving a truncated binary for the next start. A
+// binary that is not running is freed by the unlink and still counts.
+// Without /proc to ask, it answers true: the only real caller replaces the
+// running binary, and "not enough space" is the failure that can be undone.
+func isRunningBinary(fi os.FileInfo) bool {
+	self, err := os.Stat("/proc/self/exe")
+	if err != nil {
+		return true
+	}
+	return os.SameFile(fi, self)
 }
 
 // spaceFor reports whether dir has at least needed bytes available plus a
