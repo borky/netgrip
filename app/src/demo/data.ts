@@ -847,6 +847,7 @@ export const demoTcp: T.TCPResult = {
 export const demoTelegram = { botToken: "", chatId: "", enabled: false };
 
 export const demoNtfy = { server: "", topic: "", tokenSet: false, enabled: false };
+export const demoMatrix = { server: "", roomId: "", tokenSet: false, enabled: false, unreadable: false };
 
 /**
  * Histórico 24 h (muestras cada 5 min, contadores acumulados): día tranquilo

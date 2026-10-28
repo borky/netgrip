@@ -59,6 +59,7 @@ const state = {
   lanServices: structuredClone(D.demoLanServices),
   telegram: { ...D.demoTelegram },
   ntfy: { ...D.demoNtfy },
+  matrix: { ...D.demoMatrix },
   netpulse: {
     enabled: true,
     configured: true,
@@ -835,6 +836,13 @@ export const demoApi: typeof api = {
     return { ok: true };
   },
   ntfyTest: async () => { await wait(400, 900); return { ok: true } },
+  matrixGet: () => get(state.matrix),
+  matrixSet: async (server, roomId, token, enabled) => {
+    await wait(800, 1500);
+    state.matrix = { server, roomId, tokenSet: token !== "" || state.matrix.tokenSet, enabled, unreadable: false };
+    return { ok: true };
+  },
+  matrixTest: async () => { await wait(400, 900); return { ok: true } },
 
   // netpulse (agente embebido): estado sano y push reciente en la demo
   netpulse: () => get({
