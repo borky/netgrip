@@ -1,16 +1,17 @@
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
-import { Bell, Radio, Webhook } from "lucide-react";
+import { Bell, MessagesSquare, Radio, Webhook } from "lucide-react";
 import { Card, Pill } from "../ui";
 import { CollapsibleSection } from "./CollapsibleSection";
 import { TelegramSettings } from "./TelegramSettings";
 import { NtfySettings } from "./NtfySettings";
+import { MatrixSettings } from "./MatrixSettings";
 import { MQTTSettings } from "./MQTTSettings";
 
 type Channel = boolean | undefined;
 
 /**
- * Telegram + ntfy + MQTT en una sola tarjeta (#499): cada canal es una
+ * Telegram + ntfy + Matrix + MQTT en una sola tarjeta (#499): cada canal es una
  * línea (nombre + estado + chevron) que se despliega al pulsar. Los
  * formularios permanecen montados (ocultos) para no perder el estado ni
  * repetir peticiones; MQTT además solo sondea el broker con su sección
@@ -20,6 +21,7 @@ export function IntegrationsCard({ index = 0 }: { index?: number }) {
   const { t } = useTranslation();
   const [telegram, setTelegram] = useState<Channel>();
   const [ntfy, setNtfy] = useState<Channel>();
+  const [matrix, setMatrix] = useState<Channel>();
   const [mqtt, setMqtt] = useState<{ enabled: Channel; connected: Channel }>({ enabled: undefined, connected: undefined });
   const [mqttOpen, setMqttOpen] = useState(false);
 
@@ -42,6 +44,9 @@ export function IntegrationsCard({ index = 0 }: { index?: number }) {
         </CollapsibleSection>
         <CollapsibleSection icon={Bell} title={t("ntfy.title")} status={pill(ntfy)}>
           <NtfySettings onStatus={setNtfy} />
+        </CollapsibleSection>
+        <CollapsibleSection icon={MessagesSquare} title={t("matrix.title")} status={pill(matrix)}>
+          <MatrixSettings onStatus={setMatrix} />
         </CollapsibleSection>
         <CollapsibleSection icon={Radio} title={t("mqtt.title")} status={mqttPill}
           onOpenChange={setMqttOpen}>
