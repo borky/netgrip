@@ -640,6 +640,16 @@ const realApi = {
     }),
   ntfyTest: () =>
     request<{ ok: boolean }>("/api/ntfy/test", { method: "POST" }),
+  matrixGet: () =>
+    request<{ server: string; roomId: string; tokenSet: boolean; enabled: boolean; unreadable: boolean }>("/api/matrix"),
+  matrixSet: (server: string, roomId: string, token: string, enabled: boolean) =>
+    request<{ ok: boolean }>("/api/matrix", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ server, roomId, token, enabled }),
+    }),
+  matrixTest: () =>
+    request<{ ok: boolean }>("/api/matrix/test", { method: "POST" }),
   cpu: () =>
     request<import("./types").CPUProbe>("/api/cpu"),
   nlbwmon: () =>

@@ -139,23 +139,45 @@ func (m *Monitor) checkNewClients() {
 	}
 }
 
-// notifyAll sends one notification to every enabled channel (Telegram and
-// ntfy), fail-silent: a channel outage never breaks the caller. telegramText
-// is HTML (Telegram parse_mode), ntfyText is plain text (ntfy does not parse
-// HTML) and title is the ntfy Title header.
+// notifyAll sends one notification to every enabled channel (Telegram,
+// ntfy and Matrix), fail-silent: a channel outage never breaks the caller.
+// telegramText is HTML (Telegram parse_mode), ntfyText is plain text (ntfy
+// does not parse HTML) and title is the ntfy Title header. Matrix gets both:
+// the plain text as its body and the HTML as its formatted body.
+//
+// The channels are sent to in parallel: each has its own timeout and retry,
+// and one slow or hanging server must not hold the others (or the monitor)
+// back for the sum of all of them.
 func notifyAll(title, telegramText, ntfyText string, urgent bool) {
+	var wg sync.WaitGroup
 	tg := LoadTelegramConfig()
 	if tg.Enabled && tg.BotToken != "" && tg.ChatID != "" {
-		if err := SendTelegram(tg, telegramText, urgent); err != nil {
-			log.Printf("[notify] telegram: %v", err)
-		}
+		wg.Go(func() {
+			if err := SendTelegram(tg, telegramText, urgent); err != nil {
+				log.Printf("[notify] telegram: %v", err)
+			}
+		})
 	}
 	nt := LoadNtfyConfig()
 	if nt.Enabled && nt.Topic != "" {
-		if err := SendNtfy(nt, title, ntfyText, urgent); err != nil {
-			log.Printf("[notify] ntfy: %v", err)
-		}
+		wg.Go(func() {
+			if err := SendNtfy(nt, title, ntfyText, urgent); err != nil {
+				log.Printf("[notify] ntfy: %v", err)
+			}
+		})
 	}
+	mx := LoadMatrixConfig()
+	switch {
+	case mx.Enabled && mx.Configured():
+		wg.Go(func() {
+			if err := SendMatrix(mx, ntfyText, telegramText, urgent); err != nil {
+				log.Printf("[notify] matrix: %s", MatrixLogSafe(err))
+			}
+		})
+	case mx.Enabled && mx.Unreadable:
+		log.Printf("[notify] matrix: not sent, the stored config cannot be read; enter the credentials again")
+	}
+	wg.Wait()
 }
 
 // anyChannelEnabled reports whether at least one notification channel is
@@ -166,5 +188,9 @@ func anyChannelEnabled() bool {
 		return true
 	}
 	nt := LoadNtfyConfig()
-	return nt.Enabled && nt.Topic != ""
+	if nt.Enabled && nt.Topic != "" {
+		return true
+	}
+	mx := LoadMatrixConfig()
+	return mx.Enabled && mx.Configured()
 }

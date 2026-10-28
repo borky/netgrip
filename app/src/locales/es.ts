@@ -373,6 +373,10 @@ export default {
       title: "¿Cómo configuro ntfy?",
       body: "1. Instala la app de ntfy o usa ntfy.sh en el navegador. 2. Elige un nombre de topic (por ejemplo netgrip-casa) y suscríbete a él. 3. Pega aquí el servidor (https://ntfy.sh o el tuyo propio) y el topic. El token es opcional, para topics protegidos.",
     },
+    matrix: {
+      title: "¿Cómo configuro Matrix?",
+      body: "1. Crea una cuenta para el bot en tu homeserver e inicia sesión con ella una vez (por ejemplo en Element) para obtener su token de acceso: Ajustes → Ayuda y acerca de → Token de acceso. No cierres esa sesión, revocaría el token. 2. Invita al bot a la sala y acepta la invitación con el bot. 3. Copia el id interno de la sala (Ajustes de la sala → Avanzado); empieza por !. 4. Pega aquí la URL del homeserver, el id de la sala y el token. Al guardar se comprueba el token y que el bot está en la sala.",
+    },
     storage: {
       title: "¿Para qué un USB en el router?",
       body: "Un USB en el router sirve para copias, compartir archivos en casa o guardar registros. No reemplaza a un NAS, pero apaña.",
@@ -2612,6 +2616,20 @@ export default {
     save: "Guardar",
     sendTest: "Enviar mensaje de prueba",
     testSent: "Mensaje de prueba enviado. Mira tu ntfy.",
+    saved: "Guardado",
+  },
+  matrix: {
+    title: "Avisos por Matrix",
+    description: "El router publica en una sala de Matrix a través de una cuenta bot si pasa algo importante. La URL del homeserver, el id de la sala y el token se guardan cifrados.",
+    enabled: "Activar avisos",
+    server: "URL del homeserver",
+    roomId: "Id de la sala",
+    token: "Token de acceso",
+    tokenSet: "Hay un token guardado",
+    unreadable: "Las credenciales guardadas no se pueden descifrar (/etc/netgrip/secrets.key se perdió o se sustituyó). Vuelve a introducirlas.",
+    save: "Guardar",
+    sendTest: "Enviar mensaje de prueba",
+    testSent: "Mensaje de prueba enviado. Mira tu sala de Matrix.",
     saved: "Guardado",
   },
   netpulse: {

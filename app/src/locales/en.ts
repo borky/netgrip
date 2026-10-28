@@ -373,6 +373,10 @@ export default {
       title: "How do I set up ntfy?",
       body: "1. Install the ntfy app or use ntfy.sh in the browser. 2. Pick a topic name (like netgrip-casa) and subscribe to it. 3. Paste the server (https://ntfy.sh or your self-hosted one) and the topic here. The token is optional, for protected topics.",
     },
+    matrix: {
+      title: "How do I set up Matrix?",
+      body: "1. Create an account for the bot on your homeserver and log in with it once (for example in Element) to get its access token: Settings → Help & About → Access Token. Do not log out of that session, it would revoke the token. 2. Invite the bot to the room and accept the invite as the bot. 3. Copy the room's internal id (Room settings → Advanced); it starts with !. 4. Paste the homeserver URL, the room id and the token here. Saving checks the token and that the bot is in the room.",
+    },
     storage: {
       title: "Why a USB drive on the router?",
       body: "A USB drive on the router works for backups, home file sharing or logs. Not a NAS replacement, but handy.",
@@ -2612,6 +2616,20 @@ export default {
     save: "Save",
     sendTest: "Send a test message",
     testSent: "Test message sent. Check your ntfy.",
+    saved: "Saved",
+  },
+  matrix: {
+    title: "Matrix alerts",
+    description: "The router posts to a Matrix room through a bot account if something important happens. The homeserver URL, room id and token are stored encrypted.",
+    enabled: "Turn alerts on",
+    server: "Homeserver URL",
+    roomId: "Room id",
+    token: "Access token",
+    tokenSet: "A token is stored",
+    unreadable: "The stored credentials cannot be decrypted (/etc/netgrip/secrets.key was lost or replaced). Enter them again.",
+    save: "Save",
+    sendTest: "Send a test message",
+    testSent: "Test message sent. Check your Matrix room.",
     saved: "Saved",
   },
   netpulse: {
