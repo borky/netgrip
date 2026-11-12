@@ -37,10 +37,10 @@ const releaseNoAssets = `{"tag_name":"v9.9.9","body":"release notes","assets":[]
 const releaseWithAsset = `{"tag_name":"v9.9.9","body":"release notes","assets":[` +
 	`{"name":"netgrip-linux-arm64","browser_download_url":"http://example.com/netgrip-linux-arm64","size":1234},` +
 	`{"name":"netgrip-linux-amd64","browser_download_url":"http://example.com/netgrip-linux-amd64","size":1234},` +
-	`{"name":"netgrip-linux-arm64.sha256","browser_download_url":"http://example.com/netgrip-linux-arm64.sha256","size":65},` +
-	`{"name":"netgrip-linux-arm64.sha256.sig","browser_download_url":"http://example.com/netgrip-linux-arm64.sha256.sig","size":64},` +
-	`{"name":"netgrip-linux-amd64.sha256","browser_download_url":"http://example.com/netgrip-linux-amd64.sha256","size":65},` +
-	`{"name":"netgrip-linux-amd64.sha256.sig","browser_download_url":"http://example.com/netgrip-linux-amd64.sha256.sig","size":64}]}`
+	`{"name":"netgrip-linux-arm64.manifest","browser_download_url":"http://example.com/netgrip-linux-arm64.manifest","size":140},` +
+	`{"name":"netgrip-linux-arm64.manifest.sig","browser_download_url":"http://example.com/netgrip-linux-arm64.manifest.sig","size":64},` +
+	`{"name":"netgrip-linux-amd64.manifest","browser_download_url":"http://example.com/netgrip-linux-amd64.manifest","size":140},` +
+	`{"name":"netgrip-linux-amd64.manifest.sig","browser_download_url":"http://example.com/netgrip-linux-amd64.manifest.sig","size":64}]}`
 
 func TestBinaryAssetNameUsesReleaseArchitecture(t *testing.T) {
 	original := releaseArch
@@ -179,13 +179,13 @@ func TestStartSelfUpdateUsesValidCacheWithoutRecheck(t *testing.T) {
 
 	updateMu.Lock()
 	updateCheck = &SelfUpdateCheck{
-		Current:   "0.62.0",
-		Latest:    "v9.9.9",
-		Available: true,
-		AssetURL:  "http://example.com/cached",
-		AssetSize: 42,
-		DigestURL: "http://example.com/cached.sha256",
-		SigURL:    "http://example.com/cached.sha256.sig",
+		Current:        "0.62.0",
+		Latest:         "v9.9.9",
+		Available:      true,
+		AssetURL:       "http://example.com/cached",
+		AssetSize:      42,
+		ManifestURL:    "http://example.com/cached.manifest",
+		ManifestSigURL: "http://example.com/cached.manifest.sig",
 	}
 	updateMu.Unlock()
 
