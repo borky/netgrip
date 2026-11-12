@@ -97,6 +97,9 @@ type Server struct {
 	// window is about to revert, and arm a new window that restores it.
 	// Lock order: riskyMu before confirmMu.
 	riskyMu sync.Mutex
+	// riskyWait: how long a timeout revert waits for riskyMu; 0 means
+	// defaultRiskyWait.
+	riskyWait time.Duration
 }
 
 // New builds the panel. secure says it will be served over TLS, and

@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/gnacho/netgrip/internal/executor"
@@ -90,8 +91,19 @@ func (s *Server) armConfirm(snapshots map[string]string, timeout time.Duration) 
 // expireConfirm reverts the pending confirm when its timer fires, unless it
 // was already kept/reverted (id no longer matches) in the meantime.
 func (s *Server) expireConfirm(id string) {
-	s.riskyMu.Lock()
-	defer s.riskyMu.Unlock()
+	// Wait for a risky change in flight, but not forever: the timeout
+	// revert is the safety net when the panel cannot be reached, and an
+	// apply that hangs (a wifi or network reload that never returns) must
+	// not hold it back. Past riskyWait it reverts without the lock.
+	wait := s.riskyWait
+	if wait == 0 {
+		wait = defaultRiskyWait
+	}
+	if lockWithin(&s.riskyMu, wait) {
+		defer s.riskyMu.Unlock()
+	} else {
+		log.Printf("[confirm] a risky change has held the lock for %s; reverting without it", wait)
+	}
 	s.confirmMu.Lock()
 	e := s.confirm
 	if e == nil || e.id != id {
@@ -123,6 +135,24 @@ func (s *Server) runRevert(e *confirmEntry, why string) error {
 	s.lastRevert = &revertResult{at: time.Now(), err: err}
 	s.confirmMu.Unlock()
 	return err
+}
+
+// defaultRiskyWait bounds how long a timeout revert waits for a risky
+// change in flight (Server.riskyWait overrides it in tests).
+const defaultRiskyWait = 30 * time.Second
+
+// lockWithin takes mu, giving up after d.
+func lockWithin(mu *sync.Mutex, d time.Duration) bool {
+	deadline := time.Now().Add(d)
+	for {
+		if mu.TryLock() {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 // keepConfirm cancels the pending confirm, keeping the applied changes.
