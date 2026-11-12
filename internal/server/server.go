@@ -88,8 +88,9 @@ type Server struct {
 	logins *loginThrottle
 	// confirmMu guards confirm, the single pending apply-rollback window
 	// (connectivity-risky changes with a revert timer). See confirm.go.
-	confirmMu sync.Mutex
-	confirm   *confirmEntry
+	confirmMu  sync.Mutex
+	confirm    *confirmEntry
+	lastRevert *revertResult
 }
 
 // New builds the panel. secure says it will be served over TLS, and
@@ -728,7 +729,11 @@ func (s *Server) handleWanConfigPost(w http.ResponseWriter, r *http.Request) {
 	}
 	var snapshots map[string]string
 	if req.Confirm {
-		snapshots = snapshotConfigs("network")
+		var err error
+		if snapshots, err = snapshotForConfirm([]string{"network"}, nil); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 	}
 	applied, err := modules.ApplyWANConfig(req.WANConfig)
 	if err != nil {
@@ -736,9 +741,7 @@ func (s *Server) handleWanConfigPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Confirm {
-		id, expires := s.armConfirm(func() error {
-			return revertSnapshots(snapshots, []string{"network"})
-		}, confirmTimeout)
+		id, expires := s.armConfirm(snapshots, confirmTimeout)
 		// Keep the WANConfig shape and attach the confirm on top, so a
 		// non-confirming client sees exactly what it saw before.
 		b, _ := json.Marshal(applied)
@@ -1716,10 +1719,14 @@ func (s *Server) handleWifiSet(w http.ResponseWriter, r *http.Request) {
 	}
 	var snapshots map[string]string
 	if req.Confirm {
-		snapshots = snapshotConfigs("wireless")
+		var err error
+		if snapshots, err = snapshotForConfirm([]string{"wireless"}, nil); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 	}
 	probe, rolledBack, err := modules.SetWifi(req.WifiEdit)
-	s.finishRiskyApply(w, probe, rolledBack, err, req.Confirm, snapshots, []string{"wireless"})
+	s.finishRiskyApply(w, probe, rolledBack, err, req.Confirm, snapshots)
 }
 
 func (s *Server) handleWifiRadioSet(w http.ResponseWriter, r *http.Request) {
@@ -1733,10 +1740,14 @@ func (s *Server) handleWifiRadioSet(w http.ResponseWriter, r *http.Request) {
 	}
 	var snapshots map[string]string
 	if req.Confirm {
-		snapshots = snapshotConfigs("wireless")
+		var err error
+		if snapshots, err = snapshotForConfirm([]string{"wireless"}, nil); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 	}
 	probe, rolledBack, err := modules.SetWifiRadio(req.RadioEdit)
-	s.finishRiskyApply(w, probe, rolledBack, err, req.Confirm, snapshots, []string{"wireless"})
+	s.finishRiskyApply(w, probe, rolledBack, err, req.Confirm, snapshots)
 }
 
 func (s *Server) handleWifiScheduleGet(w http.ResponseWriter, _ *http.Request) {
@@ -1812,10 +1823,14 @@ func (s *Server) handleLANSet(w http.ResponseWriter, r *http.Request) {
 	// success, arm a revert timer that auto-restores unless the UI confirms.
 	var snapshots map[string]string
 	if req.Confirm {
-		snapshots = captureRiskySnapshots()
+		var err error
+		if snapshots, err = snapshotForConfirm([]string{"network"}, []string{"wireless"}); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 	}
 	probe, rolledBack, err := modules.SetLAN(cfg)
-	s.finishRiskyApply(w, probe, rolledBack, err, req.Confirm, snapshots, []string{"network"})
+	s.finishRiskyApply(w, probe, rolledBack, err, req.Confirm, snapshots)
 }
 
 func (s *Server) handleDHCPSet(w http.ResponseWriter, r *http.Request) {
@@ -2696,10 +2711,14 @@ func (s *Server) handleFirewallAddRule(w http.ResponseWriter, r *http.Request) {
 	}
 	var snapshots map[string]string
 	if req.Confirm {
-		snapshots = snapshotConfigs("firewall")
+		var err error
+		if snapshots, err = snapshotForConfirm([]string{"firewall"}, nil); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 	}
 	probe, rolledBack, err := modules.AddFirewallRule(req.FirewallRuleAdd)
-	s.finishRiskyApply(w, probe, rolledBack, err, req.Confirm, snapshots, []string{"firewall"})
+	s.finishRiskyApply(w, probe, rolledBack, err, req.Confirm, snapshots)
 }
 
 type fwDeleteRequest struct {
@@ -2715,10 +2734,14 @@ func (s *Server) handleFirewallDelRule(w http.ResponseWriter, r *http.Request) {
 	}
 	var snapshots map[string]string
 	if req.Confirm {
-		snapshots = snapshotConfigs("firewall")
+		var err error
+		if snapshots, err = snapshotForConfirm([]string{"firewall"}, nil); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 	}
 	probe, rolledBack, err := modules.DeleteFirewallRule(req.Section)
-	s.finishRiskyApply(w, probe, rolledBack, err, req.Confirm, snapshots, []string{"firewall"})
+	s.finishRiskyApply(w, probe, rolledBack, err, req.Confirm, snapshots)
 }
 
 func (s *Server) handleTemplatesGet(w http.ResponseWriter, _ *http.Request) {

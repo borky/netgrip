@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { Clock } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { api } from "../api";
-import { Button, IconTile, Modal } from "./ui";
+import { Button, IconTile, Modal, useToast } from "./ui";
 
 export interface PendingConfirm {
   id: string;
@@ -17,6 +17,8 @@ export interface PendingConfirm {
  * does not strand a pending window.
  */
 export function useRollbackConfirm() {
+  const { t } = useTranslation();
+  const { push } = useToast();
   const [pending, setPending] = useState<PendingConfirm | null>(null);
   const [seconds, setSeconds] = useState(0);
 
@@ -31,11 +33,26 @@ export function useRollbackConfirm() {
     const tick = () => {
       const left = Math.max(0, Math.ceil(pending.expires - Date.now() / 1000));
       setSeconds(left);
-      if (left <= 0) setPending(null);
+      if (left <= 0) {
+        setPending(null);
+        // The server reverts on its own at expiry; ask how that went a
+        // moment later instead of assuming it worked.
+        setTimeout(() => {
+          api.confirmStatus()
+            .then((c) => {
+              const lr = c?.last_revert;
+              if (lr && !lr.ok && lr.at >= pending.expires - 5) {
+                push({ tone: "danger", text: t("common.rollbackFailed", { error: lr.error ?? "" }) });
+              }
+            })
+            .catch(() => {});
+        }, 5000);
+      }
     };
     tick();
     const timer = setInterval(tick, 1000);
     return () => clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pending]);
 
   const keep = () => {
@@ -47,7 +64,11 @@ export function useRollbackConfirm() {
   const revert = () => {
     const id = pending?.id;
     setPending(null);
-    if (id) api.confirmRevert(id).catch(() => {});
+    if (id) {
+      api.confirmRevert(id).catch((e) => {
+        push({ tone: "danger", text: t("common.rollbackFailed", { error: e instanceof Error ? e.message : String(e) }) });
+      });
+    }
   };
 
   const arm = (confirm?: { id: string; expires: number }) => {
