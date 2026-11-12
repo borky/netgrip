@@ -35,18 +35,25 @@ export function useRollbackConfirm() {
       setSeconds(left);
       if (left <= 0) {
         setPending(null);
-        // The server reverts on its own at expiry; ask how that went a
-        // moment later instead of assuming it worked.
-        setTimeout(() => {
+        // The server reverts on its own at expiry; ask how that went
+        // instead of assuming it worked. Restoring and reloading network
+        // and Wi-Fi takes a while, so poll until the revert has finished.
+        let tries = 0;
+        const check = () => {
+          tries++;
           api.confirmStatus()
             .then((c) => {
               const lr = c?.last_revert;
-              if (lr && !lr.ok && lr.at >= pending.expires - 5) {
-                push({ tone: "danger", text: t("common.rollbackFailed", { error: lr.error ?? "" }) });
+              const ours = lr && lr.at >= pending.expires - 5;
+              if (!ours || lr.running) {
+                if (tries < 20) setTimeout(check, 3000);
+                return;
               }
+              if (!lr.ok) push({ tone: "danger", text: t("common.rollbackFailed", { error: lr.error ?? "" }) });
             })
-            .catch(() => {});
-        }, 5000);
+            .catch(() => { if (tries < 20) setTimeout(check, 3000); });
+        };
+        setTimeout(check, 3000);
       }
     };
     tick();
@@ -58,7 +65,11 @@ export function useRollbackConfirm() {
   const keep = () => {
     const id = pending?.id;
     setPending(null);
-    if (id) api.confirmKeep(id).catch(() => {});
+    if (id) {
+      api.confirmKeep(id).catch((e) => {
+        push({ tone: "danger", text: t("common.keepFailed", { error: e instanceof Error ? e.message : String(e) }) });
+      });
+    }
   };
 
   const revert = () => {
