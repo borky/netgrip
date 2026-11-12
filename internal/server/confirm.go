@@ -4,7 +4,11 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
 	"net/http"
+	"sort"
 	"time"
 
 	"github.com/gnacho/netgrip/internal/executor"
@@ -15,14 +19,25 @@ import (
 // so a last-second "Keep" reaches the server before the timer fires.
 const confirmTimeout = 120 * time.Second
 
-// confirmEntry is a single pending apply-rollback window. The revert closure
-// restores the pre-change UCI state; it is captured so tests can inject a
-// no-op and assert on timer/keep/revert behaviour without a real uci binary.
+// confirmEntry is the single pending apply-rollback window. snapshots holds
+// the UCI configs as they were before the first unconfirmed change, keyed by
+// config name; reverting restores all of them.
 type confirmEntry struct {
-	id      string
-	revert  func() error
-	expires time.Time
+	id        string
+	snapshots map[string]string
+	expires   time.Time
 }
+
+// revertResult is the outcome of the last revert, kept so the panel can
+// report what actually happened rather than what was attempted.
+type revertResult struct {
+	at  time.Time
+	err error
+}
+
+// revertFn restores a confirm's snapshots; a var so tests can stub it
+// without a real uci binary.
+var revertFn = revertSnapshots
 
 func newConfirmID() string {
 	b := make([]byte, 8)
@@ -31,15 +46,27 @@ func newConfirmID() string {
 }
 
 // armConfirm registers a pending confirm and schedules its auto-revert.
-// Single-flight: if another confirm is already in flight, it is finalised as
-// kept (the user just triggered a further change, so they are still connected)
-// before the new one takes over.
-func (s *Server) armConfirm(revert func() error, timeout time.Duration) (id string, expires time.Time) {
+//
+// A change made while another is still unconfirmed joins it instead of
+// replacing it: the pending snapshots, which predate both changes, win over
+// the new ones for any config both touched, and the new configs are added.
+// Keep then confirms both, and a timeout or a revert takes the router back to
+// the state before the first unconfirmed change. Dropping the first window
+// instead would keep a change nobody confirmed.
+func (s *Server) armConfirm(snapshots map[string]string, timeout time.Duration) (id string, expires time.Time) {
 	s.confirmMu.Lock()
-	s.confirm = nil // single-flight: drop any in-flight confirm without reverting
+	merged := make(map[string]string, len(snapshots))
+	for k, v := range snapshots {
+		merged[k] = v
+	}
+	if s.confirm != nil {
+		for k, v := range s.confirm.snapshots {
+			merged[k] = v
+		}
+	}
 	id = newConfirmID()
 	expires = time.Now().Add(timeout)
-	s.confirm = &confirmEntry{id: id, revert: revert, expires: expires}
+	s.confirm = &confirmEntry{id: id, snapshots: merged, expires: expires}
 	s.confirmMu.Unlock()
 
 	time.AfterFunc(timeout, func() { s.expireConfirm(id) })
@@ -56,11 +83,23 @@ func (s *Server) expireConfirm(id string) {
 		return
 	}
 	s.confirm = nil
-	rev := e.revert
 	s.confirmMu.Unlock()
-	if rev != nil {
-		_ = rev()
+	s.runRevert(e, "timeout")
+}
+
+// runRevert restores a confirm's snapshots, logs the outcome and records it
+// for the status endpoint. A failed revert is never silent.
+func (s *Server) runRevert(e *confirmEntry, why string) error {
+	err := revertFn(e.snapshots)
+	if err != nil {
+		log.Printf("[confirm] revert after %s FAILED: %v", why, err)
+	} else {
+		log.Printf("[confirm] reverted %v after %s", configNames(e.snapshots), why)
 	}
+	s.confirmMu.Lock()
+	s.lastRevert = &revertResult{at: time.Now(), err: err}
+	s.confirmMu.Unlock()
+	return err
 }
 
 // keepConfirm cancels the pending confirm, keeping the applied changes.
@@ -74,21 +113,18 @@ func (s *Server) keepConfirm(id string) bool {
 	return true
 }
 
-// revertConfirm immediately reverts the pending confirm.
-func (s *Server) revertConfirm(id string) bool {
+// revertConfirm immediately reverts the pending confirm. found reports
+// whether the id matched; err is the revert's own outcome.
+func (s *Server) revertConfirm(id string) (found bool, err error) {
 	s.confirmMu.Lock()
 	e := s.confirm
 	if e == nil || e.id != id {
 		s.confirmMu.Unlock()
-		return false
+		return false, nil
 	}
 	s.confirm = nil
-	rev := e.revert
 	s.confirmMu.Unlock()
-	if rev != nil {
-		_ = rev()
-	}
-	return true
+	return true, s.runRevert(e, "an explicit rollback")
 }
 
 // confirmStatus reports the currently pending confirm, if any.
@@ -101,51 +137,86 @@ func (s *Server) confirmStatus() (id string, expires time.Time, ok bool) {
 	return s.confirm.id, s.confirm.expires, true
 }
 
-// snapshotConfigs exports the given UCI configs so they can be restored on
-// revert. Best effort: a missing config (e.g. no wireless on a switch) is
-// simply skipped.
-func snapshotConfigs(configs ...string) map[string]string {
+// snapshotForConfirm exports the UCI configs a change can touch, before it
+// is applied. A required config that cannot be exported refuses the change:
+// arming a timer that has nothing to restore would report a rollback that
+// cannot happen. Optional configs (wireless on a unit without radios) are
+// skipped when absent.
+func snapshotForConfirm(required, optional []string) (map[string]string, error) {
 	out := map[string]string{}
-	for _, c := range configs {
-		if v, err := executor.Snapshot(c); err == nil {
+	for _, c := range required {
+		v, err := snapshotFn(c)
+		if err != nil {
+			return nil, fmt.Errorf("cannot take a rollback snapshot of %s, change not applied: %w", c, err)
+		}
+		out[c] = v
+	}
+	for _, c := range optional {
+		if v, err := snapshotFn(c); err == nil {
 			out[c] = v
 		}
 	}
-	return out
+	return out, nil
 }
 
-// captureRiskySnapshots exports the UCI configs a LAN change can touch.
-func captureRiskySnapshots() map[string]string {
-	return snapshotConfigs("network", "wireless")
+// snapshotFn is executor.Snapshot; a var so tests can stub it.
+var snapshotFn = executor.Snapshot
+
+// reloadOpFor is how each restored config is brought into effect on the
+// running system. Wi-Fi has no init.d script on OpenWrt: it is reloaded with
+// the wifi command, so an "initd wireless reload" restored the file and left
+// the radios on the reverted-from settings.
+func reloadOpFor(config string) executor.Op {
+	switch config {
+	case "wireless":
+		return executor.Op{Kind: "wifi_reload", Args: []string{}}
+	default: // network, firewall
+		return executor.Op{Kind: "initd", Args: []string{config, "reload"}}
+	}
 }
 
-// revertSnapshots restores the captured configs and reloads the given init.d
-// services so the restored state takes effect on the running stack.
-func revertSnapshots(snapshots map[string]string, reloads []string) error {
-	for config, content := range snapshots {
-		if err := executor.Restore(config, content); err != nil {
-			return err
+// revertSnapshots restores every captured config, then reloads each one. It
+// keeps going past a failure so one bad config does not leave the others
+// unreverted, and returns every error it met.
+func revertSnapshots(snapshots map[string]string) error {
+	var errs []error
+	names := configNames(snapshots)
+	for _, config := range names {
+		if err := executor.Restore(config, snapshots[config]); err != nil {
+			errs = append(errs, err)
 		}
 	}
-	for _, svc := range reloads {
-		_ = executor.Run(executor.Op{Kind: "initd", Args: []string{svc, "reload"}})
+	for _, config := range names {
+		if err := executor.Run(reloadOpFor(config)); err != nil {
+			errs = append(errs, fmt.Errorf("reload %s: %w", config, err))
+		}
 	}
-	return nil
+	return errors.Join(errs...)
+}
+
+// configNames lists a snapshot's configs in a stable order (network before
+// wireless before firewall would not matter to uci; stable makes logs and
+// tests readable).
+func configNames(snapshots map[string]string) []string {
+	names := make([]string, 0, len(snapshots))
+	for k := range snapshots {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	return names
 }
 
 // finishRiskyApply writes a module result, arming a confirm timer when the
 // apply succeeded and the request asked for one. Connectivity-risky handlers
 // (LAN, WAN, WiFi, firewall) route through it so their revert shares the same
-// single-flight window as the LAN change (#557).
-func (s *Server) finishRiskyApply(w http.ResponseWriter, probe any, rolledBack bool, err error, confirm bool, snapshots map[string]string, reloads []string) {
+// window as the LAN change (#557).
+func (s *Server) finishRiskyApply(w http.ResponseWriter, probe any, rolledBack bool, err error, confirm bool, snapshots map[string]string) {
 	if err != nil {
 		writeModuleResult(w, probe, rolledBack, err)
 		return
 	}
 	if confirm {
-		id, expires := s.armConfirm(func() error {
-			return revertSnapshots(snapshots, reloads)
-		}, confirmTimeout)
+		id, expires := s.armConfirm(snapshots, confirmTimeout)
 		writeJSON(w, map[string]any{
 			"state":       probe,
 			"rolled_back": rolledBack,
@@ -161,15 +232,21 @@ func (s *Server) finishRiskyApply(w http.ResponseWriter, probe any, rolledBack b
 
 func (s *Server) handleConfirmStatus(w http.ResponseWriter, _ *http.Request) {
 	id, expires, ok := s.confirmStatus()
-	if !ok {
-		writeJSON(w, map[string]any{"pending": false})
-		return
+	out := map[string]any{"pending": ok}
+	if ok {
+		out["id"] = id
+		out["expires"] = expires.Unix()
 	}
-	writeJSON(w, map[string]any{
-		"pending": true,
-		"id":      id,
-		"expires": expires.Unix(),
-	})
+	s.confirmMu.Lock()
+	if lr := s.lastRevert; lr != nil {
+		last := map[string]any{"at": lr.at.Unix(), "ok": lr.err == nil}
+		if lr.err != nil {
+			last["error"] = lr.err.Error()
+		}
+		out["last_revert"] = last
+	}
+	s.confirmMu.Unlock()
+	writeJSON(w, out)
 }
 
 func (s *Server) handleConfirmKeep(w http.ResponseWriter, r *http.Request) {
@@ -195,8 +272,13 @@ func (s *Server) handleConfirmRevert(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "confirm id required")
 		return
 	}
-	if !s.revertConfirm(req.ID) {
+	found, err := s.revertConfirm(req.ID)
+	if !found {
 		writeError(w, http.StatusNotFound, "no pending confirm")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "rollback failed: "+err.Error())
 		return
 	}
 	writeJSON(w, map[string]string{"status": "reverted"})
