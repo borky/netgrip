@@ -240,3 +240,18 @@ func TestRevertExcludesARiskyChange(t *testing.T) {
 		t.Fatal("the risky change never got the lock after the revert")
 	}
 }
+
+// A risky change that hangs while holding the lock does not hold back the
+// timeout revert past riskyWait: the safety net still fires.
+func TestTimeoutRevertDoesNotWaitForeverOnAHungChange(t *testing.T) {
+	reverted := stubRevert(t, nil)
+	s := &Server{riskyWait: 50 * time.Millisecond}
+	s.armConfirm(map[string]string{"network": "n0"}, 10*time.Millisecond)
+	s.riskyMu.Lock() // a change that never finishes
+	defer s.riskyMu.Unlock()
+	select {
+	case <-reverted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the timeout revert waited for a hung change")
+	}
+}
