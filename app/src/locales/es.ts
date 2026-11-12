@@ -134,6 +134,7 @@ export default {
     delete: "Borrar",
     rollbackTitle: "¿Se guardaron los cambios?",
     rollbackBody: "Si esta página sigue respondiendo, mantenlos. Si no puedes confirmar, se revertirán solos en {{seconds}} s.",
+    rollbackFailed: "La reversión falló, el router puede seguir con los ajustes nuevos: {{error}}",
     keep: "Mantener",
     revert: "Revertir",
   },
