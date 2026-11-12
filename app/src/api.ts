@@ -507,7 +507,7 @@ const realApi = {
       body: JSON.stringify({ id }),
     }),
   confirmStatus: () =>
-    request<{ pending: boolean; id?: string; expires?: number; last_revert?: { at: number; ok: boolean; error?: string } }>("/api/config/confirm"),
+    request<{ pending: boolean; id?: string; expires?: number; last_revert?: { at: number; ok: boolean; running?: boolean; error?: string } }>("/api/config/confirm"),
   confirmKeep: (id: string) =>
     request<{ status: string }>("/api/config/confirm", {
       method: "POST",

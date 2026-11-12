@@ -91,6 +91,11 @@ type Server struct {
 	confirmMu  sync.Mutex
 	confirm    *confirmEntry
 	lastRevert *revertResult
+	// riskyMu serializes connectivity-risky changes (snapshot, apply, arm)
+	// with reverts. Without it a change could snapshot the state a pending
+	// window is about to revert, and arm a new window that restores it.
+	// Lock order: riskyMu before confirmMu.
+	riskyMu sync.Mutex
 }
 
 // New builds the panel. secure says it will be served over TLS, and
@@ -727,6 +732,10 @@ func (s *Server) handleWanConfigPost(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid json")
 		return
 	}
+	// Snapshot, apply and arm run as one step against a revert firing in
+	// between (see riskyMu).
+	s.riskyMu.Lock()
+	defer s.riskyMu.Unlock()
 	var snapshots map[string]string
 	if req.Confirm {
 		var err error
@@ -1717,6 +1726,10 @@ func (s *Server) handleWifiSet(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid json")
 		return
 	}
+	// Snapshot, apply and arm run as one step against a revert firing in
+	// between (see riskyMu).
+	s.riskyMu.Lock()
+	defer s.riskyMu.Unlock()
 	var snapshots map[string]string
 	if req.Confirm {
 		var err error
@@ -1738,6 +1751,10 @@ func (s *Server) handleWifiRadioSet(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid json")
 		return
 	}
+	// Snapshot, apply and arm run as one step against a revert firing in
+	// between (see riskyMu).
+	s.riskyMu.Lock()
+	defer s.riskyMu.Unlock()
 	var snapshots map[string]string
 	if req.Confirm {
 		var err error
@@ -1821,6 +1838,10 @@ func (s *Server) handleLANSet(w http.ResponseWriter, r *http.Request) {
 	// A LAN change (notably the panel's own IP) can cut the admin's session,
 	// so when confirm is requested we snapshot before applying and, on
 	// success, arm a revert timer that auto-restores unless the UI confirms.
+	// Snapshot, apply and arm run as one step against a revert firing in
+	// between (see riskyMu).
+	s.riskyMu.Lock()
+	defer s.riskyMu.Unlock()
 	var snapshots map[string]string
 	if req.Confirm {
 		var err error
@@ -2709,6 +2730,10 @@ func (s *Server) handleFirewallAddRule(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid json")
 		return
 	}
+	// Snapshot, apply and arm run as one step against a revert firing in
+	// between (see riskyMu).
+	s.riskyMu.Lock()
+	defer s.riskyMu.Unlock()
 	var snapshots map[string]string
 	if req.Confirm {
 		var err error
@@ -2732,6 +2757,10 @@ func (s *Server) handleFirewallDelRule(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "section required")
 		return
 	}
+	// Snapshot, apply and arm run as one step against a revert firing in
+	// between (see riskyMu).
+	s.riskyMu.Lock()
+	defer s.riskyMu.Unlock()
 	var snapshots map[string]string
 	if req.Confirm {
 		var err error

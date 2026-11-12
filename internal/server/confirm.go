@@ -26,13 +26,22 @@ type confirmEntry struct {
 	id        string
 	snapshots map[string]string
 	expires   time.Time
+	// joined holds the ids of the windows this one absorbed: a Keep or a
+	// Revert sent with any of them still reaches the joined window.
+	joined map[string]bool
+}
+
+// matches reports whether id names this window or one it absorbed.
+func (e *confirmEntry) matches(id string) bool {
+	return e != nil && (e.id == id || e.joined[id])
 }
 
 // revertResult is the outcome of the last revert, kept so the panel can
 // report what actually happened rather than what was attempted.
 type revertResult struct {
-	at  time.Time
-	err error
+	at      time.Time
+	err     error
+	running bool
 }
 
 // revertFn restores a confirm's snapshots; a var so tests can stub it
@@ -59,14 +68,19 @@ func (s *Server) armConfirm(snapshots map[string]string, timeout time.Duration) 
 	for k, v := range snapshots {
 		merged[k] = v
 	}
+	joined := map[string]bool{}
 	if s.confirm != nil {
 		for k, v := range s.confirm.snapshots {
 			merged[k] = v
 		}
+		joined[s.confirm.id] = true
+		for old := range s.confirm.joined {
+			joined[old] = true
+		}
 	}
 	id = newConfirmID()
 	expires = time.Now().Add(timeout)
-	s.confirm = &confirmEntry{id: id, snapshots: merged, expires: expires}
+	s.confirm = &confirmEntry{id: id, snapshots: merged, expires: expires, joined: joined}
 	s.confirmMu.Unlock()
 
 	time.AfterFunc(timeout, func() { s.expireConfirm(id) })
@@ -76,6 +90,8 @@ func (s *Server) armConfirm(snapshots map[string]string, timeout time.Duration) 
 // expireConfirm reverts the pending confirm when its timer fires, unless it
 // was already kept/reverted (id no longer matches) in the meantime.
 func (s *Server) expireConfirm(id string) {
+	s.riskyMu.Lock()
+	defer s.riskyMu.Unlock()
 	s.confirmMu.Lock()
 	e := s.confirm
 	if e == nil || e.id != id {
@@ -89,7 +105,14 @@ func (s *Server) expireConfirm(id string) {
 
 // runRevert restores a confirm's snapshots, logs the outcome and records it
 // for the status endpoint. A failed revert is never silent.
+//
+// Callers hold riskyMu, so no risky change runs while the restore does.
+// The running marker is set first: the panel can tell "still reverting"
+// from "nothing happened".
 func (s *Server) runRevert(e *confirmEntry, why string) error {
+	s.confirmMu.Lock()
+	s.lastRevert = &revertResult{at: time.Now(), running: true}
+	s.confirmMu.Unlock()
 	err := revertFn(e.snapshots)
 	if err != nil {
 		log.Printf("[confirm] revert after %s FAILED: %v", why, err)
@@ -106,7 +129,7 @@ func (s *Server) runRevert(e *confirmEntry, why string) error {
 func (s *Server) keepConfirm(id string) bool {
 	s.confirmMu.Lock()
 	defer s.confirmMu.Unlock()
-	if s.confirm == nil || s.confirm.id != id {
+	if !s.confirm.matches(id) {
 		return false
 	}
 	s.confirm = nil
@@ -116,9 +139,11 @@ func (s *Server) keepConfirm(id string) bool {
 // revertConfirm immediately reverts the pending confirm. found reports
 // whether the id matched; err is the revert's own outcome.
 func (s *Server) revertConfirm(id string) (found bool, err error) {
+	s.riskyMu.Lock()
+	defer s.riskyMu.Unlock()
 	s.confirmMu.Lock()
 	e := s.confirm
-	if e == nil || e.id != id {
+	if !e.matches(id) {
 		s.confirmMu.Unlock()
 		return false, nil
 	}
@@ -239,7 +264,7 @@ func (s *Server) handleConfirmStatus(w http.ResponseWriter, _ *http.Request) {
 	}
 	s.confirmMu.Lock()
 	if lr := s.lastRevert; lr != nil {
-		last := map[string]any{"at": lr.at.Unix(), "ok": lr.err == nil}
+		last := map[string]any{"at": lr.at.Unix(), "ok": lr.err == nil, "running": lr.running}
 		if lr.err != nil {
 			last["error"] = lr.err.Error()
 		}
