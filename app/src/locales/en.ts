@@ -135,6 +135,7 @@ export default {
     rollbackTitle: "Did the change stick?",
     rollbackBody: "If this page still responds, keep it. Otherwise it reverts on its own in {{seconds}}s.",
     rollbackFailed: "The rollback failed, the router may still have the new settings: {{error}}",
+    keepFailed: "Keeping the change failed, it may still be reverted: {{error}}",
     keep: "Keep",
     revert: "Revert",
   },

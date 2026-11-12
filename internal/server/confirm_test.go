@@ -93,9 +93,7 @@ func TestSecondChangeJoinsThePendingWindow(t *testing.T) {
 	if id, _, ok := s.confirmStatus(); !ok || id != secondID {
 		t.Fatalf("active confirm %q, want %q", id, secondID)
 	}
-	if s.keepConfirm(firstID) {
-		t.Fatal("the first id must no longer be valid on its own")
-	}
+	_ = firstID // still accepted: see TestKeepWithAnAbsorbedID
 	if found, _ := s.revertConfirm(secondID); !found {
 		t.Fatal("expected to revert the joined window")
 	}
@@ -180,5 +178,65 @@ func TestConcurrentArmAndExpireIsSafe(t *testing.T) {
 			return
 		}
 		time.Sleep(time.Millisecond)
+	}
+}
+
+// Keep or Revert sent with an absorbed window's id still reaches the joined
+// window: the first tab's Keep is not refused because a second change joined.
+func TestKeepWithAnAbsorbedID(t *testing.T) {
+	stubRevert(t, nil)
+	s := &Server{}
+	firstID, _ := s.armConfirm(map[string]string{"network": "n0"}, time.Minute)
+	s.armConfirm(map[string]string{"wireless": "w0"}, time.Minute)
+	if !s.keepConfirm(firstID) {
+		t.Fatal("Keep with the first id was refused after a second change joined")
+	}
+	if _, _, ok := s.confirmStatus(); ok {
+		t.Fatal("the joined window is still pending after Keep")
+	}
+}
+
+// A revert holds riskyMu: a risky change waits for it instead of
+// snapshotting the state being reverted.
+func TestRevertExcludesARiskyChange(t *testing.T) {
+	release := make(chan struct{})
+	entered := make(chan struct{})
+	orig := revertFn
+	revertFn = func(map[string]string) error {
+		close(entered)
+		<-release
+		return nil
+	}
+	t.Cleanup(func() { revertFn = orig })
+
+	s := &Server{}
+	id, _ := s.armConfirm(map[string]string{"network": "n0"}, time.Minute)
+	go func() { _, _ = s.revertConfirm(id) }()
+	<-entered
+
+	// While the revert runs, the panel reports it as running.
+	s.confirmMu.Lock()
+	running := s.lastRevert != nil && s.lastRevert.running
+	s.confirmMu.Unlock()
+	if !running {
+		t.Fatal("last_revert does not say the revert is running")
+	}
+
+	got := make(chan struct{})
+	go func() {
+		s.riskyMu.Lock()
+		close(got)
+		s.riskyMu.Unlock()
+	}()
+	select {
+	case <-got:
+		t.Fatal("a risky change got in while a revert was running")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-got:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the risky change never got the lock after the revert")
 	}
 }
