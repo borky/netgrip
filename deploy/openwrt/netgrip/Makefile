@@ -80,7 +80,9 @@ if [ -z "$${IPKG_INSTROOT}" ]; then
 	# The DHCP fingerprint hook (/etc/hotplug.d/dhcp) only runs when dnsmasq
 	# was started with --dhcp-script, which OpenWrt's init adds once that
 	# directory holds a script: restart dnsmasq once if it runs without it.
-	if [ -x /etc/init.d/dnsmasq ]; then
+	# Only an init with that logic: a vendor's own init that never adds the
+	# flag would otherwise be restarted on every upgrade.
+	if [ -x /etc/init.d/dnsmasq ] && grep -q -- '--dhcp-script' /etc/init.d/dnsmasq; then
 		pids=$$(pidof dnsmasq)
 		hooked=0
 		for p in $$pids; do
