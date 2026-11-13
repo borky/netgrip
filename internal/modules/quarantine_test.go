@@ -265,7 +265,7 @@ func TestParseNftSetElements(t *testing.T) {
 		"02:00:00:00:00:01",
 		{"elem":{"val":"02:00:00:00:00:0A","timeout":3600,"expires":3500}}]}}]}`
 	got, err := parseNftSetElementsTimed([]byte(raw))
-	if err != nil || len(got) != 2 || got[1].Val != "02:00:00:00:00:0a" || got[1].Expires != 3500 {
+	if err != nil || len(got) != 2 || got[1].Val != "02:00:00:00:00:0A" || got[1].Expires != 3500 {
 		t.Fatalf("got %+v %v", got, err)
 	}
 	empty, err := parseNftSetElements([]byte(`{"nftables":[{"set":{"name":"x"}}]}`))
@@ -332,10 +332,13 @@ func newQFake(t *testing.T) *qFake {
 	quarantineDir = filepath.Join(dir, "q")
 	qStatePath = filepath.Join(dir, "quarantine.json")
 	oldMissing, oldLight := qMissingPolls, qLastLightSave
+	oldBudget, oldUsed, oldSum := qBudgetStart, qBudgetUsed, qBudgetSummaries
 	qMissingPolls, qLastLightSave = 0, time.Time{}
+	qBudgetStart, qBudgetUsed, qBudgetSummaries = time.Time{}, 0, 0
 	t.Cleanup(func() {
 		quarantineDir, qStatePath = oldDir, oldState
 		qMissingPolls, qLastLightSave = oldMissing, oldLight
+		qBudgetStart, qBudgetUsed, qBudgetSummaries = oldBudget, oldUsed, oldSum
 	})
 
 	oShow, oDump, oNft, oApply, oVerify, oReq, oApp, oIdent, oSeen, oNotify, oList, oChan, oDrift :=
@@ -366,7 +369,7 @@ func newQFake(t *testing.T) *qFake {
 		}
 		return s, nil
 	}
-	dumpInterfacesFn = func() []ubus.InterfaceState { return qTestIfaces }
+	dumpInterfacesFn = func() ([]ubus.InterfaceState, error) { return qTestIfaces, nil }
 	nftRunFn = func(stdin string, args ...string) ([]byte, error) {
 		cmd := strings.Join(args, " ")
 		switch {
@@ -619,11 +622,30 @@ func TestQuarantineDisableKeepsFilesWhenTheFirewallChangeFails(t *testing.T) {
 	f := newQFake(t)
 	f.enable(t, "internet", "home")
 	f.applyErr = errors.New("reload failed")
-	if _, err := QuarantineDisable(); err == nil {
+	p, err := QuarantineDisable()
+	if err == nil {
 		t.Fatal("no error")
 	}
 	if _, err := os.Stat(qInputFile()); err != nil {
 		t.Fatal("files removed while the sections still point at them")
+	}
+	if !p.Enabled || !loadQState().Enabled {
+		t.Fatal("recorded as off while the rules are still enforced")
+	}
+}
+
+func TestQReadFailuresDecideNothing(t *testing.T) {
+	f := newQFake(t)
+	f.enable(t, "internet", "home")
+	dumpInterfacesFn = func() ([]ubus.InterfaceState, error) { return nil, errors.New("ubus down") }
+	if _, err := readQRouter(); err == nil {
+		t.Fatal("a failed interface read was taken as empty")
+	}
+	f.nft = nil
+	qLiveDrifted = func(*qState, qRouter, time.Time) bool { return true }
+	qPoll(time.Now())
+	if len(f.nft) != 0 {
+		t.Fatalf("synced from a failed read: %v", f.nft)
 	}
 }
 
@@ -669,6 +691,28 @@ func TestQPollBurstIsSummarised(t *testing.T) {
 	time.Sleep(30 * time.Millisecond)
 	if f.notifiedCount() != qNotifyPerPoll+1 || !strings.Contains(f.notifiedText(), "17 more") {
 		t.Fatalf("notifications: %d\n%s", f.notifiedCount(), f.notifiedText())
+	}
+}
+
+func TestQNotifyBudget(t *testing.T) {
+	newQFake(t)
+	now := time.Now()
+	dev := func(i int) QDevice { return QDevice{MAC: "02:00:00:00:03:0" + string("0123456789"[i%10])} }
+	sent, summaries := 0, 0
+	for poll := 0; poll < 50; poll++ {
+		for _, d := range qNotifyBudget([]QDevice{dev(poll), dev(poll + 1), dev(poll + 2), dev(poll + 3), dev(poll + 4)}, now) {
+			if d.MAC == "" {
+				summaries++
+			} else {
+				sent++
+			}
+		}
+	}
+	if sent != qNotifyPerHour || summaries != qSummariesPerHour {
+		t.Fatalf("sent %d, summaries %d in an hour", sent, summaries)
+	}
+	if got := qNotifyBudget([]QDevice{dev(1)}, now.Add(61*time.Minute)); len(got) != 1 || got[0].MAC == "" {
+		t.Fatalf("budget not renewed: %+v", got)
 	}
 }
 
@@ -830,12 +874,67 @@ func TestQuarantineKeepCheck(t *testing.T) {
 		t.Fatal("off: must not interfere")
 	}
 	f.enable(t, "internet", "home")
-	// The live approved set (faked as empty) lacks the panel user's device.
+	// Unapproved in the live set (faked as empty) but never recorded by the
+	// quarantine: e.g. on an unprotected network. Must not block Keep.
+	if err := QuarantineKeepCheck("192.0.2.10"); err != nil {
+		t.Fatalf("blocked a device the quarantine is not refusing: %v", err)
+	}
+	f.seen = []qElem{{Val: "02:00:00:00:00:10"}}
 	if err := QuarantineKeepCheck("192.0.2.10"); err == nil {
-		t.Fatal("kept a change that leaves the panel user unapproved")
+		t.Fatal("kept a change while the panel user is being quarantined")
 	}
 	if err := QuarantineKeepCheck("198.51.100.7"); err != nil {
 		t.Fatal("an unknown device cannot be judged and must not block")
+	}
+	if _, err := QuarantinePause(10, "off"); err != nil {
+		t.Fatal(err)
+	}
+	if err := QuarantineKeepCheck("192.0.2.10"); err != nil {
+		t.Fatal("blocked Keep during a pause off, when nothing is refused")
+	}
+}
+
+func TestQOffPauseDoesNotAnnounce(t *testing.T) {
+	f := newQFake(t)
+	f.enable(t, "internet", "home")
+	qChannelsFn = func() bool { return true }
+	if _, err := QuarantinePause(10, "off"); err != nil {
+		t.Fatal(err)
+	}
+	f.seen = []qElem{{Val: "02:00:00:00:00:77"}}
+	qPoll(time.Now())
+	time.Sleep(30 * time.Millisecond)
+	if f.notifiedCount() != 0 {
+		t.Fatal("announced as quarantined while nothing is refused")
+	}
+	if _, ok := loadQState().Pending["02:00:00:00:00:77"]; !ok {
+		t.Fatal("not recorded")
+	}
+	qPoll(time.Now().Add(11 * time.Minute)) // the pause has ended
+	qWaitFor(t, func() bool { return f.notifiedCount() == 1 })
+}
+
+func TestQLearningPauseExcludesKnownDevices(t *testing.T) {
+	f := newQFake(t)
+	f.enable(t, "nothing", "home")
+	st := loadQState()
+	st.Notified["02:00:00:00:00:81"] = time.Now().Unix() // announced, then forgotten
+	_ = saveQState(st)
+	f.seen = []qElem{{Val: "02:00:00:00:00:82"}} // recorded, not polled yet
+	if _, err := QuarantinePause(30, "learn"); err != nil {
+		t.Fatal(err)
+	}
+	f.seen = []qElem{{Val: "02:00:00:00:00:81"}, {Val: "02:00:00:00:00:82"}, {Val: "02:00:00:00:00:83"}}
+	qPoll(time.Now())
+	a := loadQState().Approved
+	if _, ok := a["02:00:00:00:00:81"]; ok {
+		t.Fatal("a forgotten device was learned")
+	}
+	if _, ok := a["02:00:00:00:00:82"]; ok {
+		t.Fatal("a device recorded before the pause was learned")
+	}
+	if a["02:00:00:00:00:83"].Via != "pause" {
+		t.Fatal("a new device was not learned")
 	}
 }
 

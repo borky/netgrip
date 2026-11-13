@@ -937,6 +937,7 @@ export default {
     revoke: "Retirar",
     revokeTitle: "¿Retirar la aprobación de {{name}}?",
     revokeBody: "Las conexiones nuevas de este dispositivo quedarán restringidas. Las que ya están abiertas siguen hasta que terminen.",
+    revokeYouUnknown: "El router no sabe qué dispositivo estás usando: si es el que lleva tu conexión, perderás el acceso al panel.",
     cannotRevokeYou: "Es el dispositivo que estás usando",
     vendorDevice: "Dispositivo {{vendor}}",
     privateMac: "Dispositivo con dirección privada",

@@ -101,7 +101,7 @@ export function QuarantinePage() {
         </Card>
       )}
 
-      {probe.enabled && (
+      {(probe.enabled || probe.active) && (
         <>
           {probe.issues.map((i) => <Banner key={i} tone="warn">{i}</Banner>)}
 
@@ -227,17 +227,19 @@ export function QuarantinePage() {
           }} />
       )}
       {zonesOpen && probe && (
-        <ZonesModal probe={probe} busy={busy} onClose={() => setZonesOpen(false)}
-          onSave={async (zones) => {
-            if (await run(() => api.quarantineZones(zones), t("quarantine.saved"))) setZonesOpen(false);
+        <ZonesModal probe={probe} you={you} busy={busy} onClose={() => setZonesOpen(false)}
+          onSave={async (zones, allow) => {
+            if (await run(() => api.quarantineZones(zones, allow), t("quarantine.saved"))) setZonesOpen(false);
           }} />
       )}
       <ConfirmDialog open={confirmOff} onClose={() => setConfirmOff(false)} busy={busy}
         title={t("quarantine.turnOffTitle")} consequence={t("quarantine.turnOffBody")} confirmLabel={t("quarantine.turnOff")}
         onConfirm={async () => { await run(() => api.quarantineDisable(), t("quarantine.disabledOk")); setConfirmOff(false); }} />
       <ConfirmDialog open={revoke !== null} onClose={() => setRevoke(null)} busy={busy}
-        title={t("quarantine.revokeTitle", { name: revoke ? label(revoke) : "" })} consequence={t("quarantine.revokeBody")} confirmLabel={t("quarantine.revoke")}
-        onConfirm={async () => { if (revoke) await run(() => api.quarantineRevoke(revoke.mac), t("quarantine.revokedOk")); setRevoke(null); }} />
+        title={t("quarantine.revokeTitle", { name: revoke ? label(revoke) : "" })}
+        consequence={you ? t("quarantine.revokeBody") : `${t("quarantine.revokeBody")} ${t("quarantine.revokeYouUnknown")}`}
+        confirmLabel={t("quarantine.revoke")}
+        onConfirm={async () => { if (revoke) await run(() => api.quarantineRevoke(revoke.mac, !you), t("quarantine.revokedOk")); setRevoke(null); }} />
       <RollbackConfirmModal pending={rc.pending} seconds={rc.seconds} onKeep={rc.keep} onRevert={rc.revert} />
     </div>
   );
@@ -273,8 +275,9 @@ function useZoneSelection(initial: string[]) {
   return { selected, toggle };
 }
 
-function ZonesModal({ probe, busy, onClose, onSave }: { probe: QuarantineProbe; busy: boolean; onClose: () => void; onSave: (z: string[]) => void }) {
+function ZonesModal({ probe, you, busy, onClose, onSave }: { probe: QuarantineProbe; you: string; busy: boolean; onClose: () => void; onSave: (z: string[], allow: boolean) => void }) {
   const { t } = useTranslation();
+  const [accept, setAccept] = useState(false);
   // Only zones that can still be protected: a zone that became an uplink,
   // or was removed, would otherwise make every save fail.
   const { selected, toggle } = useZoneSelection(probe.zones.filter((z) => z.protected && !z.wan).map((z) => z.name));
@@ -282,10 +285,18 @@ function ZonesModal({ probe, busy, onClose, onSave }: { probe: QuarantineProbe; 
     <Modal open onClose={onClose} title={t("quarantine.zonesTitle")}
       footer={<>
         <Button variant="secondary" onClick={onClose}>{t("common.cancel")}</Button>
-        <Button loading={busy} disabled={selected.size === 0} onClick={() => onSave([...selected])}>{t("common.save")}</Button>
+        <Button loading={busy} disabled={selected.size === 0 || (!you && !accept)} onClick={() => onSave([...selected], !you && accept)}>{t("common.save")}</Button>
       </>}>
       <p className="text-small text-muted mb-3">{t("quarantine.zonesHelp")}</p>
       <ZoneChecklist probe={probe} selected={selected} onToggle={toggle} />
+      {!you && (
+        <Banner tone="danger" className="mt-3">
+          <label className="flex items-start gap-2">
+            <input type="checkbox" className="mt-1" checked={accept} onChange={(e) => setAccept(e.target.checked)} />
+            <span>{t("quarantine.youUnknown")}</span>
+          </label>
+        </Banner>
+      )}
     </Modal>
   );
 }

@@ -991,10 +991,11 @@ const realApi = {
   quarantineEnable: (body: { mode: string; zones: string[]; approve: { mac: string; name?: string }[]; allow_no_requester?: boolean }) =>
     postQ("/api/quarantine/enable", body),
   quarantineDisable: () => postQ("/api/quarantine/disable", {}),
-  quarantineZones: (zones: string[]) => postQ("/api/quarantine/zones", { zones }),
+  quarantineZones: (zones: string[], allowNoRequester?: boolean) =>
+    postQ("/api/quarantine/zones", { zones, allow_no_requester: allowNoRequester }),
   quarantineMode: (mode: string) => postQ("/api/quarantine/mode", { mode }),
   quarantineApprove: (devices: { mac: string; name?: string }[]) => postQ("/api/quarantine/approve", { devices }),
-  quarantineRevoke: (mac: string) => postQ("/api/quarantine/revoke", { mac }),
+  quarantineRevoke: (mac: string, force?: boolean) => postQ("/api/quarantine/revoke", { mac, force }),
   quarantineForget: (mac: string) => postQ("/api/quarantine/forget", { mac }),
   quarantinePause: (minutes: number, kind: "learn" | "off") => postQ("/api/quarantine/pause", { minutes, kind }),
   quarantineResume: () => postQ("/api/quarantine/resume", {}),
