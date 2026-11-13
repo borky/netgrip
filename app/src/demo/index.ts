@@ -967,7 +967,7 @@ export const demoApi: typeof api = {
     return { ...(await qResult()), confirm: { id: "demo", expires: Math.floor(Date.now() / 1000) + 120 } };
   },
   quarantineDisable: async () => { demoQ.state.enabled = false; demoQ.state.active = false; return qResult(); },
-  quarantineZones: async (zones) => { demoQ.state.zones = demoQ.state.zones.map((z) => ({ ...z, protected: zones.includes(z.name) })); return { ...(await qResult()), confirm: { id: "demo", expires: Math.floor(Date.now() / 1000) + 120 } }; },
+  quarantineZones: async (zones, _allow) => { demoQ.state.zones = demoQ.state.zones.map((z) => ({ ...z, protected: zones.includes(z.name) })); return { ...(await qResult()), confirm: { id: "demo", expires: Math.floor(Date.now() / 1000) + 120 } }; },
   quarantineMode: async (mode) => { demoQ.state.mode = mode as QuarantineProbe["mode"]; return qResult(); },
   quarantineApprove: async (devices) => {
     for (const d of devices) {
@@ -976,7 +976,7 @@ export const demoApi: typeof api = {
     }
     return qResult();
   },
-  quarantineRevoke: async (mac) => { demoQ.state.approved = demoQ.state.approved.filter((a) => a.mac !== mac); return qResult(); },
+  quarantineRevoke: async (mac, _force) => { demoQ.state.approved = demoQ.state.approved.filter((a) => a.mac !== mac); return qResult(); },
   quarantineForget: async (mac) => { demoQ.state.pending = demoQ.state.pending.filter((p) => p.mac !== mac); return qResult(); },
   quarantinePause: async (minutes, kind) => { demoQ.state.pause = { until: Math.floor(Date.now() / 1000) + minutes * 60, kind }; return qResult(); },
   quarantineResume: async () => { demoQ.state.pause = {}; return qResult(); },

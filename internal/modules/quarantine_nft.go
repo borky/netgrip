@@ -79,8 +79,9 @@ const qSeenTimeout = 3600
 
 // qRuleSet is everything the generated chains depend on. A pause "off" is
 // not part of it: it lives in the kernel as a timed element of
-// netgrip_q_off, so it ends on time even without NetGrip, and a firewall
-// reload (which starts the set empty) ends it on the safe side.
+// netgrip_q_off, so it ends on time even without NetGrip. A firewall reload
+// starts the set empty; while NetGrip runs, its poller puts the remaining
+// pause back.
 type qRuleSet struct {
 	Mode     string   // "internet" | "nothing"
 	Approved []string // lowercase MACs
@@ -304,13 +305,21 @@ func writeQFiles(rs qRuleSet) error {
 	if err := os.MkdirAll(quarantineDir, 0o755); err != nil {
 		return err
 	}
-	if err := writeFileDurable(qTableFile(), []byte(renderQTable(rs))); err != nil {
+	if err := writeIfChanged(qTableFile(), []byte(renderQTable(rs))); err != nil {
 		return err
 	}
-	if err := writeFileDurable(qInputFile(), []byte(renderQInputJump())); err != nil {
+	if err := writeIfChanged(qInputFile(), []byte(renderQInputJump())); err != nil {
 		return err
 	}
-	return writeFileDurable(qForwardFile(), []byte(renderQForwardJump()))
+	return writeIfChanged(qForwardFile(), []byte(renderQForwardJump()))
+}
+
+// writeIfChanged spares the flash a rewrite with the same content.
+func writeIfChanged(path string, data []byte) error {
+	if cur, err := os.ReadFile(path); err == nil && string(cur) == string(data) {
+		return nil
+	}
+	return writeFileDurable(path, data)
 }
 
 // writeFileDurable writes via a temp file, fsyncs it, renames it into place
@@ -447,7 +456,7 @@ func parseNftSetElementsTimed(raw []byte) ([]qElem, error) {
 		for _, e := range item.Set.Elem {
 			var s string
 			if json.Unmarshal(e, &s) == nil {
-				out = append(out, qElem{Val: strings.ToLower(s)})
+				out = append(out, qElem{Val: s})
 				continue
 			}
 			var obj struct {
@@ -457,7 +466,7 @@ func parseNftSetElementsTimed(raw []byte) ([]qElem, error) {
 				} `json:"elem"`
 			}
 			if json.Unmarshal(e, &obj) == nil && json.Unmarshal(obj.Elem.Val, &s) == nil {
-				out = append(out, qElem{Val: strings.ToLower(s), Expires: obj.Elem.Expires})
+				out = append(out, qElem{Val: s, Expires: obj.Elem.Expires})
 			}
 		}
 	}

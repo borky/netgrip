@@ -937,6 +937,7 @@ export default {
     revoke: "Revoke",
     revokeTitle: "Revoke {{name}}?",
     revokeBody: "New connections from this device will be restricted. Connections already open stay up until they end.",
+    revokeYouUnknown: "The router cannot tell which device you are using: if this is the one carrying your connection, you will lose access to the panel.",
     cannotRevokeYou: "This is the device you are using",
     vendorDevice: "{{vendor}} device",
     privateMac: "Device with a private address",

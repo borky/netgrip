@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"log"
 	"net"
 	"net/http"
 
@@ -68,6 +69,14 @@ func (s *Server) runRiskyFirewall(w http.ResponseWriter, apply func() (modules.Q
 		return
 	}
 	probe, err := apply()
+	if err != nil {
+		// The module undoes what it can; restoring the snapshot as well
+		// covers a failed undo (the firewall back to before the change).
+		if rerr := revertFn(snapshots); rerr != nil {
+			log.Printf("netgrip: quarantine: restoring the firewall after a failed change: %v", rerr)
+		}
+		probe = modules.ProbeQuarantine()
+	}
 	s.finishRiskyApply(w, probe, false, err, true, snapshots)
 }
 

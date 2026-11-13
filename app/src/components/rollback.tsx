@@ -63,11 +63,14 @@ export function useRollbackConfirm() {
   }, [pending]);
 
   const keep = () => {
-    const id = pending?.id;
+    const was = pending;
     setPending(null);
-    if (id) {
-      api.confirmKeep(id).catch((e) => {
+    if (was?.id) {
+      api.confirmKeep(was.id).catch((e) => {
         push({ tone: "danger", text: t("common.keepFailed", { error: e instanceof Error ? e.message : String(e) }) });
+        // Not kept: the server still reverts at expiry, so keep showing
+        // the countdown (and the revert outcome) instead of looking kept.
+        setPending(was);
       });
     }
   };
