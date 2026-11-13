@@ -71,6 +71,9 @@ cp "$REPO_ROOT/deploy/openwrt/netgrip/files/netgrip-restore-rules" "$PKG_DIR/usr
 chmod 755 "$PKG_DIR/usr/libexec/netgrip-restore-rules"
 cp "$REPO_ROOT/deploy/openwrt/netgrip/files/usr/libexec/netgrip-heal-register" "$PKG_DIR/usr/libexec/netgrip-heal-register"
 chmod 755 "$PKG_DIR/usr/libexec/netgrip-heal-register"
+mkdir -p "$PKG_DIR/etc/hotplug.d/dhcp"
+cp "$REPO_ROOT/deploy/openwrt/netgrip/files/etc/hotplug.d/dhcp/50-netpulse-agent" "$PKG_DIR/etc/hotplug.d/dhcp/50-netpulse-agent"
+chmod 755 "$PKG_DIR/etc/hotplug.d/dhcp/50-netpulse-agent"
 
 # CONTROL files
 cat > "$PKG_DIR/CONTROL/control" << CTRL
@@ -124,10 +127,23 @@ if [ -f /etc/netpulse-agent.env ] || [ -f /usr/sbin/netpulse-agent ] || [ -f /et
 fi
 /etc/init.d/netgrip enable 2>/dev/null || true
 /etc/init.d/netgrip restart 2>/dev/null || true
+# The DHCP fingerprint hook (/etc/hotplug.d/dhcp) only runs when dnsmasq was
+# started with --dhcp-script, which OpenWrt's init adds once that directory
+# holds a script: restart dnsmasq once if it runs without it.
+if [ -x /etc/init.d/dnsmasq ]; then
+  pids=$(pidof dnsmasq)
+  hooked=0
+  for p in $pids; do
+    tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null | grep -q -- '--dhcp-script' && hooked=1
+  done
+  if [ -n "$pids" ] && [ "$hooked" = 0 ]; then
+    /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+  fi
+fi
 # Survive sysupgrades: the apk registry does not survive, but the
 # preserved files do, so procd starts the panel on first boot.
 # /etc/netgrip/ keeps the netpulse embedded-agent env across upgrades.
-for f in /usr/sbin/netgrip /etc/init.d/netgrip /etc/rc.d/S99netgrip /usr/libexec/netgrip-restore-rules /usr/libexec/netgrip-heal-register /etc/netgrip/; do
+for f in /usr/sbin/netgrip /etc/init.d/netgrip /etc/rc.d/S99netgrip /usr/libexec/netgrip-restore-rules /usr/libexec/netgrip-heal-register /etc/hotplug.d/dhcp/50-netpulse-agent /etc/netgrip/; do
   grep -qxF "$f" /etc/sysupgrade.conf 2>/dev/null || echo "$f" >> /etc/sysupgrade.conf
 done
 exit 0
