@@ -312,6 +312,14 @@ func (s *Server) handleConfirmKeep(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "confirm id required")
 		return
 	}
+	// The Keep request itself may ride an already-open connection, which
+	// the firewall lets through whatever the change did to new ones. With
+	// the quarantine enforced, refuse to keep a change that leaves the
+	// panel user's device unapproved: the revert timer then undoes it.
+	if err := quarantineKeepCheck(requesterIP(r)); err != nil {
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
 	if !s.keepConfirm(req.ID) {
 		writeError(w, http.StatusNotFound, "no pending confirm")
 		return

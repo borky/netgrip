@@ -107,6 +107,14 @@ define Package/netgrip/prerm
 if [ -z "$${IPKG_INSTROOT}" ]; then
 	/etc/init.d/netgrip stop 2>/dev/null || true
 	/etc/init.d/netgrip disable 2>/dev/null || true
+	# Remove the device quarantine's firewall hooks: without NetGrip nothing
+	# could approve a device or turn them off.
+	q=$$(uci -q show firewall | sed -n 's/^firewall\.\(netgrip_q[A-Za-z0-9_]*\)=include$$/\1/p')
+	if [ -n "$$q" ]; then
+		for s in $$q; do uci -q delete "firewall.$$s"; done
+		uci -q commit firewall
+		/etc/init.d/firewall reload 2>/dev/null || true
+	fi
 fi
 exit 0
 endef

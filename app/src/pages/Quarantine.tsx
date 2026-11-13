@@ -88,6 +88,7 @@ export function QuarantinePage() {
       </div>
 
       {!probe.applicable && <Banner tone="warn">{t("quarantine.notApplicable", { reason: probe.reason ?? "" })}</Banner>}
+      <Banner tone="info">{t("quarantine.scopeNote")}</Banner>
 
       {probe.applicable && !probe.enabled && (
         <Card>
@@ -100,7 +101,7 @@ export function QuarantinePage() {
         </Card>
       )}
 
-      {probe.applicable && probe.enabled && (
+      {probe.enabled && (
         <>
           {probe.issues.map((i) => <Banner key={i} tone="warn">{i}</Banner>)}
 
@@ -143,6 +144,7 @@ export function QuarantinePage() {
             ) : (
               <div className="space-y-3">
                 <p className="text-small text-muted">{t("quarantine.pauseHelp")}</p>
+                <p className="text-small text-muted">{t("quarantine.pauseOffNote")}</p>
                 <div className="flex flex-wrap items-center gap-2">
                   <SegmentedControl<string>
                     ariaLabel={t("quarantine.pauseLength")}
@@ -273,7 +275,9 @@ function useZoneSelection(initial: string[]) {
 
 function ZonesModal({ probe, busy, onClose, onSave }: { probe: QuarantineProbe; busy: boolean; onClose: () => void; onSave: (z: string[]) => void }) {
   const { t } = useTranslation();
-  const { selected, toggle } = useZoneSelection(probe.zones.filter((z) => z.protected).map((z) => z.name));
+  // Only zones that can still be protected: a zone that became an uplink,
+  // or was removed, would otherwise make every save fail.
+  const { selected, toggle } = useZoneSelection(probe.zones.filter((z) => z.protected && !z.wan).map((z) => z.name));
   return (
     <Modal open onClose={onClose} title={t("quarantine.zonesTitle")}
       footer={<>
@@ -314,6 +318,7 @@ function EnableWizard({ probe, you, busy, onClose, onEnable }: {
     return n;
   });
   const youUnknown = !you;
+  const youRandom = (candidates ?? []).some((c) => c.requester && c.random);
   const canEnable = zones.size > 0 && candidates !== undefined && (!youUnknown || accept);
   const approve = useMemo(() => (candidates ?? []).filter((c) => trusted.has(c.mac) || c.requester).map((c) => ({ mac: c.mac, name: c.name })), [candidates, trusted]);
 
@@ -342,6 +347,7 @@ function EnableWizard({ probe, you, busy, onClose, onEnable }: {
         <section>
           <h3 className="text-body font-semibold mb-1">{t("quarantine.step3", { count: approve.length })}</h3>
           <p className="text-small text-muted mb-2">{t("quarantine.baselineHelp")}</p>
+          {youRandom && <Banner tone="warn" className="mb-2">{t("quarantine.youRandom")}</Banner>}
           {candidates === undefined ? <SkeletonRows rows={4} /> : (
             <>
               <div className="flex gap-2 mb-2">

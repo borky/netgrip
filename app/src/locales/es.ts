@@ -878,6 +878,9 @@ export default {
   quarantine: {
     title: "Cuarentena",
     subtitle: "Los dispositivos en los que el router no confía solo tienen internet, o nada, hasta que los apruebes.",
+    scopeNote: "El router comprueba el tráfico que pasa por él: internet, otras redes y el propio router. Dos dispositivos de la misma red o Wi-Fi siguen hablando entre sí directamente.",
+    pauseOffNote: "Los dispositivos que se conectan con la protección en pausa quedan en cuarentena al terminar la pausa: apruébalos antes.",
+    youRandom: "El dispositivo que estás usando tiene una dirección privada (aleatoria). Si cambia, este dispositivo también quedará en cuarentena: configura una dirección fija para esta red en la privacidad Wi-Fi.",
     notApplicable: "No disponible en este router: {{reason}}.",
     offTitle: "Mantén los dispositivos desconocidos lejos de tu red",
     offBody: "Con la cuarentena activa, un dispositivo que entra en una de las redes protegidas y no está en tu lista aprobada no puede llegar a tus otros equipos ni a los ajustes del router. Recibes un aviso y lo apruebas con un toque.",
@@ -930,7 +933,7 @@ export default {
     lastSeen: "Visto por última vez {{when}}",
     approvedTitle: "Dispositivos aprobados ({{count}})",
     you: "Este dispositivo",
-    via: { baseline: "Desde la configuración", manual: "Aprobado", pause: "Durante la pausa" },
+    via: { baseline: "Desde la configuración", manual: "Aprobado", pause: "Durante la pausa", panel: "Este panel" },
     revoke: "Retirar",
     revokeTitle: "¿Retirar la aprobación de {{name}}?",
     revokeBody: "Las conexiones nuevas de este dispositivo quedarán restringidas. Las que ya están abiertas siguen hasta que terminen.",

@@ -6,18 +6,27 @@ package modules
 // A device NetGrip has not been told to trust gets, at most, the internet
 // ("internet" mode) or nothing beyond an address and DNS ("nothing" mode),
 // in the zones the user chose to protect. Everything about the router's
-// layout (zones, their networks, the WAN interfaces) is read at runtime from
-// its own configuration, so the feature works on any firewall4 router.
+// layout (zones, their networks, which of them are uplinks, the WAN
+// interfaces, the DNS servers DHCP hands out) is read at runtime from its
+// own configuration, so the feature works on any firewall4 router.
+//
+// Scope: the firewall judges traffic that reaches the router - to the
+// router itself, and routed between networks or to the internet. Two
+// devices on the same bridge or Wi-Fi network talk directly and are not
+// separated by this.
 //
 // Lockout safety:
-//   - enabling needs a baseline: the devices to trust, and always the device
-//     the panel is used from;
-//   - the generated rules are validated by the kernel (nft -c) before the
-//     firewall loads them;
-//   - the server runs enabling (and zone changes) inside the confirm window,
-//     so a lost panel reverts by itself;
-//   - after a revert the include sections are gone; the poller notices and
-//     records the feature as off.
+//   - enabling and changing zones always keep the panel user's device and
+//     run inside the confirm window; "Keep" is refused when that device is
+//     not in the live approved set;
+//   - the generated rules are validated by the kernel (nft -c) before they
+//     are written or loaded;
+//   - a failed enable or zone change is undone;
+//   - revoking the panel user's device, or revoking at all when that device
+//     cannot be identified, is refused; resuming a pause keeps it;
+//   - a pause "off" lives in the kernel and ends on time without NetGrip;
+//   - the poller reconciles the live firewall with the intent, and records
+//     the feature as off once the firewall no longer has it.
 
 import (
 	"encoding/json"
@@ -40,21 +49,34 @@ import (
 var qStatePath = "/etc/netgrip/quarantine.json"
 
 const (
-	qMaxPending     = 500
-	qPendingTTL     = 7 * 24 * time.Hour
-	qMaxPause       = 24 * time.Hour
-	qPollInterval   = 5 * time.Second
-	qLearnPollEvery = 2 * time.Second
+	qMaxPending      = 500
+	qPendingTTL      = 7 * 24 * time.Hour
+	qNotifiedTTL     = 7 * 24 * time.Hour
+	qMaxPause        = 24 * time.Hour
+	qMaxLearned      = 64
+	qPollInterval    = 5 * time.Second
+	qLearnPollEvery  = 2 * time.Second
+	qLightSaveEvery  = 10 * time.Minute
+	qNotifyPerPoll   = 3
+	qMissingToRevert = 2
 )
 
-var qMu sync.Mutex
+var (
+	qMu sync.Mutex
+	// qLastLightSave throttles saves that only refresh "last seen" times,
+	// to spare the router's flash.
+	qLastLightSave time.Time
+	// qMissingPolls counts consecutive polls without the feature in the
+	// firewall; one bad read must not turn it off.
+	qMissingPolls int
+)
 
 // QApproved is one trusted device.
 type QApproved struct {
 	Name string `json:"name,omitempty"`
 	At   int64  `json:"at"`
 	// Via: "baseline" (trusted when enabling), "manual", "pause" (joined
-	// during a learning pause).
+	// during a learning pause), "panel" (the device the panel was used from).
 	Via string `json:"via"`
 }
 
@@ -64,15 +86,16 @@ type QPending struct {
 	LastSeen  int64  `json:"last_seen"`
 	IP        string `json:"ip,omitempty"`
 	Hostname  string `json:"hostname,omitempty"`
-	Notified  bool   `json:"notified,omitempty"`
 }
 
-// QPause is a time-limited pause. Kind "learn": still enforced, but every
-// new device is approved automatically. Kind "off": nothing is enforced.
+// QPause is a time-limited pause. Kind "learn": still enforced, but new
+// devices are approved automatically (not the ones already waiting when it
+// started, and at most qMaxLearned). Kind "off": nothing is enforced.
 type QPause struct {
-	Until   int64    `json:"until,omitempty"`
-	Kind    string   `json:"kind,omitempty"`
-	Learned []string `json:"learned,omitempty"`
+	Until    int64    `json:"until,omitempty"`
+	Kind     string   `json:"kind,omitempty"`
+	Learned  []string `json:"learned,omitempty"`
+	Excluded []string `json:"excluded,omitempty"`
 }
 
 func (p QPause) active(now time.Time) bool { return p.Until > now.Unix() }
@@ -84,12 +107,13 @@ type qState struct {
 	Approved map[string]QApproved `json:"approved"`
 	Pending  map[string]QPending  `json:"pending"`
 	Pause    QPause               `json:"pause"`
-	// WanApplied is the WAN interface list last written, to notice changes.
-	WanApplied []string `json:"wan_applied,omitempty"`
+	// Notified remembers when each MAC was announced, so forgetting a
+	// pending entry or pruning it does not announce it again.
+	Notified map[string]int64 `json:"notified,omitempty"`
 }
 
 func loadQState() *qState {
-	st := &qState{Mode: "internet", Approved: map[string]QApproved{}, Pending: map[string]QPending{}}
+	st := &qState{Mode: "internet"}
 	if raw, err := os.ReadFile(qStatePath); err == nil {
 		_ = json.Unmarshal(raw, st)
 	}
@@ -98,6 +122,9 @@ func loadQState() *qState {
 	}
 	if st.Pending == nil {
 		st.Pending = map[string]QPending{}
+	}
+	if st.Notified == nil {
+		st.Notified = map[string]int64{}
 	}
 	if st.Mode != "nothing" {
 		st.Mode = "internet"
@@ -110,7 +137,7 @@ func saveQState(st *qState) error {
 	if err != nil {
 		return err
 	}
-	return writeFileAtomic(qStatePath, raw)
+	return writeFileDurable(qStatePath, raw)
 }
 
 func (st *qState) approvedMACs() []string {
@@ -121,35 +148,42 @@ func (st *qState) approvedMACs() []string {
 	return sortedMACs(out)
 }
 
-func (st *qState) ruleSet(wan []string, now time.Time) qRuleSet {
-	return qRuleSet{
-		Mode:     st.Mode,
-		Paused:   st.Pause.active(now) && st.Pause.Kind == "off",
-		Approved: st.approvedMACs(),
-		Wan:      wan,
-	}
-}
+// ---- The router's configuration, read at runtime ----
 
-// ---- Zones and WAN interfaces, from the router's own configuration ----
+var (
+	// Uncached on purpose: right after its own UCI change the feature must
+	// see the new sections, and the shared read cache lags by up to 2s.
+	uciShowFn = func(pkg string) (string, error) {
+		out, err := uciExec("show", pkg)
+		return string(out), err
+	}
+	dumpInterfacesFn = func() []ubus.InterfaceState { i, _ := ubus.DumpInterfaces(); return i }
+)
 
 // QZone is a firewall zone as the quarantine sees it.
 type QZone struct {
 	Name     string   `json:"name"`
 	Networks []string `json:"networks"`
-	// Wan: the zone masquerades, i.e. it is an upstream. Never protectable.
+	// Wan: an uplink zone (masquerades, or carries a default route).
+	// Never protectable.
 	Wan bool `json:"wan"`
-	// Suggested: a client zone (not WAN, serves DHCP on one of its networks).
+	// Suggested: a client zone (not an uplink, serves DHCP).
 	Suggested bool `json:"suggested"`
 	Protected bool `json:"protected"`
 }
 
 var reZoneName = regexp.MustCompile(`^[a-zA-Z_.][a-zA-Z0-9_.-]*$`)
 
-// qZoneDevices reads the `device` option of every zone (zones can name
-// devices directly instead of, or besides, networks).
-func qZoneDevices(uciFirewall string) map[string][]string {
-	names := map[string]string{} // section -> zone name
-	devs := map[string][]string{}
+// qZoneExtra is what parseFWZonesFrom does not read: per zone name, its
+// `device` list and whether it masquerades IPv6.
+type qZoneExtra struct {
+	devices []string
+	masq6   bool
+}
+
+func qZoneExtras(uciFirewall string) map[string]qZoneExtra {
+	names := map[string]string{}
+	ex := map[string]qZoneExtra{}
 	for _, line := range strings.Split(uciFirewall, "\n") {
 		line = strings.TrimSpace(line)
 		key, val, ok := strings.Cut(line, "=")
@@ -160,17 +194,21 @@ func qZoneDevices(uciFirewall string) map[string][]string {
 		if !hasOpt {
 			continue
 		}
+		e := ex[sec]
 		switch opt {
 		case "name":
 			names[sec] = strings.Trim(val, "'")
 		case "device":
-			devs[sec] = append(devs[sec], uciListValues(line)...)
+			e.devices = append(e.devices, uciListValues(line)...)
+		case "masq6":
+			e.masq6 = strings.Trim(val, "'") == "1"
 		}
+		ex[sec] = e
 	}
-	out := map[string][]string{}
-	for sec, d := range devs {
+	out := map[string]qZoneExtra{}
+	for sec, e := range ex {
 		if n := names[sec]; n != "" {
-			out[n] = d
+			out[n] = e
 		}
 	}
 	return out
@@ -215,17 +253,56 @@ func dhcpServedNetworks(uciDhcp string) map[string]bool {
 	return out
 }
 
-// qZonesFrom builds the zone list from `uci show firewall` and
-// `uci show dhcp`. Pure, for tests.
-func qZonesFrom(uciFirewall, uciDhcp string, protected []string) []QZone {
+// qDHCPDNSServers lists the DNS servers DHCP hands out: option 6 in
+// dhcp_option / dhcp_option_force, and the `dns` list announced for IPv6.
+func qDHCPDNSServers(uciDhcp string) []string {
+	out := []string{}
+	for _, line := range strings.Split(uciDhcp, "\n") {
+		key, _, ok := strings.Cut(strings.TrimSpace(line), "=")
+		if !ok || !strings.HasPrefix(key, "dhcp.") {
+			continue
+		}
+		_, opt, _ := strings.Cut(strings.TrimPrefix(key, "dhcp."), ".")
+		switch opt {
+		case "dhcp_option", "dhcp_option_force":
+			for _, v := range uciListValues(line) {
+				parts := strings.Split(v, ",")
+				if len(parts) > 1 && (parts[0] == "6" || parts[0] == "option:dns-server") {
+					out = append(out, parts[1:]...)
+				}
+			}
+		case "dns":
+			out = append(out, uciListValues(line)...)
+		}
+	}
+	v4, v6 := splitIPs(out)
+	return append(v4, v6...)
+}
+
+// qZonesFrom builds the zone list. A zone is an uplink when it masquerades
+// (IPv4 or IPv6) or when one of its networks holds a default route. Pure,
+// for tests.
+func qZonesFrom(uciFirewall, uciDhcp string, protected []string, ifaces []ubus.InterfaceState) []QZone {
 	served := dhcpServedNetworks(uciDhcp)
+	extras := qZoneExtras(uciFirewall)
+	defRoute := map[string]bool{}
+	for _, i := range ifaces {
+		if i.HasDefaultRoute || i.HasDefaultRoute6 {
+			defRoute[i.Name] = true
+		}
+	}
 	prot := map[string]bool{}
 	for _, z := range protected {
 		prot[z] = true
 	}
 	out := []QZone{}
 	for _, z := range parseFWZonesFrom(uciFirewall) {
-		q := QZone{Name: z.Name, Networks: z.Network, Wan: z.Masq, Protected: prot[z.Name]}
+		q := QZone{Name: z.Name, Networks: z.Network, Wan: z.Masq || extras[z.Name].masq6, Protected: prot[z.Name]}
+		for _, n := range z.Network {
+			if defRoute[n] {
+				q.Wan = true
+			}
+		}
 		if !q.Wan {
 			for _, n := range z.Network {
 				if served[n] {
@@ -238,15 +315,15 @@ func qZonesFrom(uciFirewall, uciDhcp string, protected []string) []QZone {
 	return out
 }
 
-// qWanDevicesFrom resolves the WAN-side interface names: every device of
-// every masquerading zone, from its networks' runtime state and its own
-// `device` list. Pure, for tests.
-func qWanDevicesFrom(zones []QZone, zoneDevs map[string][]string, ifaces []ubus.InterfaceState) []string {
+// qWanDevicesFrom resolves the uplink interface names: every device of
+// every uplink zone, from its networks' runtime state and its own `device`
+// list. Patterns (a trailing + or *) cannot go into an nft set and are
+// returned separately so the probe can say so. Pure, for tests.
+func qWanDevicesFrom(zones []QZone, extras map[string]qZoneExtra, ifaces []ubus.InterfaceState) (devs, patterns []string) {
 	byName := map[string]ubus.InterfaceState{}
 	for _, i := range ifaces {
 		byName[i.Name] = i
 	}
-	out := []string{}
 	for _, z := range zones {
 		if !z.Wan {
 			continue
@@ -255,36 +332,53 @@ func qWanDevicesFrom(zones []QZone, zoneDevs map[string][]string, ifaces []ubus.
 			if i, ok := byName[n]; ok {
 				for _, d := range []string{i.L3Device, i.Device} {
 					if d != "" && !strings.HasPrefix(d, "/") {
-						out = append(out, d)
+						devs = append(devs, d)
 					}
 				}
 			}
 		}
-		out = append(out, zoneDevs[z.Name]...)
-	}
-	return sortedIfnames(out)
-}
-
-var (
-	// Uncached on purpose: right after its own UCI change the feature must
-	// see the new sections, and the shared read cache lags by up to 2s.
-	uciShowFn = func(pkg string) string {
-		out, err := uciExec("show", pkg)
-		if err != nil {
-			return ""
+		for _, d := range extras[z.Name].devices {
+			if strings.HasSuffix(d, "+") || strings.HasSuffix(d, "*") {
+				patterns = append(patterns, d)
+			} else {
+				devs = append(devs, d)
+			}
 		}
-		return string(out)
 	}
-	dumpInterfacesFn = func() []ubus.InterfaceState { i, _ := ubus.DumpInterfaces(); return i }
-)
-
-func qCurrentZones(protected []string) []QZone {
-	return qZonesFrom(uciShowFn("firewall"), uciShowFn("dhcp"), protected)
+	sort.Strings(patterns)
+	return sortedIfnames(devs), patterns
 }
 
-func qCurrentWan() []string {
-	fw := uciShowFn("firewall")
-	return qWanDevicesFrom(qZonesFrom(fw, "", nil), qZoneDevices(fw), dumpInterfacesFn())
+// qRouter is one read of everything the feature needs from the router.
+type qRouter struct {
+	firewall    string
+	zones       []QZone
+	wan         []string
+	wanPatterns []string
+	dns         []string
+	sections    []string // the feature's own include sections
+	actual      []string // zones the include sections actually protect
+}
+
+// readQRouter reads the router's configuration. A failed `uci show` is an
+// error: deciding anything from an empty read could delete or skip
+// sections that exist.
+func readQRouter() (qRouter, error) {
+	fw, err := uciShowFn("firewall")
+	if err != nil {
+		return qRouter{}, fmt.Errorf("reading the firewall config: %w", err)
+	}
+	dhcp, _ := uciShowFn("dhcp")
+	ifaces := dumpInterfacesFn()
+	r := qRouter{firewall: fw, sections: qIncludeSections(fw), actual: qActualZones(fw)}
+	r.zones = qZonesFrom(fw, dhcp, r.actual, ifaces)
+	r.wan, r.wanPatterns = qWanDevicesFrom(r.zones, qZoneExtras(fw), ifaces)
+	r.dns = qDHCPDNSServers(dhcp)
+	return r, nil
+}
+
+func (r qRouter) ruleSet(st *qState) qRuleSet {
+	return qRuleSet{Mode: st.Mode, Approved: st.approvedMACs(), Wan: r.wan, DNS: r.dns}
 }
 
 // ---- UCI include sections ----
@@ -300,6 +394,24 @@ func qIncludeSections(uciFirewall string) []string {
 		sec := strings.TrimPrefix(key, "firewall.")
 		if sec != key && !strings.Contains(sec, ".") && strings.HasPrefix(sec, qSectionPrefix) {
 			out = append(out, sec)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// qActualZones reads which zones the include sections hook into: the
+// actual protection, whatever the saved intent says (a confirm revert, or
+// any other firewall restore, changes the sections and not the intent).
+func qActualZones(uciFirewall string) []string {
+	out := []string{}
+	for _, line := range strings.Split(uciFirewall, "\n") {
+		key, val, ok := strings.Cut(strings.TrimSpace(line), "=")
+		if !ok || !strings.HasPrefix(key, "firewall."+qSectionPrefix+"_in_") || !strings.HasSuffix(key, ".chain") {
+			continue
+		}
+		if z, ok := strings.CutPrefix(strings.Trim(val, "'"), "input_"); ok && z != "" {
+			out = append(out, z)
 		}
 	}
 	sort.Strings(out)
@@ -339,13 +451,11 @@ func qIncludeOps(existing []string, zones []string) []executor.Op {
 	)
 }
 
-func qIncludesConfigured() bool { return uciSectionExists("firewall." + qSectionTable) }
-
 // applyQIncludes is a seam: it runs the UCI ops (tests record them).
 var applyQIncludes = func(ops []executor.Op) error { return executor.Apply(ops, nil) }
 
-// qVerifyLive checks the actual result of an enable: chains loaded, every
-// protected zone jumps into them, and the must-keep MAC is in the set.
+// qVerifyLive checks the actual result: chains loaded, every protected
+// zone jumps into them, and the must-keep MAC is in the live set.
 var qVerifyLive = func(zones []string, mustKeep string) error {
 	if !qLiveChainsPresent() {
 		return errors.New("the firewall did not load the quarantine chains")
@@ -358,19 +468,23 @@ var qVerifyLive = func(zones []string, mustKeep string) error {
 			}
 		}
 	}
-	if mustKeep != "" {
-		elems, err := qSetElements(qSetOK)
-		if err != nil {
-			return err
-		}
-		for _, e := range elems {
-			if e == mustKeep {
-				return nil
-			}
-		}
+	if mustKeep != "" && !qLiveApproved(mustKeep) {
 		return fmt.Errorf("your device %s is not in the live approved set", mustKeep)
 	}
 	return nil
+}
+
+func qLiveApproved(mac string) bool {
+	elems, err := qSetElements(qSetOK)
+	if err != nil {
+		return false
+	}
+	for _, e := range elems {
+		if e == mac {
+			return true
+		}
+	}
+	return false
 }
 
 // ---- Probe ----
@@ -389,8 +503,8 @@ type QDevice struct {
 	Via       string `json:"via,omitempty"`
 }
 
-// QuarantineProbe is the API view. Enabled is the intent; Active is what
-// the firewall actually runs.
+// QuarantineProbe is the API view. Enabled is the intent; Active and the
+// zones' Protected flags are what the firewall actually runs.
 type QuarantineProbe struct {
 	Applicable bool      `json:"applicable"`
 	Reason     string    `json:"reason,omitempty"`
@@ -428,6 +542,9 @@ func ProbeQuarantine() QuarantineProbe {
 	return probeQuarantineLocked()
 }
 
+// probeQuarantineLocked always describes the feature when it is enabled,
+// even if the router no longer looks applicable: the rules may still be
+// enforced, and the user must be able to manage or turn them off.
 func probeQuarantineLocked() QuarantineProbe {
 	st := loadQState()
 	ok, why := qApplicable()
@@ -436,15 +553,20 @@ func probeQuarantineLocked() QuarantineProbe {
 		Zones: []QZone{}, Wan: []string{}, Approved: []QDevice{}, Pending: []QDevice{},
 		Pause: st.Pause, Issues: []string{},
 	}
-	if !ok {
+	if !ok && !st.Enabled {
 		return p
 	}
-	p.Zones = qCurrentZones(st.Zones)
-	p.Wan = qCurrentWan()
-	p.Active = qIncludesConfigured() && qLiveChainsPresent()
+	r, err := readQRouter()
+	if err != nil {
+		p.Issues = append(p.Issues, err.Error())
+	}
+	p.Zones = r.zones
+	p.Wan = append([]string{}, r.wan...)
+	p.Active = len(r.sections) > 0 && qLiveChainsPresent()
 	if !p.Pause.active(time.Now()) {
 		p.Pause = QPause{}
 	}
+	p.Pause.Excluded = nil
 	ident := qIdentities()
 	for mac, a := range st.Approved {
 		d := ident.device(mac)
@@ -471,8 +593,20 @@ func probeQuarantineLocked() QuarantineProbe {
 		if !p.Active {
 			p.Issues = append(p.Issues, "enabled, but the firewall is not running the quarantine rules")
 		}
-		if st.Mode == "internet" && len(p.Wan) == 0 {
-			p.Issues = append(p.Issues, "no WAN interface found: quarantined devices get no internet")
+		known := map[string]bool{}
+		for _, z := range r.zones {
+			known[z.Name] = true
+		}
+		for _, z := range r.actual {
+			if !known[z] {
+				p.Issues = append(p.Issues, fmt.Sprintf("protected zone %q no longer exists: its devices are not checked", z))
+			}
+		}
+		if st.Mode == "internet" && len(r.wan) == 0 {
+			p.Issues = append(p.Issues, "no uplink interface found: quarantined devices get no internet")
+		}
+		for _, pat := range r.wanPatterns {
+			p.Issues = append(p.Issues, fmt.Sprintf("uplink device pattern %q cannot be matched: quarantined devices get no internet through it", pat))
 		}
 	}
 	return p
@@ -513,17 +647,20 @@ func (id qIdent) device(mac string) QDevice {
 	return d
 }
 
-// ---- Baseline candidates ----
+// ---- The panel user's device ----
 
-// QCandidate is a device the enable wizard offers to trust.
-type QCandidate struct {
-	QDevice
-	Sources   []string `json:"sources"`
-	Requester bool     `json:"requester,omitempty"`
+// qNormalizeIP strips an IPv6 zone ("fe80::1%br-lan") and brackets.
+func qNormalizeIP(ip string) string {
+	ip = strings.Trim(ip, "[]")
+	if i := strings.IndexByte(ip, '%'); i >= 0 {
+		ip = ip[:i]
+	}
+	return ip
 }
 
 // requesterMACFn resolves the panel user's device MAC from its IP.
 var requesterMACFn = func(ip string) string {
+	ip = qNormalizeIP(ip)
 	if ip == "" {
 		return ""
 	}
@@ -539,21 +676,54 @@ var requesterMACFn = func(ip string) string {
 	return parseNeighMAC(string(out))
 }
 
-// parseNeighMAC reads the lladdr of the first resolved `ip neigh` line.
+// parseNeighMAC reads the lladdr of a resolved `ip neigh` line. Two
+// different answers (the same address on two interfaces) are no answer.
 func parseNeighMAC(out string) string {
+	found := ""
 	for _, line := range strings.Split(out, "\n") {
 		f := strings.Fields(line)
 		for i := 0; i+1 < len(f); i++ {
 			if f[i] == "lladdr" && reMac.MatchString(f[i+1]) {
-				return strings.ToLower(f[i+1])
+				m := strings.ToLower(f[i+1])
+				if found != "" && found != m {
+					return ""
+				}
+				found = m
 			}
 		}
 	}
-	return ""
+	return found
 }
 
 // QuarantineRequesterMAC is the panel user's MAC, or "".
 func QuarantineRequesterMAC(ip string) string { return requesterMACFn(ip) }
+
+// QuarantineKeepCheck runs before a confirm window is kept: while the
+// quarantine is enforced, a panel user whose device is known but not in the
+// live approved set would lose the panel on the next new connection, even
+// though this request (an open connection) still got through.
+func QuarantineKeepCheck(requesterIP string) error {
+	qMu.Lock()
+	defer qMu.Unlock()
+	st := loadQState()
+	if !st.Enabled || !qLiveChainsPresent() {
+		return nil
+	}
+	mac := requesterMACFn(requesterIP)
+	if mac == "" || qLiveApproved(mac) {
+		return nil
+	}
+	return fmt.Errorf("your device %s is not approved by the quarantine: keeping this change would cut it off, so it will be undone", mac)
+}
+
+// ---- Baseline candidates ----
+
+// QCandidate is a device the enable wizard offers to trust.
+type QCandidate struct {
+	QDevice
+	Sources   []string `json:"sources"`
+	Requester bool     `json:"requester,omitempty"`
+}
 
 var listClientsFn = func(ip string) []Client { return ListClients(ip) }
 
@@ -638,7 +808,7 @@ type QEnableRequest struct {
 	Zones []string `json:"zones"`
 	// Approve: the baseline, the devices trusted from the start.
 	Approve []QApproveItem `json:"approve"`
-	// AllowNoRequester: enable even though the panel user's MAC is unknown
+	// AllowNoRequester: go ahead although the panel user's MAC is unknown
 	// (panel reached over a VPN or from another network).
 	AllowNoRequester bool `json:"allow_no_requester,omitempty"`
 }
@@ -650,7 +820,7 @@ type QApproveItem struct {
 
 func validMode(m string) bool { return m == "internet" || m == "nothing" }
 
-// validateZones checks that every zone exists and is not an upstream.
+// validateZones checks that every zone exists and is not an uplink.
 func validateZones(req []string, zones []QZone) ([]string, error) {
 	if len(req) == 0 {
 		return nil, errors.New("choose at least one zone to protect")
@@ -667,7 +837,7 @@ func validateZones(req []string, zones []QZone) ([]string, error) {
 		case !reZoneName.MatchString(name) || !ok:
 			return nil, fmt.Errorf("unknown zone %q", name)
 		case z.Wan:
-			return nil, fmt.Errorf("zone %q is an upstream (masquerading) zone and cannot be protected", name)
+			return nil, fmt.Errorf("zone %q is an uplink (it masquerades or carries a default route) and cannot be protected", name)
 		}
 		if !seen[name] {
 			seen[name] = true
@@ -676,6 +846,25 @@ func validateZones(req []string, zones []QZone) ([]string, error) {
 	}
 	sort.Strings(out)
 	return out, nil
+}
+
+var errNoRequester = errors.New("cannot tell which device you are using (no MAC for your address); open the panel from a device on the local network, or confirm you accept the risk")
+
+// qKeepRequester approves the panel user's device. It returns the MAC, ""
+// when unknown, or an error when unknown and not explicitly accepted.
+func qKeepRequester(st *qState, requesterIP string, allowUnknown bool) (string, error) {
+	mac := requesterMACFn(requesterIP)
+	if mac == "" {
+		if !allowUnknown {
+			return "", errNoRequester
+		}
+		return "", nil
+	}
+	if _, ok := st.Approved[mac]; !ok {
+		st.Approved[mac] = QApproved{At: time.Now().Unix(), Via: "panel"}
+	}
+	delete(st.Pending, mac)
+	return mac, nil
 }
 
 // QuarantineEnable turns the feature on. The caller (the server) holds the
@@ -689,74 +878,74 @@ func QuarantineEnable(req QEnableRequest, requesterIP string) (QuarantineProbe, 
 	if !validMode(req.Mode) {
 		return probeQuarantineLocked(), errors.New("mode must be internet or nothing")
 	}
-	zones, err := validateZones(req.Zones, qCurrentZones(nil))
+	r, err := readQRouter()
 	if err != nil {
 		return probeQuarantineLocked(), err
 	}
-	requester := requesterMACFn(requesterIP)
-	if requester == "" && !req.AllowNoRequester {
-		return probeQuarantineLocked(), errors.New("cannot tell which device you are using (no MAC for your address); open the panel from a device on the local network, or confirm you accept the risk")
+	zones, err := validateZones(req.Zones, r.zones)
+	if err != nil {
+		return probeQuarantineLocked(), err
 	}
-	now := time.Now()
 	st := loadQState()
-	st.Mode = req.Mode
-	st.Zones = zones
+	now := time.Now().Unix()
 	for _, a := range req.Approve {
 		mac := strings.ToLower(strings.TrimSpace(a.MAC))
 		if !reMac.MatchString(mac) {
 			return probeQuarantineLocked(), fmt.Errorf("invalid MAC %q", a.MAC)
 		}
 		if _, ok := st.Approved[mac]; !ok {
-			st.Approved[mac] = QApproved{Name: qCleanName(a.Name), At: now.Unix(), Via: "baseline"}
+			st.Approved[mac] = QApproved{Name: qCleanName(a.Name), At: now, Via: "baseline"}
 		}
 		delete(st.Pending, mac)
 	}
-	if requester != "" {
-		if _, ok := st.Approved[requester]; !ok {
-			st.Approved[requester] = QApproved{At: now.Unix(), Via: "baseline"}
-		}
-		delete(st.Pending, requester)
-	}
-	st.Pause = QPause{}
-	wan := qCurrentWan()
-	rs := st.ruleSet(wan, now)
-	if err := nftCheck(renderQCheck(rs)); err != nil {
-		return probeQuarantineLocked(), fmt.Errorf("the kernel rejected the quarantine rules, nothing was changed: %w", err)
-	}
-	if err := writeQFiles(rs); err != nil {
+	requester, err := qKeepRequester(st, requesterIP, req.AllowNoRequester)
+	if err != nil {
 		return probeQuarantineLocked(), err
+	}
+	st.Mode = req.Mode
+	st.Zones = zones
+	st.Pause = QPause{}
+	rs := r.ruleSet(st)
+	if err := writeQFiles(rs); err != nil {
+		return probeQuarantineLocked(), fmt.Errorf("the quarantine rules were refused, nothing was changed: %w", err)
 	}
 	st.Enabled = true
-	st.WanApplied = rs.Wan
 	if err := saveQState(st); err != nil {
+		removeQFiles()
 		return probeQuarantineLocked(), err
 	}
-	if err := applyQIncludes(qIncludeOps(qIncludeSections(uciShowFn("firewall")), zones)); err != nil {
-		qDisableLocked(st)
+	if err := applyQIncludes(qIncludeOps(r.sections, zones)); err != nil {
+		_ = qDisableLocked(st)
 		return probeQuarantineLocked(), fmt.Errorf("applying the firewall change failed and was undone: %w", err)
 	}
 	if err := qVerifyLive(zones, requester); err != nil {
-		qDisableLocked(st)
+		_ = qDisableLocked(st)
 		return probeQuarantineLocked(), fmt.Errorf("the quarantine did not come up as expected and was turned off again: %w", err)
 	}
+	qMissingPolls = 0
 	log.Printf("netgrip: quarantine enabled (mode %s, zones %s, %d approved)", st.Mode, strings.Join(zones, ","), len(st.Approved))
 	return probeQuarantineLocked(), nil
 }
 
-// qDisableLocked removes the include sections and files; the approvals are
-// kept so turning the feature back on remembers them.
+// qDisableLocked removes the include sections, then the files; the
+// approvals are kept so turning the feature back on remembers them.
 func qDisableLocked(st *qState) error {
 	st.Enabled = false
 	st.Pause = QPause{}
 	_ = saveQState(st)
-	var err error
-	if secs := qIncludeSections(uciShowFn("firewall")); len(secs) > 0 {
-		err = applyQIncludes(qIncludeOps(secs, nil))
+	fw, err := uciShowFn("firewall")
+	if err != nil {
+		return fmt.Errorf("reading the firewall config: %w", err)
 	}
-	for _, f := range []string{qTableFile(), qInputFile(), qForwardFile()} {
-		_ = os.Remove(f)
+	if secs := qIncludeSections(fw); len(secs) > 0 {
+		if err := applyQIncludes(qIncludeOps(secs, nil)); err != nil {
+			// Keep the files: the sections still point at them, and a jump
+			// without its chains would break the firewall at the next load.
+			return err
+		}
 	}
-	return err
+	removeQFiles()
+	return nil
 }
 
 // QuarantineDisable turns the feature off. Removing rules cannot lock
@@ -772,40 +961,100 @@ func QuarantineDisable() (QuarantineProbe, error) {
 }
 
 // QuarantineSetZones changes the protected zones (a firewall reload; the
-// server wraps it in the confirm window).
-func QuarantineSetZones(zones []string) (QuarantineProbe, error) {
+// server wraps it in the confirm window). It keeps the panel user's device
+// like enabling does, and puts the previous zones back if it fails.
+func QuarantineSetZones(zones []string, requesterIP string, allowUnknown bool) (QuarantineProbe, error) {
 	qMu.Lock()
 	defer qMu.Unlock()
 	st := loadQState()
 	if !st.Enabled {
 		return probeQuarantineLocked(), errors.New("the quarantine is off")
 	}
-	z, err := validateZones(zones, qCurrentZones(nil))
+	r, err := readQRouter()
 	if err != nil {
 		return probeQuarantineLocked(), err
 	}
-	st.Zones = z
+	z, err := validateZones(zones, r.zones)
+	if err != nil {
+		return probeQuarantineLocked(), err
+	}
+	requester, err := qKeepRequester(st, requesterIP, allowUnknown)
+	if err != nil {
+		return probeQuarantineLocked(), err
+	}
+	if err := writeQFiles(r.ruleSet(st)); err != nil {
+		return probeQuarantineLocked(), err
+	}
 	if err := saveQState(st); err != nil {
 		return probeQuarantineLocked(), err
 	}
-	if err := applyQIncludes(qIncludeOps(qIncludeSections(uciShowFn("firewall")), z)); err != nil {
-		return probeQuarantineLocked(), err
+	if err := applyQIncludes(qIncludeOps(r.sections, z)); err != nil {
+		qRestoreZonesLocked(r.actual)
+		return probeQuarantineLocked(), fmt.Errorf("changing the zones failed; the previous zones were put back: %w", err)
 	}
-	return probeQuarantineLocked(), qVerifyLive(z, "")
+	if err := qVerifyLive(z, requester); err != nil {
+		qRestoreZonesLocked(r.actual)
+		return probeQuarantineLocked(), fmt.Errorf("the new zones did not come up as expected; the previous zones were put back: %w", err)
+	}
+	st.Zones = z
+	_ = saveQState(st)
+	return probeQuarantineLocked(), nil
 }
 
-// qSyncLocked writes the include file and updates the live firewall when
-// the quarantine is running.
-func qSyncLocked(st *qState) error {
-	rs := st.ruleSet(qCurrentWan(), time.Now())
+// qRestoreZonesLocked puts the include sections back to prev (best effort).
+func qRestoreZonesLocked(prev []string) {
+	fw, err := uciShowFn("firewall")
+	if err != nil {
+		log.Printf("netgrip: quarantine: cannot restore the previous zones: %v", err)
+		return
+	}
+	if err := applyQIncludes(qIncludeOps(qIncludeSections(fw), prev)); err != nil {
+		log.Printf("netgrip: quarantine: restoring the previous zones failed: %v", err)
+	}
+}
+
+// qSyncLocked writes the include file and brings the live firewall in line
+// with the state: chains, sets and the kernel-timed pause "off". The
+// poller calls it again whenever the live state drifts, so a failure here
+// is retried.
+func qSyncLocked(st *qState, r qRouter) error {
+	rs := r.ruleSet(st)
 	if err := writeQFiles(rs); err != nil {
 		return err
 	}
-	st.WanApplied = rs.Wan
 	if !qLiveChainsPresent() {
 		return nil
 	}
-	return nftApply(renderQRuntimeUpdate(rs))
+	if err := nftApply(renderQRuntimeUpdate(rs)); err != nil {
+		return err
+	}
+	return nftApply(qOffPauseScript(st.offRemaining(time.Now())))
+}
+
+func (st *qState) offRemaining(now time.Time) int64 {
+	if st.Enabled && st.Pause.Kind == "off" && st.Pause.active(now) {
+		return st.Pause.Until - now.Unix()
+	}
+	return 0
+}
+
+// qChangeLocked saves the new intent, then applies it. The intent is saved
+// first on purpose: if applying fails, the poller keeps retrying.
+func qChangeLocked(st *qState) error {
+	if err := saveQState(st); err != nil {
+		return err
+	}
+	if !st.Enabled {
+		return nil
+	}
+	r, err := readQRouter()
+	if err != nil {
+		return err
+	}
+	if err := qSyncLocked(st, r); err != nil {
+		return fmt.Errorf("saved, but not applied yet (it will be retried): %w", err)
+	}
+	return nil
 }
 
 // QuarantineSetMode switches between "internet" and "nothing". It only
@@ -818,16 +1067,8 @@ func QuarantineSetMode(mode string) (QuarantineProbe, error) {
 	}
 	st := loadQState()
 	st.Mode = mode
-	if err := saveQState(st); err != nil {
-		return probeQuarantineLocked(), err
-	}
-	if st.Enabled {
-		if err := qSyncLocked(st); err != nil {
-			return probeQuarantineLocked(), err
-		}
-		_ = saveQState(st)
-	}
-	return probeQuarantineLocked(), nil
+	err := qChangeLocked(st)
+	return probeQuarantineLocked(), err
 }
 
 func qCleanName(s string) string {
@@ -867,55 +1108,48 @@ func QuarantineApprove(items []QApproveItem) (QuarantineProbe, error) {
 		st.Approved[mac] = a
 		delete(st.Pending, mac)
 	}
-	if err := saveQState(st); err != nil {
-		return probeQuarantineLocked(), err
-	}
-	if st.Enabled {
-		if err := qSyncLocked(st); err != nil {
-			return probeQuarantineLocked(), err
-		}
-		_ = saveQState(st)
-	}
-	return probeQuarantineLocked(), nil
+	err := qChangeLocked(st)
+	return probeQuarantineLocked(), err
 }
 
-// QuarantineRevoke withdraws trust. The panel user's own device is refused:
-// that would cut the panel off. Connections already open stay up until they
-// end (the firewall only judges new ones).
-func QuarantineRevoke(mac, requesterIP string) (QuarantineProbe, error) {
+// QuarantineRevoke withdraws trust. Refused for the panel user's own
+// device, and refused when that device cannot be identified (the MAC being
+// revoked might be the one carrying the user's traffic) unless force.
+// Connections already open stay up until they end.
+func QuarantineRevoke(mac, requesterIP string, force bool) (QuarantineProbe, error) {
 	qMu.Lock()
 	defer qMu.Unlock()
 	mac = strings.ToLower(strings.TrimSpace(mac))
 	if !reMac.MatchString(mac) {
 		return probeQuarantineLocked(), errors.New("invalid MAC")
 	}
-	if req := requesterMACFn(requesterIP); req != "" && req == mac {
+	switch req := requesterMACFn(requesterIP); {
+	case req == mac:
 		return probeQuarantineLocked(), errors.New("this is the device you are using: revoking it would cut off your access to the panel")
+	case req == "" && !force:
+		return probeQuarantineLocked(), errors.New("cannot tell which device you are using, so revoking might cut off your own access; revoke from a device on the local network")
 	}
 	st := loadQState()
 	if _, ok := st.Approved[mac]; !ok {
 		return probeQuarantineLocked(), errors.New("not an approved device")
 	}
 	delete(st.Approved, mac)
-	if err := saveQState(st); err != nil {
-		return probeQuarantineLocked(), err
-	}
-	if st.Enabled {
-		if err := qSyncLocked(st); err != nil {
-			return probeQuarantineLocked(), err
-		}
-		_ = saveQState(st)
-	}
-	return probeQuarantineLocked(), nil
+	err := qChangeLocked(st)
+	return probeQuarantineLocked(), err
 }
 
-// QuarantineForget drops a pending entry (it reappears if the device
-// comes back).
+// QuarantineForget drops a pending entry and its live "seen" record. The
+// device is not announced again for a week (it stays quarantined, and
+// reappears in the list when it is active again).
 func QuarantineForget(mac string) (QuarantineProbe, error) {
 	qMu.Lock()
 	defer qMu.Unlock()
+	mac = strings.ToLower(strings.TrimSpace(mac))
 	st := loadQState()
-	delete(st.Pending, strings.ToLower(strings.TrimSpace(mac)))
+	delete(st.Pending, mac)
+	if reMac.MatchString(mac) {
+		_, _ = nftRunFn("", "delete", "element", "inet", qTable, qSetSeen, "{", mac, "}")
+	}
 	return probeQuarantineLocked(), saveQState(st)
 }
 
@@ -938,36 +1172,35 @@ func QuarantinePause(minutes int, kind string) (QuarantineProbe, error) {
 		return probeQuarantineLocked(), errors.New("the quarantine is off")
 	}
 	learned := st.Pause.Learned
-	if st.Pause.Kind != kind {
+	if st.Pause.Kind != kind || !st.Pause.active(time.Now()) {
 		learned = nil
 	}
-	st.Pause = QPause{Until: time.Now().Add(d).Unix(), Kind: kind, Learned: learned}
-	if err := saveQState(st); err != nil {
-		return probeQuarantineLocked(), err
+	p := QPause{Until: time.Now().Add(d).Unix(), Kind: kind, Learned: learned}
+	if kind == "learn" {
+		// Devices already waiting are not approved by a learning pause:
+		// only devices that join during it.
+		for mac := range st.Pending {
+			p.Excluded = append(p.Excluded, mac)
+		}
+		sort.Strings(p.Excluded)
 	}
-	if err := qSyncLocked(st); err != nil {
-		return probeQuarantineLocked(), err
-	}
-	_ = saveQState(st)
-	return probeQuarantineLocked(), nil
+	st.Pause = p
+	err := qChangeLocked(st)
+	return probeQuarantineLocked(), err
 }
 
-// QuarantineResume ends a pause now.
-func QuarantineResume() (QuarantineProbe, error) {
+// QuarantineResume ends a pause now. The panel user's device is approved
+// first: during a pause it may have joined without being approved.
+func QuarantineResume(requesterIP string) (QuarantineProbe, error) {
 	qMu.Lock()
 	defer qMu.Unlock()
 	st := loadQState()
-	qEndPauseLocked(st)
-	if err := saveQState(st); err != nil {
-		return probeQuarantineLocked(), err
-	}
 	if st.Enabled {
-		if err := qSyncLocked(st); err != nil {
-			return probeQuarantineLocked(), err
-		}
-		_ = saveQState(st)
+		_, _ = qKeepRequester(st, requesterIP, true)
 	}
-	return probeQuarantineLocked(), nil
+	qEndPauseLocked(st)
+	err := qChangeLocked(st)
+	return probeQuarantineLocked(), err
 }
 
 func qEndPauseLocked(st *qState) {
@@ -983,9 +1216,9 @@ func qEndPauseLocked(st *qState) {
 var qPollerOnce sync.Once
 
 // StartQuarantine runs the background poller: it records quarantined
-// devices, approves them during a learning pause, ends pauses, follows WAN
-// interface changes and notices when the firewall dropped the feature
-// (a confirm revert, or the sections removed by hand).
+// devices, approves new ones during a learning pause, ends pauses, keeps
+// the live firewall in line with the intent and notices when the firewall
+// no longer has the feature (a confirm revert, or the sections removed).
 func StartQuarantine() {
 	qPollerOnce.Do(func() {
 		go func() {
@@ -1014,7 +1247,24 @@ func qPollTick() time.Duration {
 	return qPollInterval
 }
 
-var qSeenFn = func() ([]string, error) { return qSetElements(qSetSeen) }
+var qSeenFn = func() ([]qElem, error) { return qSetElementsTimed(qSetSeen) }
+
+// qLiveDrifted reports whether the live firewall or the include file
+// differs from what the intent renders.
+var qLiveDrifted = func(st *qState, r qRouter, now time.Time) bool {
+	rs := r.ruleSet(st)
+	if file, err := os.ReadFile(qTableFile()); err != nil || string(file) != renderQTable(rs) {
+		return true
+	}
+	if live, err := qSetElements(qSetOK); err != nil || strings.Join(sortedMACs(live), ",") != strings.Join(rs.Approved, ",") {
+		return true
+	}
+	if live, err := qSetElements(qSetWan); err != nil || strings.Join(sortedIfnames(live), ",") != strings.Join(sortedIfnames(rs.Wan), ",") {
+		return true
+	}
+	off, err := qSetElements(qSetOff)
+	return err != nil || (len(off) > 0) != (st.offRemaining(now) > 0)
+}
 
 func qPoll(now time.Time) {
 	qMu.Lock()
@@ -1023,85 +1273,127 @@ func qPoll(now time.Time) {
 	if !st.Enabled {
 		return
 	}
-	dirty, resync := false, false
-
-	if !qIncludesConfigured() {
-		// Reverted by the confirm window, or removed by hand: the firewall
-		// no longer has the feature, so neither does the intent.
-		log.Printf("netgrip: quarantine include sections are gone (reverted or removed); recording the feature as off")
-		st.Enabled = false
-		st.Pause = QPause{}
-		_ = saveQState(st)
+	r, err := readQRouter()
+	if err != nil {
+		return // a failed read decides nothing
+	}
+	live := qLiveChainsPresent()
+	if len(r.sections) == 0 && !live {
+		// Reverted by the confirm window, or removed by hand: once the
+		// firewall has neither the sections nor the chains, the feature is
+		// off. Twice in a row, so one odd read does not turn it off.
+		qMissingPolls++
+		if qMissingPolls >= qMissingToRevert {
+			log.Printf("netgrip: the firewall no longer has the quarantine (reverted or removed); recording it as off")
+			st.Enabled = false
+			st.Pause = QPause{}
+			_ = saveQState(st)
+			removeQFiles()
+			qMissingPolls = 0
+		}
 		return
 	}
-
+	qMissingPolls = 0
+	material := false
+	if strings.Join(r.actual, ",") != strings.Join(st.Zones, ",") && len(r.actual) > 0 {
+		st.Zones = append([]string(nil), r.actual...)
+		material = true
+	}
 	if st.Pause.Until != 0 && !st.Pause.active(now) {
 		qEndPauseLocked(st)
-		dirty, resync = true, true
+		material = true
 	}
 
-	wan := qCurrentWan()
-	if strings.Join(wan, ",") != strings.Join(sortedIfnames(st.WanApplied), ",") {
-		dirty, resync = true, true
+	light := false
+	if seen, err := qSeenFn(); err == nil {
+		m, l := qRecordSeen(st, seen, now)
+		material = material || m
+		light = light || l
 	}
-
-	seen, err := qSeenFn()
-	if err == nil {
-		var ident *qIdent
-		learning := st.Pause.active(now) && st.Pause.Kind == "learn"
-		for _, mac := range seen {
-			if !reMac.MatchString(mac) {
-				continue
-			}
-			if _, ok := st.Approved[mac]; ok {
-				continue
-			}
-			if learning {
-				st.Approved[mac] = QApproved{At: now.Unix(), Via: "pause"}
-				st.Pause.Learned = append(st.Pause.Learned, mac)
-				delete(st.Pending, mac)
-				dirty, resync = true, true
-				continue
-			}
-			if ident == nil {
-				i := qIdentities()
-				ident = &i
-			}
-			d := ident.device(mac)
-			p, existed := st.Pending[mac]
-			if !existed {
-				p.FirstSeen = now.Unix()
-			}
-			p.LastSeen = now.Unix()
-			if d.IP != "" {
-				p.IP = d.IP
-			}
-			if d.Hostname != "" {
-				p.Hostname = d.Hostname
-			}
-			if !p.Notified {
-				p.Notified = true
-				go qNotifyPending(d, qChannelsFn, qNotifyFn)
-			}
-			st.Pending[mac] = p
-			dirty = true
+	if qPrunePending(st, now) {
+		material = true
+	}
+	if material || light {
+		if material || now.Sub(qLastLightSave) >= qLightSaveEvery {
+			_ = saveQState(st)
+			qLastLightSave = now
 		}
 	}
-
-	if qPrunePending(st, now) {
-		dirty = true
-	}
-	if resync {
-		if err := qSyncLocked(st); err != nil {
+	if live && qLiveDrifted(st, r, now) {
+		if err := qSyncLocked(st, r); err != nil {
 			log.Printf("netgrip: quarantine sync: %v", err)
 		}
 	}
-	if dirty {
-		_ = saveQState(st)
-	}
 }
 
-// qPrunePending drops entries not seen for a week and caps the list.
+// qRecordSeen folds the live "seen" set into the state: it approves new
+// devices during a learning pause and records and announces the rest.
+// material: something worth saving at once; light: only times changed.
+func qRecordSeen(st *qState, seen []qElem, now time.Time) (material, light bool) {
+	learning := st.Pause.active(now) && st.Pause.Kind == "learn"
+	excluded := map[string]bool{}
+	for _, m := range st.Pause.Excluded {
+		excluded[m] = true
+	}
+	var ident *qIdent
+	var announce []QDevice
+	for _, e := range seen {
+		mac := e.Val
+		if !reMac.MatchString(mac) {
+			continue
+		}
+		if _, ok := st.Approved[mac]; ok {
+			continue
+		}
+		_, waiting := st.Pending[mac]
+		if learning && !waiting && !excluded[mac] && len(st.Pause.Learned) < qMaxLearned {
+			st.Approved[mac] = QApproved{At: now.Unix(), Via: "pause"}
+			st.Pause.Learned = append(st.Pause.Learned, mac)
+			material = true
+			continue
+		}
+		if ident == nil {
+			i := qIdentities()
+			ident = &i
+		}
+		d := ident.device(mac)
+		p := st.Pending[mac]
+		if !waiting {
+			p.FirstSeen = now.Unix()
+			material = true
+		}
+		last := now.Unix()
+		if e.Expires > 0 && e.Expires <= qSeenTimeout {
+			last = now.Unix() - (qSeenTimeout - e.Expires)
+		}
+		if last > p.LastSeen {
+			p.LastSeen = last
+			light = true
+		}
+		if d.IP != "" && d.IP != p.IP {
+			p.IP = d.IP
+			light = true
+		}
+		if d.Hostname != "" && d.Hostname != p.Hostname {
+			p.Hostname = d.Hostname
+			light = true
+		}
+		st.Pending[mac] = p
+		if _, done := st.Notified[mac]; !done {
+			st.Notified[mac] = now.Unix()
+			material = true
+			d.IP, d.Hostname = p.IP, p.Hostname
+			announce = append(announce, d)
+		}
+	}
+	if len(announce) > 0 {
+		go qNotifyPendingBatch(announce, qChannelsFn, qNotifyFn)
+	}
+	return material, light
+}
+
+// qPrunePending drops entries not seen for a week, caps the list (oldest
+// first, the MAC breaking ties) and forgets old announcements.
 func qPrunePending(st *qState, now time.Time) bool {
 	changed := false
 	for mac, p := range st.Pending {
@@ -1115,11 +1407,23 @@ func qPrunePending(st *qState, now time.Time) bool {
 		for m := range st.Pending {
 			macs = append(macs, m)
 		}
-		sort.Slice(macs, func(i, j int) bool { return st.Pending[macs[i]].LastSeen < st.Pending[macs[j]].LastSeen })
+		sort.Slice(macs, func(i, j int) bool {
+			a, b := st.Pending[macs[i]].LastSeen, st.Pending[macs[j]].LastSeen
+			if a != b {
+				return a < b
+			}
+			return macs[i] < macs[j]
+		})
 		for _, m := range macs[:len(macs)-qMaxPending] {
 			delete(st.Pending, m)
 		}
 		changed = true
+	}
+	for mac, at := range st.Notified {
+		if now.Unix()-at > int64(qNotifiedTTL/time.Second) {
+			delete(st.Notified, mac)
+			changed = true
+		}
 	}
 	return changed
 }
@@ -1145,21 +1449,33 @@ var (
 	qChannelsFn = anyChannelEnabled
 )
 
-// The channel check and sender are passed in (not read from the package
-// vars) because this runs on its own goroutine.
-func qNotifyPending(d QDevice, channels func() bool, notify func(string, string, string, bool)) {
+// qNotifyPendingBatch announces new quarantined devices: up to
+// qNotifyPerPoll one by one, the rest in one summary, so a burst of MACs
+// cannot flood the channels. The channel check and sender are passed in
+// (not read from the package vars) because this runs on its own goroutine.
+func qNotifyPendingBatch(devs []QDevice, channels func() bool, notify func(string, string, string, bool)) {
 	if !channels() {
 		return
 	}
-	label := qDeviceLabel(d)
-	extra := ""
-	if d.IP != "" {
-		extra = " · " + d.IP
+	for i, d := range devs {
+		if i == qNotifyPerPoll {
+			rest := len(devs) - qNotifyPerPoll
+			notify("NetGrip",
+				fmt.Sprintf("🔒 <b>NetGrip</b>\n%d more new devices were quarantined. See the panel's Quarantine page.", rest),
+				fmt.Sprintf("🔒 NetGrip\n%d more new devices were quarantined. See the panel's Quarantine page.", rest),
+				false)
+			return
+		}
+		label := qDeviceLabel(d)
+		extra := ""
+		if d.IP != "" {
+			extra = " · " + d.IP
+		}
+		notify("NetGrip",
+			fmt.Sprintf("🔒 <b>NetGrip</b>\nNew device quarantined: <b>%s</b>\nMAC: %s%s\nApprove it on the panel's Quarantine page.", htmlEsc(label), d.MAC, htmlEsc(extra)),
+			fmt.Sprintf("🔒 NetGrip\nNew device quarantined: %s\nMAC: %s%s\nApprove it on the panel's Quarantine page.", label, d.MAC, extra),
+			false)
 	}
-	notify("NetGrip",
-		fmt.Sprintf("🔒 <b>NetGrip</b>\nNew device quarantined: <b>%s</b>\nMAC: %s%s\nApprove it on the panel's Quarantine page.", htmlEsc(label), d.MAC, htmlEsc(extra)),
-		fmt.Sprintf("🔒 NetGrip\nNew device quarantined: %s\nMAC: %s%s\nApprove it on the panel's Quarantine page.", label, d.MAC, extra),
-		false)
 }
 
 func qNotifyLearned(macs []string, channels func() bool, notify func(string, string, string, bool)) {

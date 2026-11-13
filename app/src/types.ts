@@ -1788,7 +1788,7 @@ export interface QDevice {
   first_seen?: number;
   last_seen?: number;
   at?: number;
-  via?: "baseline" | "manual" | "pause";
+  via?: "baseline" | "manual" | "pause" | "panel";
 }
 
 export interface QPause {

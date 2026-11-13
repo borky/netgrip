@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -14,8 +15,8 @@ import (
 )
 
 // A small, made-up router: a client zone with DHCP, a second client zone,
-// a zone without DHCP and an upstream zone (masquerading) whose networks
-// are a PPPoE link and a DHCP WAN.
+// a VPN zone without DHCP, an upstream zone (masquerading, PPPoE link plus
+// a modem) and a routed uplink zone without masquerading.
 const qTestFirewall = `firewall.@zone[0]=zone
 firewall.@zone[0].name='home'
 firewall.@zone[0].network='home'
@@ -23,82 +24,122 @@ firewall.@zone[1]=zone
 firewall.@zone[1].name='up'
 firewall.@zone[1].network='uplink' 'uplink6'
 firewall.@zone[1].masq='1'
-firewall.@zone[1].device='tun9'
+firewall.@zone[1].device='tun9' 'wwan+'
 firewall.@zone[2]=zone
 firewall.@zone[2].name='guests'
 firewall.@zone[2].network='guests'
 firewall.@zone[3]=zone
 firewall.@zone[3].name='vpn'
 firewall.@zone[3].network='tunnel'
+firewall.@zone[4]=zone
+firewall.@zone[4].name='transit'
+firewall.@zone[4].network='transit'
 `
 
 const qTestDhcp = `dhcp.home=dhcp
 dhcp.home.interface='home'
+dhcp.home.dhcp_option='6,192.0.2.53' '3,192.0.2.1'
+dhcp.home.dns='2001:db8::53'
 dhcp.guests=dhcp
 dhcp.guests.interface='guests'
 dhcp.up=dhcp
 dhcp.up.interface='uplink'
 dhcp.up.ignore='1'
+dhcp.transit=dhcp
+dhcp.transit.interface='transit'
 `
 
-func TestQZonesFrom(t *testing.T) {
-	zones := qZonesFrom(qTestFirewall, qTestDhcp, []string{"guests"})
-	got := map[string]QZone{}
+var qTestIfaces = []ubus.InterfaceState{
+	{Name: "uplink", Device: "eth9", L3Device: "pppoe-uplink", HasDefaultRoute: true},
+	{Name: "uplink6", Device: "/dev/cdc-wdm9"}, // a modem path is not a netdev
+	{Name: "home", Device: "br-home"},
+	{Name: "transit", Device: "eth8", HasDefaultRoute6: true},
+}
+
+func qZoneMap(zones []QZone) map[string]QZone {
+	out := map[string]QZone{}
 	for _, z := range zones {
-		got[z.Name] = z
+		out[z.Name] = z
 	}
+	return out
+}
+
+func TestQZonesFromFindsUplinksWithoutNames(t *testing.T) {
+	got := qZoneMap(qZonesFrom(qTestFirewall, qTestDhcp, []string{"guests"}, qTestIfaces))
 	if !got["up"].Wan || got["up"].Suggested {
-		t.Fatalf("upstream zone: %+v", got["up"])
+		t.Fatalf("masquerading zone: %+v", got["up"])
+	}
+	if !got["transit"].Wan || got["transit"].Suggested {
+		t.Fatalf("a zone carrying a default route is an uplink even without masq: %+v", got["transit"])
 	}
 	if !got["home"].Suggested || !got["guests"].Suggested || got["vpn"].Suggested {
-		t.Fatalf("suggestions: %+v", zones)
+		t.Fatalf("suggestions: %+v", got)
 	}
 	if !got["guests"].Protected || got["home"].Protected {
-		t.Fatalf("protected flags: %+v", zones)
+		t.Fatalf("protected flags: %+v", got)
+	}
+	masq6 := qTestFirewall + "firewall.@zone[3].masq6='1'\n"
+	if !qZoneMap(qZonesFrom(masq6, "", nil, nil))["vpn"].Wan {
+		t.Fatal("masq6 must mark an uplink")
 	}
 }
 
 func TestQWanDevicesFrom(t *testing.T) {
-	zones := qZonesFrom(qTestFirewall, "", nil)
-	ifaces := []ubus.InterfaceState{
-		{Name: "uplink", Device: "eth9", L3Device: "pppoe-uplink"},
-		{Name: "uplink6", Device: "/dev/cdc-wdm9"}, // a modem path is not a netdev
-		{Name: "home", Device: "br-home"},
+	zones := qZonesFrom(qTestFirewall, "", nil, qTestIfaces)
+	devs, patterns := qWanDevicesFrom(zones, qZoneExtras(qTestFirewall), qTestIfaces)
+	if strings.Join(devs, ",") != "eth8,eth9,pppoe-uplink,tun9" {
+		t.Fatalf("wan devices: %v", devs)
 	}
-	got := qWanDevicesFrom(zones, qZoneDevices(qTestFirewall), ifaces)
-	if strings.Join(got, ",") != "eth9,pppoe-uplink,tun9" {
-		t.Fatalf("wan devices: %v", got)
+	if strings.Join(patterns, ",") != "wwan+" {
+		t.Fatalf("patterns: %v", patterns)
+	}
+}
+
+func TestQDHCPDNSServers(t *testing.T) {
+	if got := strings.Join(qDHCPDNSServers(qTestDhcp), ","); got != "192.0.2.53,2001:db8::53" {
+		t.Fatalf("dns servers: %s", got)
+	}
+}
+
+func TestQActualZones(t *testing.T) {
+	show := `firewall.netgrip_q_table=include
+firewall.netgrip_q_in_0=include
+firewall.netgrip_q_in_0.chain='input_guests'
+firewall.netgrip_q_fw_0.chain='forward_guests'
+firewall.netgrip_q_in_1.chain='input_home'
+firewall.other.chain='input_x'
+`
+	if got := strings.Join(qActualZones(show), ","); got != "guests,home" {
+		t.Fatalf("actual zones: %s", got)
 	}
 }
 
 func TestValidateZones(t *testing.T) {
-	zones := qZonesFrom(qTestFirewall, qTestDhcp, nil)
-	if _, err := validateZones(nil, zones); err == nil {
-		t.Fatal("no zone accepted")
+	zones := qZonesFrom(qTestFirewall, qTestDhcp, nil, qTestIfaces)
+	for _, bad := range [][]string{nil, {"up"}, {"transit"}, {"nope"}, {"home'; drop"}} {
+		if _, err := validateZones(bad, zones); err == nil {
+			t.Fatalf("accepted %v", bad)
+		}
 	}
-	if _, err := validateZones([]string{"up"}, zones); err == nil {
-		t.Fatal("an upstream zone was accepted")
-	}
-	if _, err := validateZones([]string{"nope"}, zones); err == nil {
-		t.Fatal("an unknown zone was accepted")
-	}
-	if _, err := validateZones([]string{"home'; drop"}, zones); err == nil {
-		t.Fatal("a malformed zone name was accepted")
-	}
-	got, err := validateZones([]string{"home", "guests", "home"}, zones)
-	if err != nil || strings.Join(got, ",") != "guests,home" {
+	got, err := validateZones([]string{"home", "guests", "home", "vpn"}, zones)
+	if err != nil || strings.Join(got, ",") != "guests,home,vpn" {
 		t.Fatalf("got %v %v", got, err)
 	}
 }
 
 func TestRenderQTable(t *testing.T) {
-	rs := qRuleSet{Mode: "internet", Approved: []string{"02:00:00:00:00:0B", "02:00:00:00:00:0a", "bad", "02:00:00:00:00:0a"}, Wan: []string{"pppoe-x", "eth9", "bad name"}}
+	rs := qRuleSet{Mode: "internet", Approved: []string{"02:00:00:00:00:0B", "02:00:00:00:00:0a", "bad", "02:00:00:00:00:0a"},
+		Wan: []string{"pppoe-x", "eth9", "bad name"}, DNS: []string{"192.0.2.53", "2001:db8::53", "junk"}}
 	out := renderQTable(rs)
 	for _, want := range []string{
 		"set netgrip_q_ok { type ether_addr; elements = { 02:00:00:00:00:0a, 02:00:00:00:00:0b }; }",
 		`set netgrip_q_wan { type ifname; elements = { "eth9", "pppoe-x" }; }`,
+		"set netgrip_q_off { type nf_proto; flags timeout; }",
+		"set netgrip_q_dns4 { type ipv4_addr; elements = { 192.0.2.53 }; }",
+		"set netgrip_q_dns6 { type ipv6_addr; elements = { 2001:db8::53 }; }",
 		"flags dynamic, timeout",
-		"chain netgrip_q_input {",
+		"meta iiftype != ether return",
+		"ct status dnat ct original proto-dst 53 return",
 		"udp dport { 53, 67, 123, 547 } return",
 		"oifname != @netgrip_q_wan counter reject",
 		"ip daddr @netgrip_q_private4 counter reject",
@@ -117,30 +158,53 @@ func TestRenderQTable(t *testing.T) {
 	}
 }
 
-func TestQRulesApprovedFirstAndPause(t *testing.T) {
-	for _, rules := range [][]string{qInputRules(qRuleSet{Mode: "internet"}), qForwardRules(qRuleSet{Mode: "nothing"})} {
-		if !strings.HasPrefix(rules[0], "ether saddr @netgrip_q_ok return") {
-			t.Fatalf("approved devices must leave first: %v", rules)
+// The order is the safety: non-Ethernet traffic and approved devices leave
+// before anything else, a pause "off" leaves before any refusal, and every
+// chain ends in a refusal.
+func TestQRuleOrder(t *testing.T) {
+	for _, rules := range [][]string{
+		qInputRules(qRuleSet{Mode: "internet"}),
+		qForwardRules(qRuleSet{Mode: "nothing"}),
+	} {
+		if rules[0] != "meta iiftype != ether return" || !strings.HasPrefix(rules[1], "ether saddr @netgrip_q_ok return") {
+			t.Fatalf("head: %v", rules)
 		}
-		if !strings.Contains(rules[len(rules)-1], "reject") {
-			t.Fatalf("must end in a refusal: %v", rules)
+		off, firstReject := -1, -1
+		for i, r := range rules {
+			if strings.Contains(r, "@netgrip_q_off return") {
+				off = i
+			}
+			if strings.Contains(r, "reject") && firstReject < 0 {
+				firstReject = i
+			}
+		}
+		if off < 0 || firstReject < 0 || off > firstReject {
+			t.Fatalf("pause must precede refusals: %v", rules)
+		}
+		if !strings.Contains(rules[len(rules)-1], "reject") && rules[len(rules)-1] != "return" {
+			t.Fatalf("end: %v", rules)
 		}
 	}
-	paused := qForwardRules(qRuleSet{Mode: "nothing", Paused: true})
-	if paused[len(paused)-1] != "return" || strings.Contains(strings.Join(paused, "\n"), "reject") {
-		t.Fatalf("pause off must enforce nothing: %v", paused)
+	if last := qInputRules(qRuleSet{Mode: "internet"}); !strings.Contains(last[len(last)-1], "reject") {
+		t.Fatal("input must end in a refusal")
 	}
-	if !strings.Contains(strings.Join(paused, "\n"), "update @netgrip_q_seen") {
-		t.Fatal("pause off must still record devices")
+}
+
+func TestQOffPauseScript(t *testing.T) {
+	if s := qOffPauseScript(90); !strings.Contains(s, "flush set inet fw4 netgrip_q_off") || !strings.Contains(s, "ipv4 timeout 90s, ipv6 timeout 90s") {
+		t.Fatalf("set: %s", s)
+	}
+	if s := qOffPauseScript(0); strings.Contains(s, "add element") {
+		t.Fatalf("clear: %s", s)
 	}
 }
 
 func TestRenderQRuntimeUpdateIsOneTransaction(t *testing.T) {
-	out := renderQRuntimeUpdate(qRuleSet{Mode: "internet", Approved: []string{"02:00:00:00:00:01"}, Wan: []string{"eth9"}})
+	out := renderQRuntimeUpdate(qRuleSet{Mode: "internet", Approved: []string{"02:00:00:00:00:01"}, Wan: []string{"eth9"}, DNS: []string{"192.0.2.53"}})
 	for _, want := range []string{
 		"flush chain inet fw4 netgrip_q_input", "flush chain inet fw4 netgrip_q_forward",
 		"flush set inet fw4 netgrip_q_ok", "add element inet fw4 netgrip_q_ok { 02:00:00:00:00:01 }",
-		`add element inet fw4 netgrip_q_wan { "eth9" }`, "table inet fw4 {",
+		`add element inet fw4 netgrip_q_wan { "eth9" }`, "add element inet fw4 netgrip_q_dns4 { 192.0.2.53 }", "table inet fw4 {",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("missing %q", want)
@@ -158,10 +222,7 @@ func TestQIncludeOpsAreValidAndOwned(t *testing.T) {
 			t.Fatalf("op rejected by the executor: %v", err)
 		}
 	}
-	joined := ""
-	for _, op := range ops {
-		joined += op.Kind + " " + strings.Join(op.Args, " ") + "\n"
-	}
+	joined := fmtOps(ops)
 	for _, want := range []string{
 		"uci_delete firewall.netgrip_q_table", "uci_delete firewall.netgrip_q_in_0",
 		"uci_set firewall.netgrip_q_table.position table-prepend",
@@ -173,7 +234,6 @@ func TestQIncludeOpsAreValidAndOwned(t *testing.T) {
 			t.Errorf("missing %q in\n%s", want, joined)
 		}
 	}
-	// Removing everything adds nothing back.
 	if strings.Contains(fmtOps(qIncludeOps([]string{"netgrip_q_table"}, nil)), "uci_set") {
 		t.Fatal("disable must not create sections")
 	}
@@ -204,9 +264,9 @@ func TestParseNftSetElements(t *testing.T) {
 	raw := `{"nftables":[{"metainfo":{}},{"set":{"family":"inet","name":"netgrip_q_seen","elem":[
 		"02:00:00:00:00:01",
 		{"elem":{"val":"02:00:00:00:00:0A","timeout":3600,"expires":3500}}]}}]}`
-	got, err := parseNftSetElements([]byte(raw))
-	if err != nil || strings.Join(got, ",") != "02:00:00:00:00:01,02:00:00:00:00:0a" {
-		t.Fatalf("got %v %v", got, err)
+	got, err := parseNftSetElementsTimed([]byte(raw))
+	if err != nil || len(got) != 2 || got[1].Val != "02:00:00:00:00:0a" || got[1].Expires != 3500 {
+		t.Fatalf("got %+v %v", got, err)
 	}
 	empty, err := parseNftSetElements([]byte(`{"nftables":[{"set":{"name":"x"}}]}`))
 	if err != nil || len(empty) != 0 {
@@ -221,71 +281,104 @@ func TestParseNeighMAC(t *testing.T) {
 	if parseNeighMAC("192.0.2.6 dev br-x FAILED\n") != "" {
 		t.Fatal("unresolved entry gave a MAC")
 	}
+	two := "192.0.2.7 dev a lladdr 02:00:00:00:00:07 REACHABLE\n192.0.2.7 dev b lladdr 02:00:00:00:00:08 STALE\n"
+	if parseNeighMAC(two) != "" {
+		t.Fatal("two different answers must be no answer")
+	}
+	if qNormalizeIP("fe80::1%br-x") != "fe80::1" || qNormalizeIP("[2001:db8::1]") != "2001:db8::1" {
+		t.Fatal("zone or brackets not stripped")
+	}
+}
+
+func TestWriteFileDurable(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "f")
+	if err := writeFileDurable(p, []byte("a")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeFileDurable(p, []byte("b")); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(p); string(b) != "b" {
+		t.Fatalf("content %q", b)
+	}
+	if _, err := os.Stat(p + ".tmp"); err == nil {
+		t.Fatal("temp file left behind")
+	}
 }
 
 // ---- Flow tests with every system call faked ----
 
 type qFake struct {
-	t        *testing.T
-	sections map[string]bool // owned include sections present in "UCI"
-	applied  [][]executor.Op
-	nft      []string
-	checkErr error
-	applyErr error
-	verify   error
-	seen     []string
-	mu       sync.Mutex
-	notified []string
-	live     bool
+	t         *testing.T
+	sections  map[string]map[string]string // owned include sections: options
+	applied   [][]executor.Op
+	nft       []string
+	checkErr  error
+	applyErr  error
+	verify    error
+	showErr   error
+	seen      []qElem
+	live      bool
+	mu        sync.Mutex
+	notified  []string
+	requester string
 }
 
 func newQFake(t *testing.T) *qFake {
 	t.Helper()
 	dir := t.TempDir()
-	f := &qFake{t: t, sections: map[string]bool{}}
+	f := &qFake{t: t, sections: map[string]map[string]string{}, requester: "02:00:00:00:00:10"}
 	oldDir, oldState := quarantineDir, qStatePath
 	quarantineDir = filepath.Join(dir, "q")
 	qStatePath = filepath.Join(dir, "quarantine.json")
-	t.Cleanup(func() { quarantineDir, qStatePath = oldDir, oldState })
-
-	swap := func(restore func()) { t.Cleanup(restore) }
-	oShow, oDump, oNft, oApply, oVerify, oReq, oApp, oIdent, oSeen, oNotify, oList, oChan :=
-		uciShowFn, dumpInterfacesFn, nftRunFn, applyQIncludes, qVerifyLive, requesterMACFn, qApplicable, qIdentities, qSeenFn, qNotifyFn, listClientsFn, qChannelsFn
-	swap(func() {
-		uciShowFn, dumpInterfacesFn, nftRunFn, applyQIncludes, qVerifyLive, requesterMACFn, qApplicable, qIdentities, qSeenFn, qNotifyFn, listClientsFn, qChannelsFn =
-			oShow, oDump, oNft, oApply, oVerify, oReq, oApp, oIdent, oSeen, oNotify, oList, oChan
+	oldMissing, oldLight := qMissingPolls, qLastLightSave
+	qMissingPolls, qLastLightSave = 0, time.Time{}
+	t.Cleanup(func() {
+		quarantineDir, qStatePath = oldDir, oldState
+		qMissingPolls, qLastLightSave = oldMissing, oldLight
 	})
 
-	uciShowFn = func(pkg string) string {
+	oShow, oDump, oNft, oApply, oVerify, oReq, oApp, oIdent, oSeen, oNotify, oList, oChan, oDrift :=
+		uciShowFn, dumpInterfacesFn, nftRunFn, applyQIncludes, qVerifyLive, requesterMACFn, qApplicable, qIdentities, qSeenFn, qNotifyFn, listClientsFn, qChannelsFn, qLiveDrifted
+	t.Cleanup(func() {
+		uciShowFn, dumpInterfacesFn, nftRunFn, applyQIncludes, qVerifyLive, requesterMACFn, qApplicable, qIdentities, qSeenFn, qNotifyFn, listClientsFn, qChannelsFn, qLiveDrifted =
+			oShow, oDump, oNft, oApply, oVerify, oReq, oApp, oIdent, oSeen, oNotify, oList, oChan, oDrift
+	})
+
+	uciShowFn = func(pkg string) (string, error) {
 		if pkg == "dhcp" {
-			return qTestDhcp
+			return qTestDhcp, nil
+		}
+		if f.showErr != nil {
+			return "", f.showErr
 		}
 		s := qTestFirewall
+		names := make([]string, 0, len(f.sections))
 		for sec := range f.sections {
+			names = append(names, sec)
+		}
+		sort.Strings(names)
+		for _, sec := range names {
 			s += "firewall." + sec + "=include\n"
+			for opt, val := range f.sections[sec] {
+				s += "firewall." + sec + "." + opt + "='" + val + "'\n"
+			}
 		}
-		return s
+		return s, nil
 	}
-	SetUciExecForTest(t, func(args ...string) ([]byte, error) {
-		if len(args) == 3 && args[1] == "get" && f.sections[strings.TrimPrefix(args[2], "firewall.")] {
-			return []byte("include\n"), nil
-		}
-		return nil, errors.New("not found")
-	})
-	dumpInterfacesFn = func() []ubus.InterfaceState {
-		return []ubus.InterfaceState{{Name: "uplink", Device: "eth9", L3Device: "pppoe-uplink"}}
-	}
+	dumpInterfacesFn = func() []ubus.InterfaceState { return qTestIfaces }
 	nftRunFn = func(stdin string, args ...string) ([]byte, error) {
 		cmd := strings.Join(args, " ")
-		if strings.HasPrefix(cmd, "-c ") {
-			f.nft = append(f.nft, "check")
+		switch {
+		case strings.HasPrefix(cmd, "-c "):
 			return nil, f.checkErr
-		}
-		if strings.HasPrefix(cmd, "list chain") {
+		case strings.HasPrefix(cmd, "list chain"):
 			if f.live {
 				return []byte("chain"), nil
 			}
 			return nil, errors.New("no chain")
+		case strings.HasPrefix(cmd, "-j list set"):
+			return []byte(`{"nftables":[]}`), nil
 		}
 		f.nft = append(f.nft, cmd+"\n"+stdin)
 		return nil, nil
@@ -296,12 +389,15 @@ func newQFake(t *testing.T) *qFake {
 			return f.applyErr
 		}
 		for _, op := range ops {
-			sec := strings.TrimPrefix(op.Args[0], "firewall.")
+			key := strings.TrimPrefix(op.Args[0], "firewall.")
+			sec, opt, hasOpt := strings.Cut(key, ".")
 			switch {
 			case op.Kind == "uci_delete":
 				delete(f.sections, sec)
-			case op.Kind == "uci_set" && !strings.Contains(sec, "."):
-				f.sections[sec] = true
+			case op.Kind == "uci_set" && !hasOpt:
+				f.sections[sec] = map[string]string{}
+			case op.Kind == "uci_set":
+				f.sections[sec][opt] = op.Args[1]
 			}
 		}
 		f.live = len(f.sections) > 0
@@ -309,8 +405,8 @@ func newQFake(t *testing.T) *qFake {
 	}
 	qVerifyLive = func([]string, string) error { return f.verify }
 	requesterMACFn = func(ip string) string {
-		if ip == "192.0.2.10" {
-			return "02:00:00:00:00:10"
+		if qNormalizeIP(ip) == "192.0.2.10" {
+			return f.requester
 		}
 		return ""
 	}
@@ -318,11 +414,27 @@ func newQFake(t *testing.T) *qFake {
 	qIdentities = func() qIdent {
 		return qIdent{arp: map[string]string{"02:00:00:00:00:99": "192.0.2.99"}, leases: map[string]ubus.Lease{}, meta: map[string]ClientMeta{}}
 	}
-	qSeenFn = func() ([]string, error) { return f.seen, nil }
+	qSeenFn = func() ([]qElem, error) { return f.seen, nil }
 	qNotifyFn = func(_, _, plain string, _ bool) { f.mu.Lock(); f.notified = append(f.notified, plain); f.mu.Unlock() }
 	listClientsFn = func(string) []Client { return nil }
 	qChannelsFn = func() bool { return false }
+	qLiveDrifted = func(*qState, qRouter, time.Time) bool { return false }
 	return f
+}
+
+func (f *qFake) notifiedCount() int { f.mu.Lock(); defer f.mu.Unlock(); return len(f.notified) }
+
+func (f *qFake) notifiedText() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return strings.Join(f.notified, "\n")
+}
+
+func (f *qFake) enable(t *testing.T, mode string, zones ...string) {
+	t.Helper()
+	if _, err := QuarantineEnable(QEnableRequest{Mode: mode, Zones: zones}, "192.0.2.10"); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestQuarantineEnableAlwaysTrustsTheRequester(t *testing.T) {
@@ -334,6 +446,9 @@ func TestQuarantineEnableAlwaysTrustsTheRequester(t *testing.T) {
 	if !p.Enabled || !p.Active {
 		t.Fatalf("probe: %+v", p)
 	}
+	if !qZoneMap(p.Zones)["home"].Protected {
+		t.Fatal("protection must be read back from the firewall config")
+	}
 	st := loadQState()
 	if _, ok := st.Approved["02:00:00:00:00:10"]; !ok {
 		t.Fatal("the panel user's device was not approved")
@@ -341,11 +456,12 @@ func TestQuarantineEnableAlwaysTrustsTheRequester(t *testing.T) {
 	if st.Approved["02:00:00:00:00:20"].Name != "nas" {
 		t.Fatalf("baseline: %+v", st.Approved)
 	}
-	table, err := os.ReadFile(qTableFile())
-	if err != nil || !strings.Contains(string(table), "02:00:00:00:00:10") {
-		t.Fatalf("include file: %v\n%s", err, table)
+	for _, file := range []string{qTableFile(), qInputFile(), qForwardFile()} {
+		if _, err := os.Stat(file); err != nil {
+			t.Fatalf("missing include file %s", file)
+		}
 	}
-	if !f.sections["netgrip_q_table"] || !f.sections["netgrip_q_in_0"] || !f.sections["netgrip_q_fw_0"] {
+	if f.sections["netgrip_q_in_0"]["chain"] != "input_home" || f.sections["netgrip_q_fw_0"]["chain"] != "forward_home" {
 		t.Fatalf("sections: %v", f.sections)
 	}
 }
@@ -355,7 +471,7 @@ func TestQuarantineEnableRefusesWithoutRequester(t *testing.T) {
 	if _, err := QuarantineEnable(QEnableRequest{Mode: "internet", Zones: []string{"home"}}, "198.51.100.7"); err == nil {
 		t.Fatal("enabled without knowing the panel user's device")
 	}
-	if len(f.applied) != 0 || len(f.nft) != 0 {
+	if len(f.applied) != 0 {
 		t.Fatal("something was changed")
 	}
 	if _, err := QuarantineEnable(QEnableRequest{Mode: "internet", Zones: []string{"home"}, AllowNoRequester: true}, "198.51.100.7"); err != nil {
@@ -392,8 +508,19 @@ func TestQuarantineEnableUndoesAFailedStart(t *testing.T) {
 	if loadQState().Enabled {
 		t.Fatal("still recorded as enabled")
 	}
-	if _, err := os.Stat(qTableFile()); err == nil {
+	if _, err := os.Stat(qInputFile()); err == nil {
 		t.Fatal("include file left behind")
+	}
+}
+
+func TestQuarantineEnableRefusesOnAFailedConfigRead(t *testing.T) {
+	f := newQFake(t)
+	f.showErr = errors.New("uci busy")
+	if _, err := QuarantineEnable(QEnableRequest{Mode: "internet", Zones: []string{"home"}}, "192.0.2.10"); err == nil {
+		t.Fatal("enabled on a failed read")
+	}
+	if len(f.applied) != 0 {
+		t.Fatal("firewall touched")
 	}
 }
 
@@ -402,6 +529,7 @@ func TestQuarantineEnableRejectsBadInput(t *testing.T) {
 	for _, req := range []QEnableRequest{
 		{Mode: "open", Zones: []string{"home"}},
 		{Mode: "internet", Zones: []string{"up"}},
+		{Mode: "internet", Zones: []string{"transit"}},
 		{Mode: "internet", Zones: []string{"home"}, Approve: []QApproveItem{{MAC: "zz"}}},
 	} {
 		if _, err := QuarantineEnable(req, "192.0.2.10"); err == nil {
@@ -410,15 +538,58 @@ func TestQuarantineEnableRejectsBadInput(t *testing.T) {
 	}
 }
 
-func TestQuarantineRevokeRefusesYourOwnDevice(t *testing.T) {
+func TestQuarantineSetZonesKeepsTheRequesterAndRollsBack(t *testing.T) {
+	f := newQFake(t)
+	f.enable(t, "internet", "home")
+	// The admin is now on a device the quarantine does not know yet.
+	f.requester = "02:00:00:00:00:44"
+	if _, err := QuarantineSetZones([]string{"home", "guests"}, "192.0.2.10", false); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := loadQState().Approved["02:00:00:00:00:44"]; !ok {
+		t.Fatal("changing zones did not keep the panel user's device")
+	}
+	if got := strings.Join(qActualZones(mustShow(t)), ","); got != "guests,home" {
+		t.Fatalf("zones: %s", got)
+	}
+	// A failed verification puts the previous zones back.
+	f.verify = errors.New("no jump")
+	if _, err := QuarantineSetZones([]string{"home"}, "192.0.2.10", false); err == nil {
+		t.Fatal("no error")
+	}
+	if got := strings.Join(qActualZones(mustShow(t)), ","); got != "guests,home" {
+		t.Fatalf("previous zones not restored: %s", got)
+	}
+	if got := strings.Join(loadQState().Zones, ","); got != "guests,home" {
+		t.Fatalf("intent changed by a failed change: %s", got)
+	}
+	f.verify = nil
+	if _, err := QuarantineSetZones([]string{"home"}, "198.51.100.7", false); err == nil {
+		t.Fatal("changed zones without knowing the panel user's device")
+	}
+}
+
+func mustShow(t *testing.T) string {
+	t.Helper()
+	s, err := uciShowFn("firewall")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+func TestQuarantineRevokeGuards(t *testing.T) {
 	newQFake(t)
 	if _, err := QuarantineEnable(QEnableRequest{Mode: "internet", Zones: []string{"home"}, Approve: []QApproveItem{{MAC: "02:00:00:00:00:20"}}}, "192.0.2.10"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := QuarantineRevoke("02:00:00:00:00:10", "192.0.2.10"); err == nil {
+	if _, err := QuarantineRevoke("02:00:00:00:00:10", "192.0.2.10", true); err == nil {
 		t.Fatal("revoked the panel user's own device")
 	}
-	if _, err := QuarantineRevoke("02:00:00:00:00:20", "192.0.2.10"); err != nil {
+	if _, err := QuarantineRevoke("02:00:00:00:00:20", "198.51.100.7", false); err == nil {
+		t.Fatal("revoked while the panel user's device is unknown")
+	}
+	if _, err := QuarantineRevoke("02:00:00:00:00:20", "192.0.2.10", false); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := loadQState().Approved["02:00:00:00:00:20"]; ok {
@@ -428,14 +599,15 @@ func TestQuarantineRevokeRefusesYourOwnDevice(t *testing.T) {
 
 func TestQuarantineDisableRemovesEverythingButKeepsApprovals(t *testing.T) {
 	f := newQFake(t)
-	if _, err := QuarantineEnable(QEnableRequest{Mode: "internet", Zones: []string{"home", "guests"}}, "192.0.2.10"); err != nil {
-		t.Fatal(err)
-	}
+	f.enable(t, "internet", "home", "guests")
 	if _, err := QuarantineDisable(); err != nil {
 		t.Fatal(err)
 	}
 	if len(f.sections) != 0 {
 		t.Fatalf("sections left: %v", f.sections)
+	}
+	if _, err := os.Stat(qTableFile()); err == nil {
+		t.Fatal("include file left")
 	}
 	st := loadQState()
 	if st.Enabled || len(st.Approved) == 0 {
@@ -443,13 +615,23 @@ func TestQuarantineDisableRemovesEverythingButKeepsApprovals(t *testing.T) {
 	}
 }
 
-func TestQPollRecordsAndNotifiesOnce(t *testing.T) {
+func TestQuarantineDisableKeepsFilesWhenTheFirewallChangeFails(t *testing.T) {
 	f := newQFake(t)
-	if _, err := QuarantineEnable(QEnableRequest{Mode: "internet", Zones: []string{"home"}}, "192.0.2.10"); err != nil {
-		t.Fatal(err)
+	f.enable(t, "internet", "home")
+	f.applyErr = errors.New("reload failed")
+	if _, err := QuarantineDisable(); err == nil {
+		t.Fatal("no error")
 	}
+	if _, err := os.Stat(qInputFile()); err != nil {
+		t.Fatal("files removed while the sections still point at them")
+	}
+}
+
+func TestQPollRecordsAndNotifiesOnceEvenAfterForget(t *testing.T) {
+	f := newQFake(t)
+	f.enable(t, "internet", "home")
 	qChannelsFn = func() bool { return true }
-	f.seen = []string{"02:00:00:00:00:99", "02:00:00:00:00:10"}
+	f.seen = []qElem{{Val: "02:00:00:00:00:99", Expires: 3000}, {Val: "02:00:00:00:00:10"}}
 	now := time.Now()
 	qPoll(now)
 	qPoll(now.Add(5 * time.Second))
@@ -458,73 +640,202 @@ func TestQPollRecordsAndNotifiesOnce(t *testing.T) {
 		t.Fatal("an approved device was listed as pending")
 	}
 	p := st.Pending["02:00:00:00:00:99"]
-	if p.IP != "192.0.2.99" || p.LastSeen <= p.FirstSeen-1 {
-		t.Fatalf("pending: %+v", p)
+	if p.IP != "192.0.2.99" || p.LastSeen != now.Unix()-600 {
+		t.Fatalf("pending: %+v (last seen must come from the set's expiry)", p)
 	}
 	qWaitFor(t, func() bool { return f.notifiedCount() >= 1 })
-	time.Sleep(20 * time.Millisecond)
+	if _, err := QuarantineForget("02:00:00:00:00:99"); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.Join(f.nft, "\n"), "delete element inet fw4 netgrip_q_seen { 02:00:00:00:00:99 }") {
+		t.Fatal("forget did not clear the live record")
+	}
+	qPoll(now.Add(10 * time.Second))
+	time.Sleep(30 * time.Millisecond)
 	if f.notifiedCount() != 1 {
 		t.Fatalf("notified %d times", f.notifiedCount())
 	}
 }
 
-func TestQPollLearningPauseApprovesAndEnds(t *testing.T) {
+func TestQPollBurstIsSummarised(t *testing.T) {
 	f := newQFake(t)
-	if _, err := QuarantineEnable(QEnableRequest{Mode: "nothing", Zones: []string{"home"}}, "192.0.2.10"); err != nil {
-		t.Fatal(err)
+	f.enable(t, "internet", "home")
+	qChannelsFn = func() bool { return true }
+	for i := 0; i < 20; i++ {
+		f.seen = append(f.seen, qElem{Val: "02:00:00:00:01:" + string("0123456789abcdef"[i/16]) + string("0123456789abcdef"[i%16])})
 	}
+	qPoll(time.Now())
+	qWaitFor(t, func() bool { return f.notifiedCount() == qNotifyPerPoll+1 })
+	time.Sleep(30 * time.Millisecond)
+	if f.notifiedCount() != qNotifyPerPoll+1 || !strings.Contains(f.notifiedText(), "17 more") {
+		t.Fatalf("notifications: %d\n%s", f.notifiedCount(), f.notifiedText())
+	}
+}
+
+func TestQPollSparesTheFlash(t *testing.T) {
+	f := newQFake(t)
+	f.enable(t, "internet", "home")
+	f.seen = []qElem{{Val: "02:00:00:00:00:99", Expires: 3500}}
+	now := time.Now()
+	qPoll(now) // new device: saved
+	before, _ := os.Stat(qStatePath)
+	time.Sleep(20 * time.Millisecond)
+	f.seen = []qElem{{Val: "02:00:00:00:00:99", Expires: 3590}} // only "last seen" moves
+	qPoll(now.Add(5 * time.Second))
+	after, _ := os.Stat(qStatePath)
+	if !after.ModTime().Equal(before.ModTime()) {
+		t.Fatal("a last-seen refresh was written straight away")
+	}
+	qPoll(now.Add(qLightSaveEvery + time.Minute))
+	later, _ := os.Stat(qStatePath)
+	if later.ModTime().Equal(before.ModTime()) {
+		t.Fatal("last-seen refreshes are never written")
+	}
+}
+
+func TestQLearningPauseApprovesOnlyNewDevices(t *testing.T) {
+	f := newQFake(t)
+	f.enable(t, "nothing", "home")
+	f.seen = []qElem{{Val: "02:00:00:00:00:66"}}
+	qPoll(time.Now()) // already waiting before the pause
 	if _, err := QuarantinePause(30, "learn"); err != nil {
 		t.Fatal(err)
 	}
-	f.seen = []string{"02:00:00:00:00:31"}
-	f.nft = nil
+	f.seen = []qElem{{Val: "02:00:00:00:00:66"}, {Val: "02:00:00:00:00:31"}}
 	qPoll(time.Now())
 	st := loadQState()
 	if st.Approved["02:00:00:00:00:31"].Via != "pause" {
-		t.Fatalf("not learned: %+v", st.Approved)
+		t.Fatalf("new device not learned: %+v", st.Approved)
 	}
-	if !strings.Contains(strings.Join(f.nft, "\n"), "02:00:00:00:00:31") {
-		t.Fatal("the live set was not updated")
+	if _, ok := st.Approved["02:00:00:00:00:66"]; ok {
+		t.Fatal("a device already waiting was approved by the pause")
 	}
 	qChannelsFn = func() bool { return true }
 	qPoll(time.Now().Add(31 * time.Minute))
 	if loadQState().Pause.Until != 0 {
 		t.Fatal("the pause did not end")
 	}
-	qWaitFor(t, func() bool { return f.notifiedCount() == 1 && strings.Contains(f.firstNotified(), "02:00:00:00:00:31") })
+	qWaitFor(t, func() bool { return strings.Contains(f.notifiedText(), "02:00:00:00:00:31") })
 }
 
-func TestQPauseOffSuspendsEnforcement(t *testing.T) {
+func TestQLearningPauseIsCapped(t *testing.T) {
 	f := newQFake(t)
-	if _, err := QuarantineEnable(QEnableRequest{Mode: "nothing", Zones: []string{"home"}}, "192.0.2.10"); err != nil {
+	f.enable(t, "nothing", "home")
+	if _, err := QuarantinePause(30, "learn"); err != nil {
 		t.Fatal(err)
 	}
+	for i := 0; i < qMaxLearned+10; i++ {
+		f.seen = append(f.seen, qElem{Val: "02:00:00:00:02:" + string("0123456789abcdef"[i/16]) + string("0123456789abcdef"[i%16])})
+	}
+	qPoll(time.Now())
+	if got := len(loadQState().Pause.Learned); got != qMaxLearned {
+		t.Fatalf("learned %d", got)
+	}
+}
+
+func TestQPauseOffLivesInTheKernel(t *testing.T) {
+	f := newQFake(t)
+	f.enable(t, "nothing", "home")
 	f.nft = nil
 	if _, err := QuarantinePause(10, "off"); err != nil {
 		t.Fatal(err)
 	}
 	live := strings.Join(f.nft, "\n")
-	if !strings.Contains(live, "flush chain") || strings.Contains(live, "reject") {
-		t.Fatalf("pause off still enforces:\n%s", live)
+	if !strings.Contains(live, "add element inet fw4 netgrip_q_off { ipv4 timeout") {
+		t.Fatalf("pause off not set in the kernel:\n%s", live)
 	}
 	table, _ := os.ReadFile(qTableFile())
-	if strings.Contains(string(table), "reject") {
-		t.Fatal("a reload during the pause would enforce again")
+	if strings.Contains(string(table), "ipv4 timeout") {
+		t.Fatal("a reload must start without the pause")
 	}
 	if _, err := QuarantinePause(10, "bogus"); err == nil {
 		t.Fatal("bad pause kind accepted")
 	}
 }
 
-func TestQPollNoticesARevert(t *testing.T) {
+func TestQResumeKeepsThePanelUser(t *testing.T) {
 	f := newQFake(t)
-	if _, err := QuarantineEnable(QEnableRequest{Mode: "internet", Zones: []string{"home"}}, "192.0.2.10"); err != nil {
+	f.enable(t, "nothing", "home")
+	if _, err := QuarantinePause(10, "off"); err != nil {
 		t.Fatal(err)
 	}
-	f.sections = map[string]bool{} // the confirm window restored the old firewall
+	f.requester = "02:00:00:00:00:55" // joined during the pause
+	if _, err := QuarantineResume("192.0.2.10"); err != nil {
+		t.Fatal(err)
+	}
+	if loadQState().Approved["02:00:00:00:00:55"].Via != "panel" {
+		t.Fatal("resuming did not keep the panel user's device")
+	}
+}
+
+func TestQPollNoticesARevertOnlyWhenSure(t *testing.T) {
+	f := newQFake(t)
+	f.enable(t, "internet", "home")
+	f.showErr = errors.New("uci busy")
+	qPoll(time.Now())
+	qPoll(time.Now())
+	if !loadQState().Enabled {
+		t.Fatal("a failed read turned the feature off")
+	}
+	f.showErr = nil
+	f.sections = map[string]map[string]string{} // the confirm window restored the old firewall
+	qPoll(time.Now())                           // chains still loaded: not yet
+	if !loadQState().Enabled {
+		t.Fatal("turned off while the chains are still live")
+	}
+	f.live = false
+	qPoll(time.Now())
+	if !loadQState().Enabled {
+		t.Fatal("turned off after a single miss")
+	}
 	qPoll(time.Now())
 	if loadQState().Enabled {
-		t.Fatal("still recorded as enabled after the sections vanished")
+		t.Fatal("still recorded as enabled after the feature left the firewall")
+	}
+}
+
+func TestQPollFollowsTheActualZones(t *testing.T) {
+	f := newQFake(t)
+	f.enable(t, "internet", "home", "guests")
+	// A revert restored an older firewall that only protected "home".
+	f.sections = map[string]map[string]string{}
+	_ = applyQIncludes(qIncludeOps(nil, []string{"home"}))
+	qPoll(time.Now())
+	if got := strings.Join(loadQState().Zones, ","); got != "home" {
+		t.Fatalf("zones: %s", got)
+	}
+}
+
+func TestQPollReconcilesDrift(t *testing.T) {
+	f := newQFake(t)
+	f.enable(t, "internet", "home")
+	drift := true
+	qLiveDrifted = func(*qState, qRouter, time.Time) bool { return drift }
+	f.nft = nil
+	qPoll(time.Now())
+	if !strings.Contains(strings.Join(f.nft, "\n"), "flush chain inet fw4 netgrip_q_input") {
+		t.Fatal("drift was not repaired")
+	}
+	drift = false
+	f.nft = nil
+	qPoll(time.Now())
+	if len(f.nft) != 0 {
+		t.Fatalf("resynced without drift: %v", f.nft)
+	}
+}
+
+func TestQuarantineKeepCheck(t *testing.T) {
+	f := newQFake(t)
+	if err := QuarantineKeepCheck("192.0.2.10"); err != nil {
+		t.Fatal("off: must not interfere")
+	}
+	f.enable(t, "internet", "home")
+	// The live approved set (faked as empty) lacks the panel user's device.
+	if err := QuarantineKeepCheck("192.0.2.10"); err == nil {
+		t.Fatal("kept a change that leaves the panel user unapproved")
+	}
+	if err := QuarantineKeepCheck("198.51.100.7"); err != nil {
+		t.Fatal("an unknown device cannot be judged and must not block")
 	}
 }
 
@@ -533,9 +844,9 @@ func TestQPrunePending(t *testing.T) {
 	st := &qState{Pending: map[string]QPending{
 		"02:00:00:00:00:01": {LastSeen: now.Add(-8 * 24 * time.Hour).Unix()},
 		"02:00:00:00:00:02": {LastSeen: now.Unix()},
-	}}
-	if !qPrunePending(st, now) || len(st.Pending) != 1 {
-		t.Fatalf("pending: %+v", st.Pending)
+	}, Notified: map[string]int64{"02:00:00:00:00:03": now.Add(-8 * 24 * time.Hour).Unix()}}
+	if !qPrunePending(st, now) || len(st.Pending) != 1 || len(st.Notified) != 0 {
+		t.Fatalf("pending: %+v notified: %+v", st.Pending, st.Notified)
 	}
 }
 
@@ -548,15 +859,4 @@ func qWaitFor(t *testing.T, cond func() bool) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-}
-
-func (f *qFake) notifiedCount() int { f.mu.Lock(); defer f.mu.Unlock(); return len(f.notified) }
-
-func (f *qFake) firstNotified() string {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if len(f.notified) == 0 {
-		return ""
-	}
-	return f.notified[0]
 }
