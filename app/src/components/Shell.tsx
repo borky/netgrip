@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { LucideIcon } from "lucide-react";
-import { Activity, ArrowLeftRight, Blocks, ChartColumn, ChartPie, Download, EyeOff, Forward, Globe, HardDrive, Info, LayoutDashboard, LogOut, Menu, Network, Radar, Server, Settings, ShieldAlert, ShieldBan, Smartphone, Wifi, Wrench } from "lucide-react";
+import { Activity, ArrowLeftRight, Blocks, ChartColumn, ChartPie, Download, EyeOff, Forward, Globe, HardDrive, Info, LayoutDashboard, Lock, LogOut, Menu, Network, Radar, Server, Settings, ShieldAlert, ShieldBan, Smartphone, Wifi, Wrench } from "lucide-react";
 import { api, disableDemo, isDemo } from "../api";
 import type { Board, DDNSProbe, DriftProbe, EthPort, FwdProbe, GuestProbe, IoTProbe, IPv6Probe, MultiWanProbe, OVPNProbe, PhysPortsProbe, SelfUpdateCheck, SQMProbe, StorageProbe, SystemInfo, TSProbe, UsteerAP, UpdateCheck, WanStatus, WGProbe, WirelessRadio } from "../types";
 import { useHealthScore } from "../hooks/useHealthScore";
@@ -13,6 +13,7 @@ import { Overview } from "../pages/Overview";
 import { TrafficPage } from "../pages/Traffic";
 import { CoveragePage } from "../pages/Coverage";
 import { ClientsPage } from "../pages/Clients";
+import { QuarantinePage } from "../pages/Quarantine";
 import { L2ClientsPage } from "../pages/L2Clients";
 import { WifiPage } from "../pages/Wifi";
 import { InternetPage } from "../pages/Internet";
@@ -27,13 +28,14 @@ import { StoragePage } from "../pages/Storage";
 import { AboutPage } from "../pages/About";
 import { SelfUpdateDialog } from "../components/system/SelfUpdateDialog";
 
-export type Page = "overview" | "internet" | "wan" | "clients" | "coverage" | "wifi" | "lan" | "services" | "traffic" | "trafficrules" | "banip" | "upnp" | "ports" | "forwards" | "tools" | "diagnostics" | "fleet" | "storage" | "system" | "dpi" | "about";
+export type Page = "overview" | "internet" | "wan" | "clients" | "quarantine" | "coverage" | "wifi" | "lan" | "services" | "traffic" | "trafficrules" | "banip" | "upnp" | "ports" | "forwards" | "tools" | "diagnostics" | "fleet" | "storage" | "system" | "dpi" | "about";
 
 const NAV_ICONS: Record<Page, LucideIcon> = {
   overview: LayoutDashboard,
   internet: Globe,
   wan: Globe,
   clients: Smartphone,
+  quarantine: Lock,
   coverage: Radar,
   wifi: Wifi,
   lan: Network,
@@ -67,7 +69,7 @@ const ROLE_BADGE: Record<"router" | "ap" | "switch", { labelKey: string; cls: st
  *  "internet" (solo gateway). */
 const NAV_GROUPS: { group: string | null; items: Page[] }[] = [
   { group: null, items: ["overview"] },
-  { group: "nav.group.yourNetwork", items: ["clients", "coverage", "traffic"] },
+  { group: "nav.group.yourNetwork", items: ["clients", "quarantine", "coverage", "traffic"] },
   { group: "nav.group.connection", items: ["internet", "wifi", "lan", "ports", "trafficrules"] },
   { group: "nav.group.services", items: ["services"] },
   { group: "nav.group.system", items: ["diagnostics", "storage", "fleet", "system", "about"] },
@@ -223,7 +225,7 @@ function ShellInner({ onLogout }: { onLogout: () => void }) {
     if (!modeReady) return id === "overview" ? null : "loading";
     // La línea de salida y todo lo que cuelga de ella (reenvío de puertos,
     // DPI, banIP) solo aplica a la puerta de enlace.
-    if ((id === "internet" || id === "wan" || id === "forwards" || id === "dpi" || id === "banip" || id === "upnp" || id === "trafficrules") && !isRouter) return "gatewayOnly";
+    if ((id === "internet" || id === "wan" || id === "forwards" || id === "dpi" || id === "banip" || id === "upnp" || id === "trafficrules" || id === "quarantine") && !isRouter) return "gatewayOnly";
     // Red local (DHCP/DNS/reservas): sin dnsmasq la página quedaría vacía
     // (p. ej. un switch gestionado), así que la entrada no se ofrece.
     if (id === "lan" && !mode?.dnsmasq_on) return "noDnsmasq";
@@ -444,6 +446,7 @@ function ShellInner({ onLogout }: { onLogout: () => void }) {
       {activePage === "internet" && (
         <InternetPage mwan={mwan} onMwanChange={setMwan} fwd={fwd} onFwdChange={setFwd} />
       )}
+      {activePage === "quarantine" && <QuarantinePage />}
       {activePage === "coverage" && <CoveragePage aps={usteerAps} error={usteerError} />}
       {activePage === "trafficrules" && <TrafficRulesPage />}
       {activePage === "wifi" && (

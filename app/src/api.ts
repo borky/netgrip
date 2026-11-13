@@ -103,6 +103,15 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+/** POST helper for the quarantine endpoints (they all answer QResult). */
+function postQ(path: string, body: unknown) {
+  return request<import("./types").QResult>(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
 const realApi = {
   login: (password: string) =>
     request<void>("/api/login", {
@@ -975,6 +984,20 @@ const realApi = {
     request<import("./types").ParentalProbe>(`/api/parental?mac=${encodeURIComponent(mac)}`, {
       method: "DELETE",
     }),
+  quarantine: () =>
+    request<{ state: import("./types").QuarantineProbe; you: string }>("/api/quarantine"),
+  quarantineCandidates: () =>
+    request<{ candidates: import("./types").QCandidate[] }>("/api/quarantine/candidates"),
+  quarantineEnable: (body: { mode: string; zones: string[]; approve: { mac: string; name?: string }[]; allow_no_requester?: boolean }) =>
+    postQ("/api/quarantine/enable", body),
+  quarantineDisable: () => postQ("/api/quarantine/disable", {}),
+  quarantineZones: (zones: string[]) => postQ("/api/quarantine/zones", { zones }),
+  quarantineMode: (mode: string) => postQ("/api/quarantine/mode", { mode }),
+  quarantineApprove: (devices: { mac: string; name?: string }[]) => postQ("/api/quarantine/approve", { devices }),
+  quarantineRevoke: (mac: string) => postQ("/api/quarantine/revoke", { mac }),
+  quarantineForget: (mac: string) => postQ("/api/quarantine/forget", { mac }),
+  quarantinePause: (minutes: number, kind: "learn" | "off") => postQ("/api/quarantine/pause", { minutes, kind }),
+  quarantineResume: () => postQ("/api/quarantine/resume", {}),
   quotas: () =>
     request<import("./types").QuotaProbe>("/api/quotas"),
   setQuota: (quota: import("./types").Quota) =>

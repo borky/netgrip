@@ -1765,3 +1765,62 @@ export interface SNMPProbe {
   community_ro?: string;
   community_rw?: string;
 }
+
+/** Device quarantine: a firewall zone as the feature sees it. */
+export interface QZone {
+  name: string;
+  networks: string[];
+  /** An upstream (masquerading) zone: never protectable. */
+  wan: boolean;
+  /** A client zone with DHCP: offered pre-selected. */
+  suggested: boolean;
+  protected: boolean;
+}
+
+export interface QDevice {
+  mac: string;
+  name?: string;
+  ip?: string;
+  hostname?: string;
+  vendor?: string;
+  /** Locally administered (private / random) MAC. */
+  random?: boolean;
+  first_seen?: number;
+  last_seen?: number;
+  at?: number;
+  via?: "baseline" | "manual" | "pause";
+}
+
+export interface QPause {
+  until?: number;
+  kind?: "learn" | "off";
+  learned?: string[];
+}
+
+export interface QuarantineProbe {
+  applicable: boolean;
+  reason?: string;
+  /** The intent. */
+  enabled: boolean;
+  /** What the firewall actually runs. */
+  active: boolean;
+  mode: "internet" | "nothing";
+  zones: QZone[];
+  wan: string[];
+  approved: QDevice[];
+  pending: QDevice[];
+  pause: QPause;
+  issues: string[];
+}
+
+export interface QCandidate extends QDevice {
+  sources: string[];
+  requester?: boolean;
+}
+
+export interface QResult {
+  state?: QuarantineProbe;
+  status?: string;
+  error?: string;
+  confirm?: { id: string; expires: number };
+}
