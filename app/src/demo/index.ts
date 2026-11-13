@@ -1,4 +1,5 @@
 import type * as T from "../types";
+import type { QResult, QuarantineProbe } from "../types";
 import type { api } from "../api";
 import * as D from "./data";
 
@@ -161,6 +162,21 @@ function nextClients() {
   }
   return { ts, clients: state.clients, bands: DEMO_BANDS };
 }
+
+// Device quarantine in the demo: a small in-memory model, dummy data only.
+const demoQ: { state: QuarantineProbe; you: string } = {
+  you: "02:00:00:00:00:10",
+  state: {
+    applicable: true, enabled: false, active: false, mode: "internet",
+    zones: [
+      { name: "lan", networks: ["lan"], wan: false, suggested: true, protected: false },
+      { name: "guest", networks: ["guest"], wan: false, suggested: true, protected: false },
+      { name: "wan", networks: ["wan", "wan6"], wan: true, suggested: false, protected: false },
+    ],
+    wan: ["eth1"], approved: [], pending: [], pause: {}, issues: [],
+  },
+};
+const qResult = async (): Promise<QResult> => { await wait(200, 500); return { status: "applied", state: structuredClone(demoQ.state) }; };
 
 export const demoApi: typeof api = {
   // sesión
@@ -935,6 +951,35 @@ export const demoApi: typeof api = {
     delete state.parental.rules[mac];
     return { rules: state.parental.rules, ts: Date.now() };
   },
+  quarantine: () => get(structuredClone(demoQ)),
+  quarantineCandidates: () => get({ candidates: [
+    { mac: "02:00:00:00:00:10", name: "This laptop", ip: "192.0.2.10", sources: ["wifi", "lease"], requester: true },
+    { mac: "02:00:00:00:00:11", name: "Living room TV", ip: "192.0.2.11", sources: ["cable", "lease"] },
+    { mac: "02:00:00:00:00:12", hostname: "phone", ip: "192.0.2.12", random: true, sources: ["wifi"] },
+  ] }),
+  quarantineEnable: async (b) => {
+    const s = demoQ.state;
+    s.enabled = true; s.active = true; s.mode = b.mode as QuarantineProbe["mode"];
+    s.zones = s.zones.map((z) => ({ ...z, protected: b.zones.includes(z.name) }));
+    s.approved = [...b.approve.map((a) => ({ mac: a.mac, name: a.name, at: Date.now() / 1000, via: "baseline" as const })), { mac: demoQ.you, at: Date.now() / 1000, via: "baseline" as const }]
+      .filter((d, i, all) => all.findIndex((x) => x.mac === d.mac) === i);
+    s.pending = [{ mac: "02:00:00:00:00:99", vendor: "Example Corp", ip: "192.0.2.99", first_seen: Date.now() / 1000 - 300, last_seen: Date.now() / 1000 }];
+    return { ...(await qResult()), confirm: { id: "demo", expires: Math.floor(Date.now() / 1000) + 120 } };
+  },
+  quarantineDisable: async () => { demoQ.state.enabled = false; demoQ.state.active = false; return qResult(); },
+  quarantineZones: async (zones) => { demoQ.state.zones = demoQ.state.zones.map((z) => ({ ...z, protected: zones.includes(z.name) })); return { ...(await qResult()), confirm: { id: "demo", expires: Math.floor(Date.now() / 1000) + 120 } }; },
+  quarantineMode: async (mode) => { demoQ.state.mode = mode as QuarantineProbe["mode"]; return qResult(); },
+  quarantineApprove: async (devices) => {
+    for (const d of devices) {
+      demoQ.state.pending = demoQ.state.pending.filter((p) => p.mac !== d.mac);
+      demoQ.state.approved.push({ mac: d.mac, name: d.name, at: Date.now() / 1000, via: "manual" });
+    }
+    return qResult();
+  },
+  quarantineRevoke: async (mac) => { demoQ.state.approved = demoQ.state.approved.filter((a) => a.mac !== mac); return qResult(); },
+  quarantineForget: async (mac) => { demoQ.state.pending = demoQ.state.pending.filter((p) => p.mac !== mac); return qResult(); },
+  quarantinePause: async (minutes, kind) => { demoQ.state.pause = { until: Math.floor(Date.now() / 1000) + minutes * 60, kind }; return qResult(); },
+  quarantineResume: async () => { demoQ.state.pause = {}; return qResult(); },
   quotas: () => get({ ...state.quota }),
   setQuota: async (q) => {
     await wait(800, 1500);

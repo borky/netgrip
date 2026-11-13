@@ -87,6 +87,7 @@ func main() {
 	modules.StartMQTT(version)
 	modules.StartSelfUpdateScheduler(version)
 	modules.StartParentalScheduler()
+	modules.StartQuarantine()
 	modules.StartQuotaScheduler()
 	modules.StartFleetDiscovery(version, *port)
 	modules.StartPoEWatchdog()

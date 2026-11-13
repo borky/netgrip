@@ -359,6 +359,7 @@ func New(rpcdURL, version string, secure bool, servingCert string) *Server {
 	s.mux.HandleFunc("GET /api/quotas", s.requireAuth(s.handleQuotaGet))
 	s.mux.HandleFunc("POST /api/quotas", s.requireAuth(s.handleQuotaSet))
 	s.mux.HandleFunc("DELETE /api/quotas", s.requireAuth(s.handleQuotaDelete))
+	s.registerQuarantineRoutes()
 	s.mux.HandleFunc("GET /api/push-config", s.requireAuth(s.handlePushConfigGet))
 	s.mux.HandleFunc("POST /api/push-config", s.requireAuth(s.handlePushConfigSet))
 	s.mux.HandleFunc("POST /api/push-config/push", s.requireAuth(s.handlePushSnapshot))

@@ -1,0 +1,326 @@
+package modules
+
+// Device quarantine: the firewall side.
+//
+// The quarantine plugs into firewall4 through UCI `include` sections, never
+// through a table of its own:
+//
+//   - one `table-prepend` include holds the sets and the two chains
+//     (netgrip_q_input, netgrip_q_forward), with the approved MACs written
+//     into the set, so a firewall reload or a reboot recreates everything
+//     already filled: there is no empty-set window in which approved devices
+//     would be cut off;
+//   - per protected zone, a `chain-prepend` include puts one jump at the top
+//     of fw4's own input_<zone> and forward_<zone> chains. fw4 builds those
+//     chains from the zone's own networks and devices, so no interface,
+//     bridge or VLAN name is ever written here.
+//
+// Because the hook-up is plain UCI in /etc/config/firewall, turning the
+// feature on is reverted by the panel's confirm window like any other risky
+// firewall change, and removing the include sections removes everything.
+//
+// Runtime changes (an approval, a mode change, a pause) are applied to the
+// live chains and sets with `nft -f` transactions and written to the include
+// file first, so the next reload loads the same state.
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
+)
+
+const (
+	qTable        = "fw4" // firewall4's table: the include lives inside it
+	qSetOK        = "netgrip_q_ok"
+	qSetSeen      = "netgrip_q_seen"
+	qSetWan       = "netgrip_q_wan"
+	qSetPriv4     = "netgrip_q_private4"
+	qSetPriv6     = "netgrip_q_private6"
+	qChainInput   = "netgrip_q_input"
+	qChainForward = "netgrip_q_forward"
+
+	// UCI section names of the includes. All start with qSectionPrefix so
+	// the feature can find and remove every one of its sections.
+	qSectionPrefix = "netgrip_q"
+	qSectionTable  = "netgrip_q_table"
+)
+
+// quarantineDir holds the include files; a var so tests can redirect it.
+var quarantineDir = "/etc/netgrip/quarantine"
+
+func qTableFile() string   { return filepath.Join(quarantineDir, "table.nft") }
+func qInputFile() string   { return filepath.Join(quarantineDir, "input.nft") }
+func qForwardFile() string { return filepath.Join(quarantineDir, "forward.nft") }
+
+// Address ranges that are never "the internet": private, shared (CGNAT),
+// link-local, loopback, multicast and reserved space. In "internet" mode a
+// quarantined device may not reach them even through a WAN interface, which
+// covers an upstream modem's web UI and double-NAT neighbours.
+var (
+	qPrivate4 = []string{
+		"0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
+		"172.16.0.0/12", "192.0.0.0/24", "192.168.0.0/16", "198.18.0.0/15", "224.0.0.0/3",
+	}
+	qPrivate6 = []string{"::/127", "fc00::/7", "fe80::/10", "ff00::/8"}
+)
+
+// qRuleSet is everything the generated chains depend on.
+type qRuleSet struct {
+	Mode     string   // "internet" | "nothing"
+	Paused   bool     // pause "off": record, but enforce nothing
+	Approved []string // lowercase MACs
+	Wan      []string // WAN-side interface names (runtime-derived)
+}
+
+// reIfname: what nft accepts as an interface name in a set element, quoted.
+var reIfname = regexp.MustCompile(`^[A-Za-z0-9_.:@-]{1,15}$`)
+
+// sortedMACs returns the valid, unique, lowercase MACs in a stable order.
+func sortedMACs(in []string) []string {
+	seen := map[string]bool{}
+	out := []string{}
+	for _, m := range in {
+		m = strings.ToLower(strings.TrimSpace(m))
+		if !reMac.MatchString(m) || seen[m] {
+			continue
+		}
+		seen[m] = true
+		out = append(out, m)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func sortedIfnames(in []string) []string {
+	seen := map[string]bool{}
+	out := []string{}
+	for _, n := range in {
+		if !reIfname.MatchString(n) || seen[n] {
+			continue
+		}
+		seen[n] = true
+		out = append(out, n)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func quoted(in []string) []string {
+	out := make([]string, len(in))
+	for i, s := range in {
+		out[i] = `"` + s + `"`
+	}
+	return out
+}
+
+// elementsLine is ` elements = { a, b }` or "" for an empty set (nft refuses
+// an empty element list).
+func elementsLine(elems []string) string {
+	if len(elems) == 0 {
+		return ""
+	}
+	return " elements = { " + strings.Join(elems, ", ") + " };"
+}
+
+// qInputRules are the rules of netgrip_q_input, one per line. A device that
+// is not approved may still get an address and names from the router (DHCP,
+// DHCPv6, DNS, NTP, IPv6 neighbour discovery); everything else addressed to
+// the router - the panel, SSH, LuCI - is refused.
+func qInputRules(rs qRuleSet) []string {
+	r := []string{
+		"ether saddr @" + qSetOK + " return",
+		"update @" + qSetSeen + " { ether saddr }",
+	}
+	if rs.Paused {
+		return append(r, "return")
+	}
+	return append(r,
+		"udp dport { 53, 67, 123, 547 } return",
+		"tcp dport 53 return",
+		"icmpv6 type { nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert } return",
+		`counter reject comment "netgrip quarantine"`,
+	)
+}
+
+// qForwardRules are the rules of netgrip_q_forward. "internet": out through
+// a WAN interface, to a public address, only. "nothing": no forwarding.
+// With no WAN interface known the oifname test matches everything, so
+// "internet" fails closed rather than open.
+func qForwardRules(rs qRuleSet) []string {
+	r := []string{
+		"ether saddr @" + qSetOK + " return",
+		"update @" + qSetSeen + " { ether saddr }",
+	}
+	if rs.Paused {
+		return append(r, "return")
+	}
+	if rs.Mode == "internet" {
+		return append(r,
+			`oifname != @`+qSetWan+` counter reject comment "netgrip quarantine"`,
+			`ip daddr @`+qSetPriv4+` counter reject comment "netgrip quarantine"`,
+			`ip6 daddr @`+qSetPriv6+` counter reject comment "netgrip quarantine"`,
+			"return",
+		)
+	}
+	return append(r, `counter reject comment "netgrip quarantine"`)
+}
+
+// renderQTable renders the table-prepend include: sets and chains, as fw4
+// splices it into `table inet fw4 { ... }`.
+func renderQTable(rs qRuleSet) string {
+	var b strings.Builder
+	b.WriteString("# Generated by NetGrip (device quarantine). Do not edit: rewritten on every change.\n")
+	fmt.Fprintf(&b, "set %s { type ether_addr;%s }\n", qSetOK, elementsLine(sortedMACs(rs.Approved)))
+	fmt.Fprintf(&b, "set %s { type ether_addr; size 4096; flags dynamic, timeout; timeout 1h; }\n", qSetSeen)
+	fmt.Fprintf(&b, "set %s { type ifname;%s }\n", qSetWan, elementsLine(quoted(sortedIfnames(rs.Wan))))
+	fmt.Fprintf(&b, "set %s { type ipv4_addr; flags interval;%s }\n", qSetPriv4, elementsLine(qPrivate4))
+	fmt.Fprintf(&b, "set %s { type ipv6_addr; flags interval;%s }\n", qSetPriv6, elementsLine(qPrivate6))
+	writeChain(&b, qChainInput, qInputRules(rs), "")
+	writeChain(&b, qChainForward, qForwardRules(rs), "")
+	return b.String()
+}
+
+func writeChain(b *strings.Builder, name string, rules []string, indent string) {
+	fmt.Fprintf(b, "%schain %s {\n", indent, name)
+	for _, r := range rules {
+		fmt.Fprintf(b, "%s\t%s\n", indent, r)
+	}
+	fmt.Fprintf(b, "%s}\n", indent)
+}
+
+// The chain-prepend includes: one line each, the same for every zone.
+func renderQInputJump() string   { return "jump " + qChainInput + "\n" }
+func renderQForwardJump() string { return "jump " + qChainForward + "\n" }
+
+// renderQRuntimeUpdate is one nft transaction that brings the live chains,
+// the approved set and the WAN set in line with rs, without a firewall
+// reload: flushes and refills, applied atomically by `nft -f`.
+func renderQRuntimeUpdate(rs qRuleSet) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "flush chain inet %s %s\n", qTable, qChainInput)
+	fmt.Fprintf(&b, "flush chain inet %s %s\n", qTable, qChainForward)
+	fmt.Fprintf(&b, "flush set inet %s %s\n", qTable, qSetOK)
+	fmt.Fprintf(&b, "flush set inet %s %s\n", qTable, qSetWan)
+	if m := sortedMACs(rs.Approved); len(m) > 0 {
+		fmt.Fprintf(&b, "add element inet %s %s { %s }\n", qTable, qSetOK, strings.Join(m, ", "))
+	}
+	if w := sortedIfnames(rs.Wan); len(w) > 0 {
+		fmt.Fprintf(&b, "add element inet %s %s { %s }\n", qTable, qSetWan, strings.Join(quoted(w), ", "))
+	}
+	fmt.Fprintf(&b, "table inet %s {\n", qTable)
+	writeChain(&b, qChainInput, qInputRules(rs), "\t")
+	writeChain(&b, qChainForward, qForwardRules(rs), "\t")
+	b.WriteString("}\n")
+	return b.String()
+}
+
+// renderQCheck wraps the include content in a throwaway table so `nft -c`
+// can validate it against the running kernel (set flags, dynset, reject)
+// before the real firewall ever loads it.
+func renderQCheck(rs qRuleSet) string {
+	var b strings.Builder
+	b.WriteString("table inet netgrip_q_check {\n")
+	b.WriteString(renderQTable(rs))
+	b.WriteString("chain zone_input {\n\t" + strings.TrimSpace(renderQInputJump()) + "\n}\n")
+	b.WriteString("chain zone_forward {\n\t" + strings.TrimSpace(renderQForwardJump()) + "\n}\n")
+	b.WriteString("}\n")
+	return b.String()
+}
+
+// nftRunFn runs nft with args and optional stdin; a var so tests never run
+// the real binary.
+var nftRunFn = func(stdin string, args ...string) ([]byte, error) {
+	cmd := exec.Command("nft", args...)
+	if stdin != "" {
+		cmd.Stdin = strings.NewReader(stdin)
+	}
+	return cmd.CombinedOutput()
+}
+
+func nftApply(script string) error {
+	if out, err := nftRunFn(script, "-f", "-"); err != nil {
+		return fmt.Errorf("nft: %w (%s)", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// nftCheck validates a script without applying it.
+func nftCheck(script string) error {
+	if out, err := nftRunFn(script, "-c", "-f", "-"); err != nil {
+		return fmt.Errorf("nft check: %w (%s)", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// writeQFiles writes the three include files. The table file goes last:
+// it is the one a reload would read the approved list from.
+func writeQFiles(rs qRuleSet) error {
+	if err := os.MkdirAll(quarantineDir, 0o755); err != nil {
+		return err
+	}
+	if err := writeFileAtomic(qInputFile(), []byte(renderQInputJump())); err != nil {
+		return err
+	}
+	if err := writeFileAtomic(qForwardFile(), []byte(renderQForwardJump())); err != nil {
+		return err
+	}
+	return writeFileAtomic(qTableFile(), []byte(renderQTable(rs)))
+}
+
+// qLiveChainsPresent reports whether fw4 has loaded the quarantine chains:
+// the actual state, not the configured one.
+func qLiveChainsPresent() bool {
+	_, err1 := nftRunFn("", "list", "chain", "inet", qTable, qChainInput)
+	_, err2 := nftRunFn("", "list", "chain", "inet", qTable, qChainForward)
+	return err1 == nil && err2 == nil
+}
+
+// qSetElements reads the elements of a live set (MACs or names), whatever
+// shape nft's JSON gives them (plain values, or objects with timeouts).
+func qSetElements(set string) ([]string, error) {
+	raw, err := nftRunFn("", "-j", "list", "set", "inet", qTable, set)
+	if err != nil {
+		return nil, fmt.Errorf("nft list set %s: %w", set, err)
+	}
+	return parseNftSetElements(raw)
+}
+
+func parseNftSetElements(raw []byte) ([]string, error) {
+	var doc struct {
+		Nftables []struct {
+			Set *struct {
+				Elem []json.RawMessage `json:"elem"`
+			} `json:"set"`
+		} `json:"nftables"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return nil, err
+	}
+	out := []string{}
+	for _, item := range doc.Nftables {
+		if item.Set == nil {
+			continue
+		}
+		for _, e := range item.Set.Elem {
+			var s string
+			if json.Unmarshal(e, &s) == nil {
+				out = append(out, strings.ToLower(s))
+				continue
+			}
+			var obj struct {
+				Elem struct {
+					Val json.RawMessage `json:"val"`
+				} `json:"elem"`
+			}
+			if json.Unmarshal(e, &obj) == nil && json.Unmarshal(obj.Elem.Val, &s) == nil {
+				out = append(out, strings.ToLower(s))
+			}
+		}
+	}
+	return out, nil
+}
