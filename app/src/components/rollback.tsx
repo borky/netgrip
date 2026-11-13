@@ -97,7 +97,9 @@ export function RollbackConfirmModal({ pending, seconds, onKeep, onRevert }: {
 }) {
   const { t } = useTranslation();
   return (
-    <Modal open={pending !== null} onClose={onKeep}>
+    // Escape or a click outside must not count as "Keep": keeping a change
+    // that cut connectivity is exactly what this window guards against.
+    <Modal open={pending !== null} onClose={() => {}}>
       <div className="flex items-start gap-3">
         <IconTile icon={Clock} tone="accent" />
         <div className="min-w-0">

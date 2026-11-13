@@ -878,6 +878,9 @@ export default {
   quarantine: {
     title: "Quarantine",
     subtitle: "Devices the router has not been told to trust get only the internet, or nothing, until you approve them.",
+    scopeNote: "The router checks traffic that reaches it: the internet, other networks and the router itself. Two devices on the same network or Wi-Fi still talk to each other directly.",
+    pauseOffNote: "Devices that join while protection is paused are quarantined when the pause ends: approve them before it does.",
+    youRandom: "The device you are using has a private (random) address. If it changes, this device will be quarantined too: set Wi-Fi privacy to a fixed address for this network.",
     notApplicable: "Not available on this router: {{reason}}.",
     offTitle: "Keep unknown devices away from your network",
     offBody: "When it is on, a device that joins one of the protected networks and is not on your approved list cannot reach your other devices or the router's settings. You get a notification and approve it with one tap.",
@@ -930,7 +933,7 @@ export default {
     lastSeen: "Last seen {{when}}",
     approvedTitle: "Approved devices ({{count}})",
     you: "This device",
-    via: { baseline: "From setup", manual: "Approved", pause: "During pause" },
+    via: { baseline: "From setup", manual: "Approved", pause: "During pause", panel: "This panel" },
     revoke: "Revoke",
     revokeTitle: "Revoke {{name}}?",
     revokeBody: "New connections from this device will be restricted. Connections already open stay up until they end.",

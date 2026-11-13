@@ -63,6 +63,15 @@ func (s interfaceStatus) hasDefaultRoute() bool {
 	return false
 }
 
+func (s interfaceStatus) hasDefaultRoute6() bool {
+	for _, r := range s.Route {
+		if r.Target == "::" && r.Mask == 0 {
+			return true
+		}
+	}
+	return false
+}
+
 func (s interfaceStatus) defaultGateway() string {
 	for _, r := range s.Route {
 		if r.Target == "0.0.0.0" && r.Mask == 0 && r.Nexthop != "" {
@@ -234,20 +243,22 @@ func buildWanStatusPreferring(raw []byte, preferred string) (*WanStatus, error) 
 // that need to look at every interface rather than just "the WAN" — which is
 // what deciding between several uplinks requires.
 type InterfaceState struct {
-	Name            string   `json:"name"`
-	Proto           string   `json:"proto"`
-	Device          string   `json:"device"`
-	L3Device        string   `json:"l3Device"`
-	Up              bool     `json:"up"`
-	Available       bool     `json:"available"`
-	Dynamic         bool     `json:"dynamic"`
-	Metric          int      `json:"metric"`
-	RouteMetric     int      `json:"routeMetric"`
-	HasDefaultRoute bool     `json:"hasDefaultRoute"`
-	Gateway         string   `json:"gateway,omitempty"`
-	IPv4            []string `json:"ipv4"`
-	DNS             []string `json:"dns"`
-	Uptime          int64    `json:"uptime"`
+	Name            string `json:"name"`
+	Proto           string `json:"proto"`
+	Device          string `json:"device"`
+	L3Device        string `json:"l3Device"`
+	Up              bool   `json:"up"`
+	Available       bool   `json:"available"`
+	Dynamic         bool   `json:"dynamic"`
+	Metric          int    `json:"metric"`
+	RouteMetric     int    `json:"routeMetric"`
+	HasDefaultRoute bool   `json:"hasDefaultRoute"`
+	// HasDefaultRoute6 is the IPv6 counterpart (a ::/0 route).
+	HasDefaultRoute6 bool     `json:"hasDefaultRoute6,omitempty"`
+	Gateway          string   `json:"gateway,omitempty"`
+	IPv4             []string `json:"ipv4"`
+	DNS              []string `json:"dns"`
+	Uptime           int64    `json:"uptime"`
 }
 
 // ParseInterfaceDump flattens a `network.interface dump` payload. Pure, so
@@ -260,19 +271,20 @@ func ParseInterfaceDump(raw []byte) ([]InterfaceState, error) {
 	out := make([]InterfaceState, 0, len(dump.Interface))
 	for _, i := range dump.Interface {
 		s := InterfaceState{
-			Name:            i.Interface,
-			Proto:           i.Proto,
-			Device:          i.Device,
-			L3Device:        i.L3Device,
-			Up:              i.Up,
-			Available:       i.Available,
-			Dynamic:         i.Dynamic,
-			Metric:          i.Metric,
-			HasDefaultRoute: i.hasDefaultRoute(),
-			Gateway:         i.defaultGateway(),
-			IPv4:            []string{},
-			DNS:             i.DNS,
-			Uptime:          i.Uptime,
+			Name:             i.Interface,
+			Proto:            i.Proto,
+			Device:           i.Device,
+			L3Device:         i.L3Device,
+			Up:               i.Up,
+			Available:        i.Available,
+			Dynamic:          i.Dynamic,
+			Metric:           i.Metric,
+			HasDefaultRoute:  i.hasDefaultRoute(),
+			HasDefaultRoute6: i.hasDefaultRoute6(),
+			Gateway:          i.defaultGateway(),
+			IPv4:             []string{},
+			DNS:              i.DNS,
+			Uptime:           i.Uptime,
 		}
 		if s.HasDefaultRoute {
 			s.RouteMetric = i.defaultRouteMetric()

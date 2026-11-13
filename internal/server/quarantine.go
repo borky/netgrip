@@ -29,6 +29,9 @@ func (s *Server) registerQuarantineRoutes() {
 	s.mux.HandleFunc("POST /api/quarantine/resume", s.requireAuth(s.handleQuarantineResume))
 }
 
+// quarantineKeepCheck is a seam so confirm tests do not touch nft.
+var quarantineKeepCheck = modules.QuarantineKeepCheck
+
 // requesterIP is the panel user's address, IPv4 or IPv6.
 func requesterIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
@@ -79,15 +82,23 @@ func (s *Server) handleQuarantineEnable(w http.ResponseWriter, r *http.Request) 
 
 func (s *Server) handleQuarantineZones(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Zones []string `json:"zones"`
+		Zones            []string `json:"zones"`
+		AllowNoRequester bool     `json:"allow_no_requester,omitempty"`
 	}
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	s.runRiskyFirewall(w, func() (modules.QuarantineProbe, error) { return modules.QuarantineSetZones(req.Zones) })
+	ip := requesterIP(r)
+	s.runRiskyFirewall(w, func() (modules.QuarantineProbe, error) {
+		return modules.QuarantineSetZones(req.Zones, ip, req.AllowNoRequester)
+	})
 }
 
+// handleQuarantineDisable reloads the firewall too: it is serialized with
+// the confirm-window changes so it cannot interleave with a revert.
 func (s *Server) handleQuarantineDisable(w http.ResponseWriter, _ *http.Request) {
+	s.riskyMu.Lock()
+	defer s.riskyMu.Unlock()
 	p, err := modules.QuarantineDisable()
 	writeModuleResult(w, p, false, err)
 }
@@ -116,12 +127,13 @@ func (s *Server) handleQuarantineApprove(w http.ResponseWriter, r *http.Request)
 
 func (s *Server) handleQuarantineRevoke(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		MAC string `json:"mac"`
+		MAC   string `json:"mac"`
+		Force bool   `json:"force,omitempty"`
 	}
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	p, err := modules.QuarantineRevoke(req.MAC, requesterIP(r))
+	p, err := modules.QuarantineRevoke(req.MAC, requesterIP(r), req.Force)
 	writeModuleResult(w, p, false, err)
 }
 
@@ -148,7 +160,7 @@ func (s *Server) handleQuarantinePause(w http.ResponseWriter, r *http.Request) {
 	writeModuleResult(w, p, false, err)
 }
 
-func (s *Server) handleQuarantineResume(w http.ResponseWriter, _ *http.Request) {
-	p, err := modules.QuarantineResume()
+func (s *Server) handleQuarantineResume(w http.ResponseWriter, r *http.Request) {
+	p, err := modules.QuarantineResume(requesterIP(r))
 	writeModuleResult(w, p, false, err)
 }
