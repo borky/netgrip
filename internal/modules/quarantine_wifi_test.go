@@ -513,6 +513,11 @@ func TestQuarantineWifiLayerEndToEnd(t *testing.T) {
 	if len(w.kicked) != 0 || qRestartDue["radio9"].IsZero() {
 		t.Fatalf("kicked %v, restart due %v: want a scheduled restart", w.kicked, qRestartDue)
 	}
+	for _, op := range w.ops[len(w.ops)-1] {
+		if op.Kind == "wifi_reload" && op.Args[0] == "radio9" {
+			t.Fatal("a WPA3 approval reloaded the radio at once: devices drop and rejoin where they were before the restart")
+		}
+	}
 	// Revoking it soon after joins the same restart.
 	qNowFn = func() time.Time { return base.Add(5 * time.Second) }
 	if _, err := QuarantineRevoke("02:00:00:00:00:66", "192.0.2.10", false); err != nil {

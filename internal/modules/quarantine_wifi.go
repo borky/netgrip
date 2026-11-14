@@ -975,6 +975,11 @@ func qWifiApplyLocked(v qWifiView, p qWifiPlan) error {
 		kind := "wifi_reload"
 		if o.radios[r] {
 			kind = "wifi_bounce"
+		} else if o.saeRadios[r] {
+			// WPA3 entries need the scheduled restart; a reload first would
+			// only disconnect the devices and let them rejoin where they
+			// were, a few seconds before the restart moves them.
+			continue
 		}
 		ops = append(ops, executor.Op{Kind: kind, Args: []string{r}})
 	}
