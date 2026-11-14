@@ -435,6 +435,14 @@ func newQWifiFake(t *testing.T, f *qFake) *qWifiFake {
 	qKickFn = func(ifname, mac string) error { w.kicked = append(w.kicked, ifname+" "+mac); return nil }
 	qQuarantineFDBFn = func(string) map[string]bool { return map[string]bool{} }
 	qNetdevsFn = func() []string { return []string{"br-home", "eth9"} }
+	oRun, oSnap, oRestore := qDnsmasqRuntimeFn, qSnapshotFn, qRestoreFn
+	t.Cleanup(func() { qDnsmasqRuntimeFn, qSnapshotFn, qRestoreFn = oRun, oSnap, oRestore })
+	qDnsmasqRuntimeFn = func() qDnsmasqServing { return parseDnsmasqServing(qDnsmasqHealthy, true) }
+	qSnapshotFn = func(string) (string, error) { return "", nil }
+	qRestoreFn = func(string, string) error { return nil }
+	oWait := qDnsmasqWaitFn
+	qDnsmasqWaitFn = func(time.Time) {}
+	t.Cleanup(func() { qDnsmasqWaitFn = oWait })
 	qRoutesFn = func() []string { return []string{"192.0.2.0/24"} }
 	return w
 }
@@ -772,5 +780,78 @@ func TestQuarantineEnableAgainKeepsAWorkingWifiLayer(t *testing.T) {
 	f.enable(t, "internet", "home") // a repeated request
 	if w.v.wireless["home2"].Option("network") != qNet {
 		t.Fatal("a repeated enable tore down a working Wi-Fi layer")
+	}
+}
+
+// Shaped like a real generated dnsmasq config, with dummy addresses.
+const qDnsmasqHealthy = `bind-dynamic
+dhcp-range=set:lan,192.0.2.100,192.0.2.249,255.255.255.0,12h
+dhcp-range=set:guests,198.51.100.100,198.51.100.249,255.255.255.0,12h
+`
+
+func TestQDHCPRegression(t *testing.T) {
+	before := parseDnsmasqServing(qDnsmasqHealthy, true)
+	own := qOwnDHCP{bridge: "br-quarantine", routerIP: "192.168.254.1"}
+	withOurs := qDnsmasqHealthy + "dhcp-range=set:netgrip_quarantine,192.168.254.100,192.168.254.249,255.255.255.0,1h\n"
+	for name, c := range map[string]struct {
+		after string
+		bad   bool
+	}{
+		"our range added":               {withOurs, false},
+		"bound to the quarantine alone": {withOurs + "interface=br-quarantine\n", true}, // what happened on 2026-11-14
+		"a range lost":                  {"dhcp-range=set:lan,192.0.2.100,192.0.2.249,255.255.255.0,12h\n", true},
+		"lease time changed only":       {strings.ReplaceAll(qDnsmasqHealthy, "12h", "6h"), false},
+	} {
+		got := qDHCPRegression(before, parseDnsmasqServing(c.after, true), own)
+		if (got != "") != c.bad {
+			t.Errorf("%s: %q", name, got)
+		}
+	}
+	// Turning the layer off removes our own range and binding: fine.
+	on := parseDnsmasqServing(withOurs, true)
+	if got := qDHCPRegression(on, before, own); got != "" {
+		t.Fatalf("our own range going away was taken for a regression: %q", got)
+	}
+	// An instance bound to its interfaces may gain ours, not lose its own.
+	bound := parseDnsmasqServing(qDnsmasqHealthy+"interface=br-home\n", true)
+	if got := qDHCPRegression(bound, parseDnsmasqServing(qDnsmasqHealthy+"interface=br-home\ninterface=br-quarantine\n", true), own); got != "" {
+		t.Fatalf("adding ours to a bound instance: %q", got)
+	}
+	if got := qDHCPRegression(bound, parseDnsmasqServing(qDnsmasqHealthy+"interface=br-quarantine\n", true), own); got == "" {
+		t.Fatal("a bound instance losing its interface passed")
+	}
+}
+
+func TestQuarantineWifiEnableRestoresDHCPWhenItBreaks(t *testing.T) {
+	f := newQFake(t)
+	f.enable(t, "internet", "home")
+	w := newQWifiFake(t, f)
+	oRun, oSnap, oRestore := qDnsmasqRuntimeFn, qSnapshotFn, qRestoreFn
+	t.Cleanup(func() { qDnsmasqRuntimeFn, qSnapshotFn, qRestoreFn = oRun, oSnap, oRestore })
+	calls := 0
+	qDnsmasqRuntimeFn = func() qDnsmasqServing {
+		calls++
+		if calls == 1 {
+			return parseDnsmasqServing(qDnsmasqHealthy, true)
+		}
+		// Whatever the cause, dnsmasq ends up serving the quarantine alone.
+		return parseDnsmasqServing("interface=br-quarantine\ndhcp-range=set:q,192.168.254.100,192.168.254.249,255.255.255.0,1h\n", true)
+	}
+	qSnapshotFn = func(c string) (string, error) { return "snapshot-of-" + c, nil }
+	restored := ""
+	qRestoreFn = func(c, content string) error { restored = c + ":" + content; return nil }
+
+	if _, err := QuarantineWifiEnable("192.0.2.10", false); err == nil || !strings.Contains(err.Error(), "stopped DHCP") {
+		t.Fatalf("enable went ahead with DHCP broken: %v", err)
+	}
+	if restored != "dhcp:snapshot-of-dhcp" {
+		t.Fatalf("the DHCP config was not put back: %q", restored)
+	}
+	last := w.ops[len(w.ops)-1]
+	if len(last) != 1 || last[0].Kind != "initd" || last[0].Args[0] != "dnsmasq" {
+		t.Fatalf("dnsmasq not reloaded after the restore: %+v", last)
+	}
+	if loadQState().Wifi.Enabled {
+		t.Fatal("recorded as on")
 	}
 }
