@@ -174,6 +174,13 @@ const demoQ: { state: QuarantineProbe; you: string } = {
       { name: "wan", networks: ["wan", "wan6"], wan: true, suggested: false, protected: false },
     ],
     wan: ["eth1"], approved: [], pending: [], pause: {}, issues: [],
+    wifi: {
+      enabled: false, quarantined: 0, issues: [],
+      ssids: [
+        { section: "default_radio0", ssid: "Home", network: "lan", zone: "lan", covered: false, applied: false, reason: "its network is not in a protected zone" },
+        { section: "default_radio1", ssid: "Home-5G", network: "lan", zone: "lan", covered: false, applied: false, reason: "its network is not in a protected zone" },
+      ],
+    },
   },
 };
 const qResult = async (): Promise<QResult> => { await wait(200, 500); return { status: "applied", state: structuredClone(demoQ.state) }; };
@@ -967,7 +974,13 @@ export const demoApi: typeof api = {
     return { ...(await qResult()), confirm: { id: "demo", expires: Math.floor(Date.now() / 1000) + 120 } };
   },
   quarantineDisable: async () => { demoQ.state.enabled = false; demoQ.state.active = false; return qResult(); },
-  quarantineZones: async (zones, _allow) => { demoQ.state.zones = demoQ.state.zones.map((z) => ({ ...z, protected: zones.includes(z.name) })); return { ...(await qResult()), confirm: { id: "demo", expires: Math.floor(Date.now() / 1000) + 120 } }; },
+  quarantineZones: async (zones, _allow) => {
+    demoQ.state.zones = demoQ.state.zones.map((z) => ({ ...z, protected: zones.includes(z.name) }));
+    demoQ.state.wifi.ssids = demoQ.state.wifi.ssids.map((s) => {
+      const covered = zones.includes(s.zone);
+      return { ...s, covered, reason: covered ? undefined : "its network is not in a protected zone", applied: demoQ.state.wifi.enabled && covered };
+    });
+    return { ...(await qResult()), confirm: { id: "demo", expires: Math.floor(Date.now() / 1000) + 120 } }; },
   quarantineMode: async (mode) => { demoQ.state.mode = mode as QuarantineProbe["mode"]; return qResult(); },
   quarantineApprove: async (devices) => {
     for (const d of devices) {
@@ -980,6 +993,14 @@ export const demoApi: typeof api = {
   quarantineForget: async (mac) => { demoQ.state.pending = demoQ.state.pending.filter((p) => p.mac !== mac); return qResult(); },
   quarantinePause: async (minutes, kind) => { demoQ.state.pause = { until: Math.floor(Date.now() / 1000) + minutes * 60, kind }; return qResult(); },
   quarantineResume: async () => { demoQ.state.pause = {}; return qResult(); },
+  quarantineWifi: async (enabled, _allow) => {
+    const w = demoQ.state.wifi;
+    w.enabled = enabled;
+    w.subnet = enabled ? "192.168.254.1/24" : undefined;
+    w.ssids = w.ssids.map((s) => ({ ...s, applied: enabled && s.covered }));
+    const res = await qResult();
+    return enabled ? { ...res, confirm: { id: "demo", expires: Math.floor(Date.now() / 1000) + 120 } } : res;
+  },
   quotas: () => get({ ...state.quota }),
   setQuota: async (q) => {
     await wait(800, 1500);

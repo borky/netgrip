@@ -1,0 +1,564 @@
+package modules
+
+import (
+	"encoding/binary"
+	"net"
+	"sort"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/gnacho/netgrip/internal/executor"
+	"github.com/gnacho/netgrip/internal/ubus"
+)
+
+// A made-up router: two SSIDs on a protected client network, one on an
+// unprotected one, one WPA2/WPA3 Enterprise, one turned off.
+func qWifiTestView() qWifiView {
+	w := parseUCIShow(`wireless.radio9=wifi-device
+wireless.radio9.band='2g'
+wireless.radio8=wifi-device
+wireless.radio8.band='5g'
+wireless.home2=wifi-iface
+wireless.home2.device='radio9'
+wireless.home2.mode='ap'
+wireless.home2.ssid='Home'
+wireless.home2.encryption='sae-mixed'
+wireless.home2.key='dummy-pass-1'
+wireless.home2.network='home'
+wireless.home5=wifi-iface
+wireless.home5.device='radio8'
+wireless.home5.mode='ap'
+wireless.home5.ssid='Home5'
+wireless.home5.encryption='psk2+ccmp'
+wireless.home5.key='dummy-pass-2'
+wireless.home5.network='home'
+wireless.guest=wifi-iface
+wireless.guest.device='radio9'
+wireless.guest.mode='ap'
+wireless.guest.ssid='Guests'
+wireless.guest.encryption='psk2'
+wireless.guest.key='dummy-pass-3'
+wireless.guest.network='guests'
+wireless.corp=wifi-iface
+wireless.corp.device='radio8'
+wireless.corp.mode='ap'
+wireless.corp.ssid='Corp'
+wireless.corp.encryption='wpa3'
+wireless.corp.network='home'
+wireless.off=wifi-iface
+wireless.off.device='radio8'
+wireless.off.ssid='Off'
+wireless.off.encryption='psk2'
+wireless.off.key='dummy-pass-4'
+wireless.off.network='home'
+wireless.off.disabled='1'
+`, "wireless")
+	n := parseUCIShow(`network.home=interface
+network.home.device='br-home'
+network.home.proto='static'
+network.home.ipaddr='192.0.2.1'
+network.home.netmask='255.255.255.0'
+network.guests=interface
+network.guests.proto='static'
+network.guests.ipaddr='198.51.100.1/24'
+network.@device[0]=device
+network.@device[0].name='br-home'
+network.@device[0].type='bridge'
+`, "network")
+	d := parseUCIShow(`dhcp.home=dhcp
+dhcp.home.interface='home'
+dhcp.home.dhcp_option='6,192.0.2.53' '3,192.0.2.1'
+dhcp.guests=dhcp
+dhcp.guests.interface='guests'
+`, "dhcp")
+	return qWifiView{wireless: w, network: n, dhcp: d, firewall: map[string]uciSection{}}
+}
+
+var qWifiTestZones = []QZone{
+	{Name: "home", Networks: []string{"home"}},
+	{Name: "guests", Networks: []string{"guests"}},
+	{Name: "up", Networks: []string{"uplink"}, Wan: true},
+}
+
+func TestQWifiSSIDsCoverage(t *testing.T) {
+	got := map[string]QWifiSSID{}
+	for _, s := range qWifiSSIDs(qWifiTestView(), qWifiTestZones, []string{"home"}) {
+		got[s.Section] = s
+	}
+	if !got["home2"].Covered || !got["home5"].Covered {
+		t.Fatalf("protected PSK/SAE SSIDs not covered: %+v", got)
+	}
+	for sec, why := range map[string]string{
+		"guest": "not in a protected zone", "corp": "shared password", "off": "turned off",
+	} {
+		if got[sec].Covered || !strings.Contains(got[sec].Reason, why) {
+			t.Errorf("%s: %+v, want a reason containing %q", sec, got[sec], why)
+		}
+	}
+	// Someone else's per-device entries rule an SSID out.
+	v := qWifiTestView()
+	v.wireless["theirs"] = uciSection{Type: "wifi-station", Options: map[string][]string{"mac": {"02:00:00:00:00:31"}, "iface": {"home5"}}}
+	for _, s := range qWifiSSIDs(v, qWifiTestZones, []string{"home"}) {
+		if s.Section == "home5" && s.Covered {
+			t.Fatal("an SSID with foreign station entries was covered")
+		}
+	}
+}
+
+func TestQPickRouterIPAvoidsEveryTakenNetwork(t *testing.T) {
+	var taken []*net.IPNet
+	for _, c := range []string{"192.168.254.0/24", "192.168.253.0/23", "192.168.0.0/24"} {
+		_, n, _ := net.ParseCIDR(c)
+		taken = append(taken, n)
+	}
+	ip, err := qPickRouterIP(taken)
+	if err != nil || ip != "192.168.251.1" {
+		t.Fatalf("picked %q, %v", ip, err)
+	}
+	_, all, _ := net.ParseCIDR("192.168.0.0/16")
+	ip, err = qPickRouterIP([]*net.IPNet{all})
+	if err != nil || !strings.HasPrefix(ip, "172.31.") {
+		t.Fatalf("with 192.168/16 taken: %q, %v", ip, err)
+	}
+}
+
+// qApplyOps plays UCI ops onto parsed configs, like uci would.
+func qApplyOps(t *testing.T, v *qWifiView, ops []executor.Op) {
+	t.Helper()
+	cfg := map[string]map[string]uciSection{"wireless": v.wireless, "network": v.network, "dhcp": v.dhcp, "firewall": v.firewall}
+	split := func(key string) (map[string]uciSection, string, string) {
+		parts := strings.SplitN(key, ".", 3)
+		m := cfg[parts[0]]
+		if m == nil {
+			t.Fatalf("unknown package in %q", key)
+		}
+		if len(parts) == 2 {
+			return m, parts[1], ""
+		}
+		return m, parts[1], parts[2]
+	}
+	for _, op := range ops {
+		switch op.Kind {
+		case "uci_set":
+			m, sec, opt := split(op.Args[0])
+			if opt == "" {
+				m[sec] = uciSection{Type: op.Args[1], Options: map[string][]string{}}
+				continue
+			}
+			s, ok := m[sec]
+			if !ok {
+				t.Fatalf("set on missing section %q", op.Args[0])
+			}
+			s.Options[opt] = []string{op.Args[1]}
+		case "uci_add_list":
+			m, sec, opt := split(op.Args[0])
+			s, ok := m[sec]
+			if !ok {
+				t.Fatalf("add_list on missing section %q", op.Args[0])
+			}
+			s.Options[opt] = append(s.Options[opt], op.Args[1])
+		case "uci_delete":
+			m, sec, opt := split(op.Args[0])
+			if opt == "" {
+				delete(m, sec)
+			} else if s, ok := m[sec]; ok {
+				delete(s.Options, opt)
+			}
+		case "uci_commit", "initd", "wifi_reload":
+		default:
+			t.Fatalf("unexpected op %+v", op)
+		}
+	}
+}
+
+func qTestPlan(v qWifiView, approved []string) qWifiPlan {
+	ssids := qWifiSSIDs(v, qWifiTestZones, []string{"home"})
+	return qWifiPlan{
+		enabled: true, routerIP: "192.168.254.1", bridge: "br-quarantine", ssids: ssids,
+		approved: approved, uplinks: qUplinkZones(qWifiTestZones), dns: qDNSFor(v.dhcp, "home"),
+	}
+}
+
+func TestQWifiOpsBuildTheLayerAndSettle(t *testing.T) {
+	v := qWifiTestView()
+	approved := []string{"02:00:00:00:00:0a", "02:00:00:00:00:0b"}
+	o := qWifiOpsFor(v, qTestPlan(v, approved))
+	if !o.radios["radio8"] || !o.radios["radio9"] {
+		t.Fatalf("both radios carry a covered SSID and must reload: %v", o.radios)
+	}
+	var all []executor.Op
+	all = append(append(append(append(all, o.network...), o.dhcp...), o.firewall...), o.wireless...)
+	qApplyOps(t, &v, all)
+
+	for _, sec := range []string{"home2", "home5"} {
+		s := v.wireless[sec]
+		if strings.Join(s.Options["network"], " ") != qNet || s.Option(qWifiMarker) != "home" || s.Option("dynamic_vlan") != "1" {
+			t.Fatalf("%s not converted: %+v", sec, s.Options)
+		}
+		vl, sta := v.wireless[qVlanPfx+sec], v.wireless[qStaPfx+sec]
+		if vl.Type != "wifi-vlan" || vl.Option("network") != "home" || vl.Option("vid") != sta.Option("vid") {
+			t.Fatalf("%s VLAN section: %+v", sec, vl)
+		}
+		if sta.Type != "wifi-station" || strings.Join(sta.Options["mac"], ",") != strings.Join(approved, ",") || sta.Option("key") != v.wireless[sec].Option("key") {
+			t.Fatalf("%s station section: %+v", sec, sta)
+		}
+		for _, m := range sta.Options["mac"] {
+			if m == "00:00:00:00:00:00" {
+				t.Fatal("a wildcard station entry (it overrides every other, E2)")
+			}
+		}
+	}
+	if v.wireless["guest"].Option("network") != "guests" || v.wireless["corp"].Option(qWifiMarker) != "" {
+		t.Fatal("an SSID outside the layer was touched")
+	}
+	if v.network[qNet].Option("ipaddr") != "192.168.254.1" || v.network[qNet].Option("device") != "br-quarantine" || v.network[qDevSection].Option("bridge_empty") != "1" {
+		t.Fatalf("quarantine network: %+v %+v", v.network[qNet], v.network[qDevSection])
+	}
+	if strings.Join(v.dhcp[qNet].Options["dhcp_option"], " ") != "6,192.0.2.53" {
+		t.Fatalf("DNS not copied from the SSID's network: %+v", v.dhcp[qNet])
+	}
+	z := v.firewall[qZoneSection]
+	if z.Option("input") != "REJECT" || z.Option("forward") != "REJECT" || z.Option("name") != qNet {
+		t.Fatalf("zone must fail closed: %+v", z)
+	}
+	if v.firewall[qUplinkPfx+"0"].Option("dest") != "up" || v.firewall[qResolverPfx+"0"].Option("dest_ip") != "192.0.2.53" {
+		t.Fatalf("uplink forwarding / resolver rule: %+v %+v", v.firewall[qUplinkPfx+"0"], v.firewall[qResolverPfx+"0"])
+	}
+	if v.network[qNet].Options["proto"] == nil || len(v.network[qNet].Options["proto"]) != 1 {
+		t.Fatalf("interface proto: %+v", v.network[qNet].Options["proto"])
+	}
+	for name, s := range v.firewall {
+		if !strings.HasPrefix(name, "netgrip_quarantine") {
+			t.Errorf("firewall section not named after the feature: %s", name)
+		}
+		if s.Type == "rule" && !strings.HasPrefix(s.Option("name"), "netgrip quarantine: ") {
+			t.Errorf("rule %s not labelled: %q", name, s.Option("name"))
+		}
+	}
+	if again := qWifiOpsFor(v, qTestPlan(v, approved)); again.any() {
+		t.Fatalf("does not settle: %+v", again)
+	}
+}
+
+func TestQWifiApprovingOnlyTouchesStations(t *testing.T) {
+	v := qWifiTestView()
+	approved := []string{"02:00:00:00:00:0a"}
+	o := qWifiOpsFor(v, qTestPlan(v, approved))
+	qApplyOps(t, &v, append(append(append(o.network, o.dhcp...), o.firewall...), o.wireless...))
+
+	more := []string{"02:00:00:00:00:0a", "02:00:00:00:00:0c"}
+	o = qWifiOpsFor(v, qTestPlan(v, more))
+	if len(o.network)+len(o.dhcp)+len(o.firewall) > 0 || len(o.radios) > 0 {
+		t.Fatalf("an approval restarted something: radios %v, ops %d/%d/%d", o.radios, len(o.network), len(o.dhcp), len(o.firewall))
+	}
+	if !o.stationRadios["radio8"] || !o.stationRadios["radio9"] {
+		t.Fatalf("station data not reloaded: %v", o.stationRadios)
+	}
+	for _, sec := range []string{"home2", "home5"} {
+		if strings.Join(o.moved[sec], ",") != "02:00:00:00:00:0c" {
+			t.Fatalf("%s: moved %v, want only the new device", sec, o.moved[sec])
+		}
+	}
+	// A password change follows into the entries, again without a restart.
+	qApplyOps(t, &v, o.wireless)
+	v.wireless["home2"].Options["key"] = []string{"dummy-pass-new"}
+	o = qWifiOpsFor(v, qTestPlan(v, more))
+	if len(o.radios) > 0 || !o.stationRadios["radio9"] {
+		t.Fatalf("password change: radios %v, stations %v", o.radios, o.stationRadios)
+	}
+}
+
+func TestQWifiOffRestoresEverything(t *testing.T) {
+	v := qWifiTestView()
+	o := qWifiOpsFor(v, qTestPlan(v, []string{"02:00:00:00:00:0a"}))
+	qApplyOps(t, &v, append(append(append(o.network, o.dhcp...), o.firewall...), o.wireless...))
+	// Someone moved Home5 elsewhere by hand meanwhile.
+	v.wireless["home5"].Options["network"] = []string{"guests"}
+
+	o = qWifiOpsFor(v, qWifiPlan{})
+	qApplyOps(t, &v, append(append(append(o.network, o.dhcp...), o.firewall...), o.wireless...))
+	if strings.Join(v.wireless["home2"].Options["network"], " ") != "home" {
+		t.Fatalf("home2 not restored: %+v", v.wireless["home2"].Options)
+	}
+	if strings.Join(v.wireless["home5"].Options["network"], " ") != "guests" {
+		t.Fatalf("a hand-made change was overwritten: %+v", v.wireless["home5"].Options)
+	}
+	for _, sec := range []string{"home2", "home5"} {
+		if v.wireless[sec].Option(qWifiMarker) != "" || v.wireless[sec].Option("dynamic_vlan") != "" {
+			t.Fatalf("%s keeps the layer's marks: %+v", sec, v.wireless[sec].Options)
+		}
+	}
+	for _, m := range []map[string]uciSection{v.wireless, v.network, v.dhcp, v.firewall} {
+		for name := range m {
+			if strings.HasPrefix(name, "netgrip_quarantine") {
+				t.Errorf("left behind: %s", name)
+			}
+		}
+	}
+	if again := qWifiOpsFor(v, qWifiPlan{}); again.any() {
+		t.Fatalf("off does not settle: %+v", again)
+	}
+}
+
+func TestQWifiNoApprovedDevicesNoStationSection(t *testing.T) {
+	v := qWifiTestView()
+	o := qWifiOpsFor(v, qTestPlan(v, nil))
+	qApplyOps(t, &v, append(append(append(o.network, o.dhcp...), o.firewall...), o.wireless...))
+	for name, s := range v.wireless {
+		if s.Type == "wifi-station" {
+			t.Fatalf("an empty station entry was written: %s %+v", name, s)
+		}
+	}
+}
+
+func TestParseBrForward(t *testing.T) {
+	entry := func(mac string, local bool, ageCs uint32) []byte {
+		e := make([]byte, 16)
+		hw, _ := net.ParseMAC(mac)
+		copy(e, hw)
+		if local {
+			e[7] = 1
+		}
+		binary.NativeEndian.PutUint32(e[8:12], ageCs)
+		return e
+	}
+	raw := append(append(entry("02:00:00:00:00:41", false, 500), entry("02:00:00:00:00:42", true, 0)...), entry("02:00:00:00:00:43", false, 90000)...)
+	got := parseBrForward(raw, 60)
+	keys := []string{}
+	for k := range got {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	if strings.Join(keys, ",") != "02:00:00:00:00:41" {
+		t.Fatalf("recent remote entries: %v (local and stale ones must be left out)", keys)
+	}
+}
+
+func TestQHookZonesAddsTheQuarantineZoneOnlyWithTheLayer(t *testing.T) {
+	st := &qState{Zones: []string{"home"}}
+	if strings.Join(qHookZones(st), ",") != "home" {
+		t.Fatal("hooked the quarantine zone without the layer")
+	}
+	st.Wifi.Enabled = true
+	if strings.Join(qHookZones(st), ",") != "home,"+qNet {
+		t.Fatalf("hooks: %v", qHookZones(st))
+	}
+	if strings.Join(qUserZones([]string{"home", qNet}), ",") != "home" {
+		t.Fatal("the quarantine zone leaked into the user's zones")
+	}
+	if _, err := validateZones([]string{qNet}, []QZone{{Name: qNet, Networks: []string{qNet}}}); err == nil {
+		t.Fatal("the quarantine zone can be picked as a protected zone")
+	}
+}
+
+// renderUCIShow prints parsed sections back the way `uci show` does.
+func renderUCIShow(pkg string, m map[string]uciSection) string {
+	names := make([]string, 0, len(m))
+	for n := range m {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	var b strings.Builder
+	for _, n := range names {
+		s := m[n]
+		b.WriteString(pkg + "." + n + "=" + s.Type + "\n")
+		opts := make([]string, 0, len(s.Options))
+		for o := range s.Options {
+			opts = append(opts, o)
+		}
+		sort.Strings(opts)
+		for _, o := range opts {
+			q := make([]string, len(s.Options[o]))
+			for i, v := range s.Options[o] {
+				q[i] = "'" + v + "'"
+			}
+			b.WriteString(pkg + "." + n + "." + o + "=" + strings.Join(q, " ") + "\n")
+		}
+	}
+	return b.String()
+}
+
+type qWifiFake struct {
+	v      qWifiView
+	kicked []string
+	ops    [][]executor.Op
+}
+
+// newQWifiFake extends the phase 1 fake router with Wi-Fi, network and
+// DHCP configs held in memory, and an SSID "home2" on the protected
+// network with two stations connected.
+func newQWifiFake(t *testing.T, f *qFake) *qWifiFake {
+	t.Helper()
+	w := &qWifiFake{v: qWifiTestView()}
+	w.v.dhcp = parseUCIShow(qTestDhcp, "dhcp")
+	oShow, oApply, oBSS, oKick, oFDB, oDevs, oRoutes := uciShowFn, applyQWifiOps, qBSSFn, qKickFn, qQuarantineFDBFn, qNetdevsFn, qRoutesFn
+	t.Cleanup(func() {
+		uciShowFn, applyQWifiOps, qBSSFn, qKickFn, qQuarantineFDBFn, qNetdevsFn, qRoutesFn = oShow, oApply, oBSS, oKick, oFDB, oDevs, oRoutes
+	})
+	base := uciShowFn
+	uciShowFn = func(pkg string) (string, error) {
+		switch pkg {
+		case "wireless":
+			return renderUCIShow("wireless", w.v.wireless), nil
+		case "network":
+			return renderUCIShow("network", w.v.network), nil
+		case "dhcp":
+			return renderUCIShow("dhcp", w.v.dhcp), nil
+		case "firewall":
+			s, err := base(pkg)
+			return s + renderUCIShow("firewall", w.v.firewall), err
+		}
+		return base(pkg)
+	}
+	applyQWifiOps = func(ops []executor.Op) error {
+		w.ops = append(w.ops, ops)
+		qApplyOps(t, &w.v, ops)
+		return nil
+	}
+	qBSSFn = func() map[string]ubus.WirelessInterface {
+		return map[string]ubus.WirelessInterface{"home2": {Ifname: "phy9-ap0", RFaceName: "home2", Clients: []ubus.WirelessClient{
+			{MAC: "02:00:00:00:00:10"}, {MAC: "02:00:00:00:00:66"},
+		}}}
+	}
+	qKickFn = func(ifname, mac string) error { w.kicked = append(w.kicked, ifname+" "+mac); return nil }
+	qQuarantineFDBFn = func(string) map[string]bool { return map[string]bool{} }
+	qNetdevsFn = func() []string { return []string{"br-home", "eth9"} }
+	qRoutesFn = func() []string { return []string{"192.0.2.0/24"} }
+	return w
+}
+
+func TestQuarantineWifiLayerEndToEnd(t *testing.T) {
+	f := newQFake(t)
+	f.enable(t, "internet", "home")
+	w := newQWifiFake(t, f)
+
+	if _, err := QuarantineWifiEnable("192.0.2.10", false); err != nil {
+		t.Fatal(err)
+	}
+	st := loadQState()
+	if !st.Wifi.Enabled || st.Wifi.RouterIP == "" {
+		t.Fatalf("state: %+v", st.Wifi)
+	}
+	home2 := w.v.wireless["home2"]
+	if home2.Option("network") != qNet || home2.Option(qWifiMarker) != "home" {
+		t.Fatalf("SSID not on the quarantine network: %+v", home2.Options)
+	}
+	if got := w.v.wireless[qStaPfx+"home2"].Options["mac"]; strings.Join(got, ",") != "02:00:00:00:00:10" {
+		t.Fatalf("station entries: %v (the requester must be among them)", got)
+	}
+	// Phase 1 hooks into the quarantine network's zone too.
+	actual := qActualZones(mustShowPkg(t, "firewall"))
+	if strings.Join(actual, ",") != "home,"+qNet {
+		t.Fatalf("hooked zones: %v", actual)
+	}
+	if strings.Join(loadQState().Zones, ",") != "home" {
+		t.Fatalf("the quarantine zone leaked into the protected zones: %v", loadQState().Zones)
+	}
+	if p := ProbeQuarantine(); !p.Wifi.Enabled || p.Wifi.Subnet == "" || qZoneMap(p.Zones)[qNet].Name != "" {
+		t.Fatalf("probe: %+v", p.Wifi)
+	}
+
+	// Approving a connected device: its entry, and it reconnects.
+	w.kicked = nil
+	if _, err := QuarantineApprove([]QApproveItem{{MAC: "02:00:00:00:00:66"}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := w.v.wireless[qStaPfx+"home2"].Options["mac"]; strings.Join(got, ",") != "02:00:00:00:00:10,02:00:00:00:00:66" {
+		t.Fatalf("station entries after approve: %v", got)
+	}
+	if strings.Join(w.kicked, ";") != "phy9-ap0 02:00:00:00:00:66" {
+		t.Fatalf("kicked: %v", w.kicked)
+	}
+	// Revoking it: entry gone, reconnected onto the quarantine network.
+	w.kicked = nil
+	if _, err := QuarantineRevoke("02:00:00:00:00:66", "192.0.2.10", false); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(w.kicked, ";") != "phy9-ap0 02:00:00:00:00:66" {
+		t.Fatalf("revoked device not reconnected: %v", w.kicked)
+	}
+
+	// The poller syncs the layer and finds it settled: nothing to write.
+	w.ops = nil
+	synced := 0
+	qQuarantineFDBFn = func(string) map[string]bool { synced++; return map[string]bool{} }
+	qPoll(time.Now().Add(time.Hour))
+	if synced == 0 {
+		t.Fatal("the poller did not sync the Wi-Fi layer")
+	}
+	if len(w.ops) != 0 {
+		t.Fatalf("the poller rewrote a settled layer: %v", w.ops)
+	}
+
+	// Turning the quarantine off takes the layer with it.
+	if _, err := QuarantineDisable(); err != nil {
+		t.Fatal(err)
+	}
+	if w.v.wireless["home2"].Option("network") != "home" || w.v.wireless["home2"].Option(qWifiMarker) != "" {
+		t.Fatalf("SSID not restored: %+v", w.v.wireless["home2"].Options)
+	}
+	for _, m := range []map[string]uciSection{w.v.wireless, w.v.network, w.v.dhcp, w.v.firewall} {
+		for name := range m {
+			if strings.HasPrefix(name, "netgrip_quarantine") {
+				t.Errorf("left behind: %s", name)
+			}
+		}
+	}
+	if loadQState().Wifi.Enabled {
+		t.Fatal("the layer is still recorded as on")
+	}
+}
+
+func TestQuarantineWifiEnableNeedsACoveredSSID(t *testing.T) {
+	f := newQFake(t)
+	f.enable(t, "internet", "guests")
+	w := newQWifiFake(t, f)
+	w.v.wireless["guest"].Options["encryption"] = []string{"wpa2"} // Enterprise: not coverable
+	if _, err := QuarantineWifiEnable("192.0.2.10", false); err == nil {
+		t.Fatal("turned on with no SSID it can cover")
+	}
+	if loadQState().Wifi.Enabled || len(w.ops) != 0 {
+		t.Fatal("something was changed")
+	}
+}
+
+func mustShowPkg(t *testing.T, pkg string) string {
+	t.Helper()
+	s, err := uciShowFn(pkg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+func TestQuarantineWifiHealsAMisplacedApprovedDevice(t *testing.T) {
+	f := newQFake(t)
+	f.enable(t, "internet", "home")
+	w := newQWifiFake(t, f)
+	if _, err := QuarantineWifiEnable("192.0.2.10", false); err != nil {
+		t.Fatal(err)
+	}
+	old := qKicked
+	qKicked = map[string]time.Time{}
+	t.Cleanup(func() { qKicked = old })
+	// The approved requester and an unknown device are both heard on the
+	// quarantine network.
+	qQuarantineFDBFn = func(string) map[string]bool {
+		return map[string]bool{"02:00:00:00:00:10": true, "02:00:00:00:00:66": true}
+	}
+	w.kicked = nil
+	now := time.Now().Add(time.Hour)
+	qPoll(now)
+	if strings.Join(w.kicked, ";") != "phy9-ap0 02:00:00:00:00:10" {
+		t.Fatalf("kicked %v, want only the approved device", w.kicked)
+	}
+	qPoll(now.Add(qFullCheckEvery))
+	if len(w.kicked) != 1 {
+		t.Fatalf("kicked again within %v: %v", qKickEvery, w.kicked)
+	}
+	qPoll(now.Add(qKickEvery + qFullCheckEvery))
+	if len(w.kicked) != 2 {
+		t.Fatalf("not retried after %v: %v", qKickEvery, w.kicked)
+	}
+}

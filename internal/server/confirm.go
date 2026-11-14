@@ -225,6 +225,8 @@ func reloadOpFor(config string) executor.Op {
 	switch config {
 	case "wireless":
 		return executor.Op{Kind: "wifi_reload", Args: []string{}}
+	case "dhcp": // no init script of its own: dnsmasq reads it
+		return executor.Op{Kind: "initd", Args: []string{"dnsmasq", "reload"}}
 	default: // network, firewall
 		return executor.Op{Kind: "initd", Args: []string{config, "reload"}}
 	}

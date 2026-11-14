@@ -999,6 +999,8 @@ const realApi = {
   quarantineForget: (mac: string) => postQ("/api/quarantine/forget", { mac }),
   quarantinePause: (minutes: number, kind: "learn" | "off") => postQ("/api/quarantine/pause", { minutes, kind }),
   quarantineResume: () => postQ("/api/quarantine/resume", {}),
+  quarantineWifi: (enabled: boolean, allowNoRequester?: boolean) =>
+    postQ("/api/quarantine/wifi", { enabled, allow_no_requester: allowNoRequester }),
   quotas: () =>
     request<import("./types").QuotaProbe>("/api/quotas"),
   setQuota: (quota: import("./types").Quota) =>

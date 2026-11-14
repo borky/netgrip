@@ -1811,6 +1811,31 @@ export interface QuarantineProbe {
   pending: QDevice[];
   pause: QPause;
   issues: string[];
+  /** The Wi-Fi layer (phase 2). */
+  wifi: QWifiProbe;
+}
+
+/** One of the router's own SSIDs, as the Wi-Fi layer sees it. */
+export interface QWifiSSID {
+  section: string;
+  ssid: string;
+  /** Its own network, restored when the layer goes off. */
+  network: string;
+  zone: string;
+  /** In a protected zone and able to take per-device entries. */
+  covered: boolean;
+  /** Currently on the quarantine network. */
+  applied: boolean;
+  reason?: string;
+}
+
+export interface QWifiProbe {
+  enabled: boolean;
+  subnet?: string;
+  ssids: QWifiSSID[];
+  /** Devices heard on the quarantine network lately. */
+  quarantined: number;
+  issues: string[];
 }
 
 export interface QCandidate extends QDevice {
