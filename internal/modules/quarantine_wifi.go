@@ -44,15 +44,20 @@ import (
 )
 
 const (
-	qNet          = "netgrip_quarantine" // network interface, firewall zone and dhcp section
-	qDevSection   = "netgrip_quarantine_dev"
-	qZoneSection  = "netgrip_quarantine_zone"
-	qRuleDHCP     = "netgrip_quarantine_dhcp"
-	qRuleDNS      = "netgrip_quarantine_dns"
-	qRuleNTP      = "netgrip_quarantine_ntp"
-	qResolverPfx  = "netgrip_quarantine_resolver_"
-	qUplinkPfx    = "netgrip_quarantine_uplink_"
-	qWifiMarker   = "netgrip_quarantine_network" // wifi-iface option: the SSID's own network
+	qNet         = "netgrip_quarantine" // network interface, firewall zone and dhcp section
+	qDevSection  = "netgrip_quarantine_dev"
+	qZoneSection = "netgrip_quarantine_zone"
+	qRuleDHCP    = "netgrip_quarantine_dhcp"
+	qRuleDNS     = "netgrip_quarantine_dns"
+	qRuleNTP     = "netgrip_quarantine_ntp"
+	qResolverPfx = "netgrip_quarantine_resolver_"
+	qUplinkPfx   = "netgrip_quarantine_uplink_"
+	qWifiMarker  = "netgrip_quarantine_network" // wifi-iface option: the SSID's own network
+	// qOKCMarker holds the SSID's own okc setting ("-" for unset) while the
+	// layer turns okc off: with okc on, hostapd caches WPA3 sessions, and a
+	// device resuming one keeps the network it had (an approved device
+	// stays in quarantine, a revoked one stays on the SSID's network).
+	qOKCMarker    = "netgrip_quarantine_okc"
 	qVlanPfx      = "netgrip_quarantine_vlan_"
 	qStaPfx       = "netgrip_quarantine_sta_"
 	qVlanName     = "ngq" // suffix of hostapd's per-VLAN netdev: <ifname>.ngq
@@ -545,6 +550,10 @@ func qWifiOpsFor(v qWifiView, p qWifiPlan) qOps {
 			ensureOption(&o.wireless, s, key, "network", []string{qNet})
 			ensureOption(&o.wireless, s, key, "dynamic_vlan", []string{"1"})
 			ensureOption(&o.wireless, s, key, qWifiMarker, []string{c.Network})
+			if s.Option(qOKCMarker) == "" {
+				ensureOption(&o.wireless, s, key, qOKCMarker, []string{firstNonEmpty(s.Option("okc"), "-")})
+			}
+			ensureOption(&o.wireless, s, key, "okc", []string{"0"})
 			if len(o.wireless) > before {
 				markRadios(o.radios, s)
 			}
@@ -557,6 +566,15 @@ func qWifiOpsFor(v qWifiView, p qWifiPlan) qOps {
 				o.wireless = append(o.wireless, executor.Op{Kind: "uci_set", Args: []string{key + ".network", marker}})
 			}
 			o.wireless = append(o.wireless, executor.Op{Kind: "uci_delete", Args: []string{key + "." + qWifiMarker}})
+			switch prev := s.Option(qOKCMarker); prev {
+			case "":
+			case "-":
+				o.wireless = append(o.wireless, executor.Op{Kind: "uci_delete", Args: []string{key + ".okc"}},
+					executor.Op{Kind: "uci_delete", Args: []string{key + "." + qOKCMarker}})
+			default:
+				o.wireless = append(o.wireless, executor.Op{Kind: "uci_set", Args: []string{key + ".okc", prev}},
+					executor.Op{Kind: "uci_delete", Args: []string{key + "." + qOKCMarker}})
+			}
 			if s.Option("dynamic_vlan") != "" {
 				o.wireless = append(o.wireless, executor.Op{Kind: "uci_delete", Args: []string{key + ".dynamic_vlan"}})
 			}

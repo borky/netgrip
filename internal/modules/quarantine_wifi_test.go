@@ -221,6 +221,11 @@ func TestQWifiOpsBuildTheLayerAndSettle(t *testing.T) {
 			}
 		}
 	}
+	for _, sec := range []string{"home2", "home5"} {
+		if v.wireless[sec].Option("okc") != "0" || v.wireless[sec].Option(qOKCMarker) != "-" {
+			t.Fatalf("%s: session caching must be off while held (a resumed session keeps its old network): %+v", sec, v.wireless[sec].Options)
+		}
+	}
 	if v.wireless["guest"].Option("network") != "guests" || v.wireless["corp"].Option(qWifiMarker) != "" {
 		t.Fatal("an SSID outside the layer was touched")
 	}
@@ -297,7 +302,8 @@ func TestQWifiOffRestoresEverything(t *testing.T) {
 		t.Fatalf("a hand-made change was overwritten: %+v", v.wireless["home5"].Options)
 	}
 	for _, sec := range []string{"home2", "home5"} {
-		if v.wireless[sec].Option(qWifiMarker) != "" || v.wireless[sec].Option("dynamic_vlan") != "" {
+		if v.wireless[sec].Option(qWifiMarker) != "" || v.wireless[sec].Option("dynamic_vlan") != "" ||
+			v.wireless[sec].Option(qOKCMarker) != "" || v.wireless[sec].Option("okc") != "" {
 			t.Fatalf("%s keeps the layer's marks: %+v", sec, v.wireless[sec].Options)
 		}
 	}
@@ -1066,5 +1072,23 @@ func TestQuarantineWifiPollerRepairsAStuckSSID(t *testing.T) {
 	}
 	if bounces != 1 {
 		t.Fatalf("%d radio restarts in two polls, want exactly one", bounces)
+	}
+}
+
+func TestQWifiRestoresAnExplicitOKC(t *testing.T) {
+	v := qWifiTestView()
+	v.wireless["home2"].Options["okc"] = []string{"1"}
+	o := qWifiOpsFor(v, qTestPlan(v, []string{"02:00:00:00:00:0a"}))
+	qApplyOps(t, &v, append(append(append(o.network, o.dhcp...), o.firewall...), o.wireless...))
+	if v.wireless["home2"].Option("okc") != "0" || v.wireless["home2"].Option(qOKCMarker) != "1" {
+		t.Fatalf("held: %+v", v.wireless["home2"].Options)
+	}
+	if again := qWifiOpsFor(v, qTestPlan(v, []string{"02:00:00:00:00:0a"})); again.any() {
+		t.Fatalf("does not settle: %+v", again.wireless)
+	}
+	o = qWifiOpsFor(v, qWifiPlan{})
+	qApplyOps(t, &v, append(append(append(o.network, o.dhcp...), o.firewall...), o.wireless...))
+	if v.wireless["home2"].Option("okc") != "1" || v.wireless["home2"].Option(qOKCMarker) != "" {
+		t.Fatalf("restored: %+v", v.wireless["home2"].Options)
 	}
 }
