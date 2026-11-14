@@ -953,7 +953,10 @@ func qWifiApplyLocked(v qWifiView, p qWifiPlan) error {
 	// quarantine network alone and every other network lost DHCP).
 	var dhcpBefore qDnsmasqServing
 	var dhcpSnap string
-	if len(o.dhcp) > 0 {
+	// A teardown only removes the layer's own DHCP: nothing to guard, and a
+	// network briefly down must not keep the layer from going away.
+	guard := len(o.dhcp) > 0 && p.enabled
+	if guard {
 		dhcpBefore = qDnsmasqRuntimeFn()
 		snap, err := qSnapshotFn("dhcp")
 		if err != nil {
@@ -965,7 +968,7 @@ func qWifiApplyLocked(v qWifiView, p qWifiPlan) error {
 	if err := applyQWifiOps(ops); err != nil {
 		return err
 	}
-	if len(o.dhcp) > 0 {
+	if guard {
 		qDnsmasqWaitFn(started)
 		own := qOwnDHCP{bridge: firstNonEmpty(p.bridge, v.network[qDevSection].Option("name")), routerIP: firstNonEmpty(p.routerIP, v.network[qNet].Option("ipaddr"))}
 		why := qDHCPRegression(dhcpBefore, qDnsmasqRuntimeFn(), own)
@@ -1064,7 +1067,17 @@ var qUCIPendingFn = func(pkg string) (string, error) {
 type QPendingError struct{ Pkg, First string }
 
 func (e *QPendingError) Error() string {
-	return fmt.Sprintf("the %s config has uncommitted changes that NetGrip did not make (%s); nothing was changed. See them with `uci changes %s`, discard them with `uci revert %s` (or commit them if they are yours)", e.Pkg, e.First, e.Pkg, e.Pkg)
+	return fmt.Sprintf("the %s config has uncommitted changes from outside this action (for example %s); nothing was changed. See them with `uci changes %s`, discard them with `uci revert %s` (or commit them if they are yours)", e.Pkg, e.First, e.Pkg, e.Pkg)
+}
+
+// QuarantineWifiTouches reports whether a zone change may touch the Wi-Fi,
+// network and DHCP configs: only while the Wi-Fi layer is on, or has
+// leftovers to remove.
+func QuarantineWifiTouches() bool {
+	qMu.Lock()
+	defer qMu.Unlock()
+	st := loadQState()
+	return st.Wifi.Enabled || st.Wifi.Leftovers
 }
 
 // QuarantinePendingCheck refuses when any of the configs holds uncommitted
@@ -1092,40 +1105,49 @@ var qUCIRevertFn = func(pkg string) error {
 	return nil
 }
 
-// qApplyClean runs a batch of ops. If one fails midway, the changes it had
-// staged but not committed are reverted: they are NetGrip's own (the
-// configs were checked clean before), and left behind they would block
-// every later change, turning the quarantine off included.
+// qApplyClean runs a batch of ops one by one. If one fails, the changes
+// staged in configs not committed yet are reverted: they are NetGrip's own
+// (the configs were checked clean before), and left behind they would block
+// every later change, turning the quarantine off included. A config already
+// committed is left alone: anything pending there now is someone else's.
 func qApplyClean(ops []executor.Op) error {
-	err := executor.Apply(ops, nil)
-	if err == nil {
-		return nil
-	}
-	seen := map[string]bool{}
-	for _, op := range ops {
+	touched, committed := map[string]bool{}, map[string]bool{}
+	for i, op := range ops {
+		if err := executor.Run(op); err != nil {
+			for pkg := range touched {
+				if committed[pkg] {
+					continue
+				}
+				if pending, perr := qUCIPendingFn(pkg); perr == nil && pending != "" {
+					if rerr := qUCIRevertFn(pkg); rerr != nil {
+						log.Printf("netgrip: quarantine: reverting the half-applied %s changes: %v", pkg, rerr)
+					}
+				}
+			}
+			return fmt.Errorf("op %d (%s) failed: %w", i, op.Kind, err)
+		}
 		if !strings.HasPrefix(op.Kind, "uci_") || len(op.Args) == 0 {
 			continue
 		}
 		pkg, _, _ := strings.Cut(op.Args[0], ".")
-		if seen[pkg] {
-			continue
-		}
-		seen[pkg] = true
-		if pending, perr := qUCIPendingFn(pkg); perr == nil && pending != "" {
-			if rerr := qUCIRevertFn(pkg); rerr != nil {
-				log.Printf("netgrip: quarantine: reverting the half-applied %s changes: %v", pkg, rerr)
-			}
+		if op.Kind == "uci_commit" {
+			committed[pkg] = true
+		} else {
+			touched[pkg] = true
 		}
 	}
-	return err
+	return nil
 }
 
+// qFirstLine names the first pending change by its key only: its value
+// could be a password.
 func qFirstLine(s string) string {
 	line, _, _ := strings.Cut(s, "\n")
-	if len(line) > 80 {
-		line = line[:80] + "..."
+	key, _, _ := strings.Cut(line, "=")
+	if len(key) > 80 {
+		key = key[:80] + "..."
 	}
-	return line
+	return key
 }
 
 // qDnsmasqWaitFn waits (up to 5 s) until a dnsmasq generated config is
@@ -1396,6 +1418,14 @@ func QuarantineWifiEnable(requesterIP string, allowUnknown bool) (QuarantineProb
 	// The network, zone and SSIDs first, then phase 1's hooks including the
 	// new zone (its chains must exist before a jump into them).
 	if err := qWifiApplyLocked(v, p); err != nil {
+		var refused *QPendingError
+		if errors.As(err, &refused) {
+			// Refused before any change: returned as is, so the server
+			// knows nothing needs restoring.
+			st.Wifi = prev
+			_ = saveQState(st)
+			return probeQuarantineLocked(), refused
+		}
 		return fail("setting up the Wi-Fi layer failed", err)
 	}
 	fw, err := uciShowFn("firewall")
@@ -1579,7 +1609,7 @@ func qWifiFollowZonesLocked(st *qState) error {
 	if !covered {
 		// The new zones leave the layer nothing to hold: off now, with
 		// the reason, rather than on the next poll without one.
-		if err := qWifiApplyLocked(v, qWifiPlan{}); err != nil {
+		if err := qWifiApplyLocked(v, qWifiPlan{routerIP: st.Wifi.RouterIP}); err != nil {
 			return err
 		}
 		st.Wifi.Enabled = false
