@@ -177,7 +177,7 @@ func qApplyOps(t *testing.T, v *qWifiView, ops []executor.Op) {
 			} else if s, ok := m[sec]; ok {
 				delete(s.Options, opt)
 			}
-		case "uci_commit", "initd", "wifi_reload":
+		case "uci_commit", "initd", "wifi_reload", "wifi_bounce":
 		default:
 			t.Fatalf("unexpected op %+v", op)
 		}
@@ -395,6 +395,7 @@ type qWifiFake struct {
 	v      qWifiView
 	kicked []string
 	ops    [][]executor.Op
+	stuck  bool // the interface stays in its old bridge (reload instead of restart)
 }
 
 // newQWifiFake extends the phase 1 fake router with Wi-Fi, network and
@@ -436,6 +437,16 @@ func newQWifiFake(t *testing.T, f *qFake) *qWifiFake {
 	qKickFn = func(ifname, mac string) error { w.kicked = append(w.kicked, ifname+" "+mac); return nil }
 	qQuarantineFDBFn = func(string) map[string]bool { return map[string]bool{} }
 	qNetdevsFn = func() []string { return []string{"br-home", "eth9"} }
+	// The SSID's interface follows its config, as after a radio restart.
+	oMaster, oAttach := qMasterFn, qAttachTimeout
+	t.Cleanup(func() { qMasterFn, qAttachTimeout = oMaster, oAttach })
+	qAttachTimeout = 0
+	qMasterFn = func(ifname string) string {
+		if w.stuck || w.v.wireless["home2"].Option("network") != qNet {
+			return "br-home"
+		}
+		return "br-quarantine"
+	}
 	oRun, oSnap, oRestore := qDnsmasqRuntimeFn, qSnapshotFn, qRestoreFn
 	t.Cleanup(func() { qDnsmasqRuntimeFn, qSnapshotFn, qRestoreFn = oRun, oSnap, oRestore })
 	qDnsmasqRuntimeFn = func() qDnsmasqServing { return qServing(qDnsmasqHealthy) }
@@ -993,5 +1004,67 @@ func TestQuarantineWifiLeftoversAreRetried(t *testing.T) {
 	qPoll(time.Now().Add(time.Hour))
 	if loadQState().Wifi.Leftovers || w.v.wireless["home2"].Option("network") != "home" {
 		t.Fatalf("leftovers not removed: %+v %+v", loadQState().Wifi, w.v.wireless["home2"].Options)
+	}
+}
+
+func TestQuarantineWifiEnableRestartsTheRadioAndChecksTheBridge(t *testing.T) {
+	f := newQFake(t)
+	f.enable(t, "internet", "home")
+	w := newQWifiFake(t, f)
+	if _, err := QuarantineWifiEnable("192.0.2.10", false); err != nil {
+		t.Fatal(err)
+	}
+	bounced := false
+	for _, batch := range w.ops {
+		for _, op := range batch {
+			if op.Kind == "wifi_reload" && len(op.Args) == 1 && op.Args[0] == "radio9" {
+				t.Fatal("the SSID's move was only reloaded: its interface would stay in the old bridge")
+			}
+			bounced = bounced || (op.Kind == "wifi_bounce" && op.Args[0] == "radio9")
+		}
+	}
+	if !bounced {
+		t.Fatal("the radio was not restarted")
+	}
+}
+
+func TestQuarantineWifiEnableFailsWhenTheSSIDStaysInItsBridge(t *testing.T) {
+	f := newQFake(t)
+	f.enable(t, "internet", "home")
+	w := newQWifiFake(t, f)
+	w.stuck = true
+	if _, err := QuarantineWifiEnable("192.0.2.10", false); err == nil || !strings.Contains(err.Error(), "not on the quarantine network") {
+		t.Fatalf("enable reported success with the SSID in its old bridge: %v", err)
+	}
+}
+
+func TestQuarantineWifiPollerRepairsAStuckSSID(t *testing.T) {
+	f := newQFake(t)
+	f.enable(t, "internet", "home")
+	w := newQWifiFake(t, f)
+	if _, err := QuarantineWifiEnable("192.0.2.10", false); err != nil {
+		t.Fatal(err)
+	}
+	old := qBounced
+	qBounced = map[string]time.Time{}
+	t.Cleanup(func() { qBounced = old })
+	w.stuck = true // e.g. something reloaded the radio in place
+	if p := ProbeQuarantine(); len(p.Wifi.Issues) == 0 {
+		t.Fatal("a stuck SSID is not reported")
+	}
+	w.ops = nil
+	now := time.Now().Add(time.Hour)
+	qPoll(now)
+	qPoll(now.Add(qFullCheckEvery))
+	bounces := 0
+	for _, batch := range w.ops {
+		for _, op := range batch {
+			if op.Kind == "wifi_bounce" {
+				bounces++
+			}
+		}
+	}
+	if bounces != 1 {
+		t.Fatalf("%d radio restarts in two polls, want exactly one", bounces)
 	}
 }

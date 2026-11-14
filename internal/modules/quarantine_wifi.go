@@ -932,7 +932,15 @@ func qWifiApplyLocked(v qWifiView, p qWifiPlan) error {
 	}
 	sort.Strings(names)
 	for _, r := range names {
-		ops = append(ops, executor.Op{Kind: "wifi_reload", Args: []string{r}})
+		// Moving an SSID to another network needs the radio down and up: a
+		// reload reconfigures the BSS in place and leaves its interface in
+		// the bridge it was in (2026-11-14: IOT stayed in br-lan). Station
+		// entries alone only need hostapd to re-read its files.
+		kind := "wifi_reload"
+		if o.radios[r] {
+			kind = "wifi_bounce"
+		}
+		ops = append(ops, executor.Op{Kind: kind, Args: []string{r}})
 	}
 	// Committing a config also commits whatever else is pending in it:
 	// refuse to publish changes nobody here made.
@@ -987,6 +995,11 @@ func qWifiApplyLocked(v qWifiView, p qWifiPlan) error {
 				log.Printf("netgrip: quarantine: reloading dnsmasq: %v", err)
 			}
 			return &qDHCPError{why}
+		}
+	}
+	if p.enabled && len(o.radios) > 0 {
+		if bad := qWaitAttached(p, qAttachTimeout); len(bad) > 0 {
+			return fmt.Errorf("the Wi-Fi network %s is not on the quarantine network after the change (its interface is in another bridge)", qSSIDNames(bad))
 		}
 	}
 	// A restarted SSID reconnects everyone anyway; elsewhere only the
@@ -1297,6 +1310,63 @@ func qDHCPRegression(before, after qDnsmasqServing, own qOwnDHCP) string {
 // qKickDelay is how long a reload is given before stations are kicked.
 var qKickDelay = 3 * time.Second
 
+// qMasterFn is the bridge a network interface is a port of ("" if none).
+var qMasterFn = func(ifname string) string {
+	link, err := os.Readlink("/sys/class/net/" + ifname + "/master")
+	if err != nil {
+		return ""
+	}
+	return filepath.Base(link)
+}
+
+var qAttachTimeout = 30 * time.Second
+
+// qMisattached lists the covered SSIDs whose running interface is not a
+// port of the quarantine bridge: what the router actually does, not what
+// the config says.
+func qMisattached(p qWifiPlan) []QWifiSSID {
+	bss := qBSSFn()
+	var bad []QWifiSSID
+	for _, s := range p.ssids {
+		if !s.Covered {
+			continue
+		}
+		// Only a running interface can sit in the wrong bridge: one that
+		// is off (or waiting out a DFS check) is created on the right one
+		// when it comes up.
+		b, ok := bss[s.Section]
+		if ok && b.Ifname != "" && qMasterFn(b.Ifname) != p.bridge {
+			bad = append(bad, s)
+		}
+	}
+	return bad
+}
+
+func qSSIDNames(l []QWifiSSID) string {
+	names := make([]string, len(l))
+	for i, s := range l {
+		names[i] = firstNonEmpty(s.SSID, s.Section)
+	}
+	return strings.Join(names, ", ")
+}
+
+// qWaitAttached waits for the covered SSIDs to come up on the quarantine
+// bridge (a radio restart takes a few seconds) and returns those that
+// did not.
+func qWaitAttached(p qWifiPlan, timeout time.Duration) []QWifiSSID {
+	deadline := time.Now().Add(timeout)
+	for {
+		bad := qMisattached(p)
+		if len(bad) == 0 || !time.Now().Before(deadline) {
+			return bad
+		}
+		time.Sleep(time.Second)
+	}
+}
+
+// qBounced rate-limits the poller's repair of a misattached SSID.
+var qBounced = map[string]time.Time{}
+
 // qKicked remembers when a misplaced station was last disconnected.
 var qKicked = map[string]time.Time{}
 
@@ -1533,6 +1603,22 @@ func qWifiSyncLocked(st *qState, r qRouter, now time.Time) (QWifiProbe, error) {
 		}
 	}
 	p.ssids = held
+	defer func() {
+		if bad := qMisattached(p); len(bad) > 0 {
+			wp.Issues = append(wp.Issues, "not on the quarantine network yet: "+qSSIDNames(bad))
+			for _, s := range bad {
+				radio := v.wireless[s.Section].Option("device")
+				if radio == "" || now.Sub(qBounced[radio]) < qKickEvery {
+					continue
+				}
+				qBounced[radio] = now
+				log.Printf("netgrip: quarantine: %s is not on the quarantine network; restarting %s", qSSIDNames(bad), radio)
+				if err := applyQWifiOps([]executor.Op{{Kind: "wifi_bounce", Args: []string{radio}}}); err != nil {
+					log.Printf("netgrip: quarantine: restarting %s: %v", radio, err)
+				}
+			}
+		}
+	}()
 	if err := qWifiApplyLocked(v, p); err != nil {
 		var dhcpErr *qDHCPError
 		if errors.As(err, &dhcpErr) {
@@ -1657,6 +1743,17 @@ func qWifiProbeLocked(st *qState, r qRouter) QWifiProbe {
 	}
 	if len(dns) > 1 {
 		wp.Issues = append(wp.Issues, "the protected Wi-Fi networks hand out different DNS servers; the quarantine network uses those of the first one")
+	}
+	if s, ok := v.network[qDevSection]; ok {
+		held := qWifiPlan{bridge: s.Option("name")}
+		for _, x := range wp.SSIDs {
+			if x.Covered && x.Applied {
+				held.ssids = append(held.ssids, x)
+			}
+		}
+		if bad := qMisattached(held); len(bad) > 0 {
+			wp.Issues = append(wp.Issues, "the router has not moved "+qSSIDNames(bad)+" to the quarantine network yet: new devices there still land on its usual network (NetGrip restarts the radio to fix it)")
+		}
 	}
 	for _, s := range wp.SSIDs {
 		switch {
