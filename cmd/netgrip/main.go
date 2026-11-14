@@ -81,6 +81,9 @@ func main() {
 	// token ended up in clear on a TLS port.
 	modules.SetPanelPort(*port)
 	modules.SetPanelServesTLS(*useTLS)
+	// First: access points asking RADIUS cannot let anyone join until it
+	// answers, so it starts before anything slower.
+	modules.StartQuarantineRadius()
 	modules.StartHistoryCollector()
 	modules.StartMonitor()
 	modules.StartNetPulseAgent(version)

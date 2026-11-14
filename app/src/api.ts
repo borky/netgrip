@@ -999,6 +999,10 @@ const realApi = {
   quarantineForget: (mac: string) => postQ("/api/quarantine/forget", { mac }),
   quarantinePause: (minutes: number, kind: "learn" | "off") => postQ("/api/quarantine/pause", { minutes, kind }),
   quarantineResume: () => postQ("/api/quarantine/resume", {}),
+  quarantineRadius: (enabled: boolean, zones: string[]) => postQ("/api/quarantine/radius", { enabled, zones }),
+  quarantineRadiusSecret: () => request<{ secret: string }>("/api/quarantine/radius/secret"),
+  quarantineRadiusNewSecret: () =>
+    request<{ secret: string }>("/api/quarantine/radius/secret", { method: "POST", body: "{}" }),
   quarantineWifi: (enabled: boolean, allowNoRequester?: boolean) =>
     postQ("/api/quarantine/wifi", { enabled, allow_no_requester: allowNoRequester }),
   quotas: () =>

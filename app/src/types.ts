@@ -1788,7 +1788,9 @@ export interface QDevice {
   first_seen?: number;
   last_seen?: number;
   at?: number;
-  via?: "baseline" | "manual" | "pause" | "panel";
+  via?: "baseline" | "manual" | "pause" | "panel" | "mlo";
+  /** An approved MAC one apart in the last octet: probably the same Wi-Fi 7 device. */
+  pair_of?: string;
 }
 
 export interface QPause {
@@ -1813,6 +1815,30 @@ export interface QuarantineProbe {
   issues: string[];
   /** The Wi-Fi layer (phase 2). */
   wifi: QWifiProbe;
+  /** The access-point layer (phase 3, RADIUS MAC authentication). */
+  radius: QRadiusProbe;
+}
+
+export interface QRadiusStats {
+  listening: boolean;
+  error?: string;
+  last_request?: number;
+  accepted: number;
+  rejected: number;
+  bad_auth: number;
+  /** Access point addresses seen. */
+  clients: string[];
+  /** SSIDs seen in requests. */
+  ssids: string[];
+}
+
+export interface QRadiusProbe {
+  enabled: boolean;
+  zones: string[];
+  port: number;
+  /** The router's addresses in those zones, for the access points. */
+  addresses: string[];
+  stats: QRadiusStats;
 }
 
 /** One of the router's own SSIDs, as the Wi-Fi layer sees it. */

@@ -174,6 +174,10 @@ const demoQ: { state: QuarantineProbe; you: string } = {
       { name: "wan", networks: ["wan", "wan6"], wan: true, suggested: false, protected: false },
     ],
     wan: ["eth1"], approved: [], pending: [], pause: {}, issues: [],
+    radius: {
+      enabled: false, zones: [], port: 1812, addresses: [],
+      stats: { listening: false, accepted: 0, rejected: 0, bad_auth: 0, clients: [], ssids: [] },
+    },
     wifi: {
       enabled: false, quarantined: 0, issues: [],
       ssids: [
@@ -993,6 +997,16 @@ export const demoApi: typeof api = {
   quarantineForget: async (mac) => { demoQ.state.pending = demoQ.state.pending.filter((p) => p.mac !== mac); return qResult(); },
   quarantinePause: async (minutes, kind) => { demoQ.state.pause = { until: Math.floor(Date.now() / 1000) + minutes * 60, kind }; return qResult(); },
   quarantineResume: async () => { demoQ.state.pause = {}; return qResult(); },
+  quarantineRadius: async (enabled, zones) => {
+    const r = demoQ.state.radius;
+    r.enabled = enabled;
+    r.zones = enabled ? zones : [];
+    r.addresses = enabled ? ["192.0.2.1"] : [];
+    r.stats = { ...r.stats, listening: enabled };
+    return qResult();
+  },
+  quarantineRadiusSecret: () => get({ secret: "dummy-demo-secret-0000" }),
+  quarantineRadiusNewSecret: () => get({ secret: "dummy-demo-secret-1111" }),
   quarantineWifi: async (enabled, _allow) => {
     const w = demoQ.state.wifi;
     w.enabled = enabled;
