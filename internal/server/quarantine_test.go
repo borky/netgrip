@@ -2,6 +2,7 @@ package server
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -44,11 +45,50 @@ func TestRunRiskyDoesNotRevertARefusal(t *testing.T) {
 	if reverted {
 		t.Fatal("a refusal was reverted")
 	}
-	// Any other failure is.
+	// A refusal wrapped by a later step came after something changed.
+	(&Server{}).runRisky(httptest.NewRecorder(), qFirewallConfigs, nil, func() (modules.QuarantineProbe, error) {
+		return modules.QuarantineProbe{}, fmt.Errorf("hooking failed: %w", &modules.QPendingError{Pkg: "firewall", First: "x"})
+	})
+	if !reverted {
+		t.Fatal("a refusal after changes were made was not reverted")
+	}
+	reverted = false
+	// Any other failure is reverted too.
 	(&Server{}).runRisky(httptest.NewRecorder(), qFirewallConfigs, nil, func() (modules.QuarantineProbe, error) {
 		return modules.QuarantineProbe{}, errors.New("boom")
 	})
 	if !reverted {
 		t.Fatal("a failed change was not reverted")
+	}
+}
+
+// Pending changes in an optional config (unrelated Wi-Fi edits while only
+// the zones change): not refused, and not snapshotted.
+func TestRunRiskyLeavesDirtyOptionalConfigsOut(t *testing.T) {
+	oPending, oSnap := quarantinePendingCheck, snapshotFn
+	t.Cleanup(func() { quarantinePendingCheck, snapshotFn = oPending, oSnap })
+	quarantinePendingCheck = func(pkgs []string) error {
+		for _, p := range pkgs {
+			if p == "wireless" {
+				return &modules.QPendingError{Pkg: p, First: "x"}
+			}
+		}
+		return nil
+	}
+	var snapped []string
+	snapshotFn = func(c string) (string, error) { snapped = append(snapped, c); return "", nil }
+	applied := false
+	rec := httptest.NewRecorder()
+	(&Server{}).runRisky(rec, qFirewallConfigs, qWifiOptional, func() (modules.QuarantineProbe, error) {
+		applied = true
+		return modules.QuarantineProbe{}, errors.New("boom")
+	})
+	if !applied {
+		t.Fatal("refused over an optional config")
+	}
+	for _, c := range snapped {
+		if c == "wireless" {
+			t.Fatal("a config with pending changes was snapshotted")
+		}
 	}
 }

@@ -963,15 +963,17 @@ func TestQApplyCleanRevertsItsOwnHalfAppliedChanges(t *testing.T) {
 	var reverted []string
 	qUCIRevertFn = func(pkg string) error { reverted = append(reverted, pkg); return nil }
 	// An op that fails (an invalid key: refused before uci runs).
+	// Only ops validation refuses run here, so no real uci is touched even
+	// where one is installed. A config this batch never touched is not
+	// reverted, whatever is pending in it.
 	err := qApplyClean([]executor.Op{
-		{Kind: "uci_set", Args: []string{"dhcp.netgrip_quarantine", "dhcp"}},
-		{Kind: "uci_set", Args: []string{"wireless.bad key", "x"}},
+		{Kind: "uci_set", Args: []string{"dhcp.bad key", "x"}},
 	})
 	if err == nil {
-		t.Skip("the executor accepted the op here; nothing to test")
+		t.Fatal("an invalid op passed")
 	}
-	if strings.Join(reverted, ",") != "dhcp" {
-		t.Fatalf("reverted %v, want the config with staged changes", reverted)
+	if len(reverted) != 0 {
+		t.Fatalf("reverted %v although this batch had staged nothing", reverted)
 	}
 }
 

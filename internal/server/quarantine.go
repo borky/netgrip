@@ -2,7 +2,6 @@ package server
 
 import (
 	"encoding/json"
-	"errors"
 	"log"
 	"net"
 	"net/http"
@@ -37,6 +36,9 @@ var quarantineKeepCheck = modules.QuarantineKeepCheck
 
 // quarantinePendingCheck is a seam for the pending-changes refusal.
 var quarantinePendingCheck = modules.QuarantinePendingCheck
+
+// quarantineWifiTouches is a seam: does a zone change involve the Wi-Fi layer.
+var quarantineWifiTouches = modules.QuarantineWifiTouches
 
 // requesterIP is the panel user's address, IPv4 or IPv6.
 func requesterIP(r *http.Request) string {
@@ -85,18 +87,30 @@ func (s *Server) runRisky(w http.ResponseWriter, required, optional []string, ap
 	defer s.riskyMu.Unlock()
 	// Before any snapshot: a snapshot (uci export) carries uncommitted
 	// changes, and restoring it after a failure would commit them.
-	if err := quarantinePendingCheck(append(append([]string{}, required...), optional...)); err != nil {
+	if err := quarantinePendingCheck(required); err != nil {
 		writeError(w, http.StatusConflict, err.Error())
 		return
 	}
-	snapshots, err := snapshotForConfirm(required, optional)
+	// An optional config with pending changes is left out of the
+	// snapshots rather than refused: this change may not touch it (the
+	// module refuses by itself if it would), and restoring a snapshot of it
+	// would commit those changes.
+	var clean []string
+	for _, c := range optional {
+		if quarantinePendingCheck([]string{c}) == nil {
+			clean = append(clean, c)
+		}
+	}
+	snapshots, err := snapshotForConfirm(required, clean)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	probe, err := apply()
-	var refused *modules.QPendingError
-	if err != nil && !errors.As(err, &refused) {
+	// Only a refusal returned as is (not wrapped) means nothing changed: a
+	// wrapped one came after a step that did change something.
+	_, refused := err.(*modules.QPendingError)
+	if err != nil && !refused {
 		// The module undoes what it can; restoring the snapshot as well
 		// covers a failed undo (the configs back to before the change).
 		// A refusal changed nothing, so there is nothing to restore.
@@ -151,7 +165,13 @@ func (s *Server) handleQuarantineZones(w http.ResponseWriter, r *http.Request) {
 	}
 	ip := requesterIP(r)
 	// With the Wi-Fi layer on, the SSIDs follow the zones.
-	s.runRisky(w, qFirewallConfigs, qWifiOptional, func() (modules.QuarantineProbe, error) {
+	// With the Wi-Fi layer on, the SSIDs follow the zones: those configs
+	// join the window. Otherwise they are not this change's to snapshot.
+	var optional []string
+	if quarantineWifiTouches() {
+		optional = qWifiOptional
+	}
+	s.runRisky(w, qFirewallConfigs, optional, func() (modules.QuarantineProbe, error) {
 		return modules.QuarantineSetZones(req.Zones, ip, req.AllowNoRequester)
 	})
 }
