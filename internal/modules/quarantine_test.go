@@ -1,7 +1,9 @@
 package modules
 
 import (
+	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -331,13 +333,13 @@ func newQFake(t *testing.T) *qFake {
 	oldDir, oldState := quarantineDir, qStatePath
 	quarantineDir = filepath.Join(dir, "q")
 	qStatePath = filepath.Join(dir, "quarantine.json")
-	oldMissing, oldLight := qMissingPolls, qLastLightSave
+	oldMissing, oldFlush := qMissingPolls, qLastFlush
 	oldBudget, oldUsed, oldSum := qBudgetStart, qBudgetUsed, qBudgetSummaries
-	qMissingPolls, qLastLightSave = 0, time.Time{}
+	qMissingPolls, qLastFlush = 0, time.Time{}
 	qBudgetStart, qBudgetUsed, qBudgetSummaries = time.Time{}, 0, 0
 	t.Cleanup(func() {
 		quarantineDir, qStatePath = oldDir, oldState
-		qMissingPolls, qLastLightSave = oldMissing, oldLight
+		qMissingPolls, qLastFlush = oldMissing, oldFlush
 		qBudgetStart, qBudgetUsed, qBudgetSummaries = oldBudget, oldUsed, oldSum
 	})
 
@@ -662,7 +664,8 @@ func TestQPollRecordsAndNotifiesOnceEvenAfterForget(t *testing.T) {
 		t.Fatal("an approved device was listed as pending")
 	}
 	p := st.Pending["02:00:00:00:00:99"]
-	if p.IP != "192.0.2.99" || p.LastSeen != now.Unix()-600 {
+	// The second poll's set entry is 5 s fresher: last seen is now-595.
+	if p.IP != "192.0.2.99" || p.LastSeen != now.Unix()+5-600 {
 		t.Fatalf("pending: %+v (last seen must come from the set's expiry)", p)
 	}
 	qWaitFor(t, func() bool { return f.notifiedCount() >= 1 })
@@ -730,10 +733,60 @@ func TestQPollSparesTheFlash(t *testing.T) {
 	if !after.ModTime().Equal(before.ModTime()) {
 		t.Fatal("a last-seen refresh was written straight away")
 	}
-	qPoll(now.Add(qLightSaveEvery + time.Minute))
+	qPoll(now.Add(qFlushEvery + time.Minute))
 	later, _ := os.Stat(qStatePath)
 	if later.ModTime().Equal(before.ModTime()) {
 		t.Fatal("last-seen refreshes are never written")
+	}
+}
+
+func TestQPollMACFloodSparesTheFlash(t *testing.T) {
+	f := newQFake(t)
+	f.enable(t, "internet", "home")
+	now := time.Now()
+	qPoll(now)
+	base, _ := os.Stat(qStatePath)
+	writes := 0
+	last := base.ModTime()
+	for i := 0; i < 60; i++ { // five minutes of a new random MAC every poll
+		time.Sleep(2 * time.Millisecond)
+		f.seen = append(f.seen, qElem{Val: fmt.Sprintf("02:00:00:00:%02x:%02x", 0x40+i/256, i%256), Expires: 3600})
+		qPoll(now.Add(time.Duration(i+1) * qPollInterval))
+		if st, _ := os.Stat(qStatePath); !st.ModTime().Equal(last) {
+			writes++
+			last = st.ModTime()
+		}
+	}
+	if writes > 1 {
+		t.Fatalf("%d flash writes in five minutes of new MACs", writes)
+	}
+	// The panel still sees every device at once.
+	if p := ProbeQuarantine(); len(p.Pending) != 60 {
+		t.Fatalf("pending in memory: %d, want 60", len(p.Pending))
+	}
+	// And they reach the flash once the interval has passed.
+	qPoll(now.Add(qFlushEvery + 2*time.Minute))
+	raw, _ := os.ReadFile(qStatePath)
+	var st qState
+	_ = json.Unmarshal(raw, &st)
+	if len(st.Pending) != 60 {
+		t.Fatalf("pending on flash: %d, want 60", len(st.Pending))
+	}
+}
+
+func TestQLearnedApprovalWrittenAtOnce(t *testing.T) {
+	f := newQFake(t)
+	f.enable(t, "nothing", "home")
+	if _, err := QuarantinePause(30, "learn"); err != nil {
+		t.Fatal(err)
+	}
+	f.seen = []qElem{{Val: "02:00:00:00:00:77"}}
+	qPoll(time.Now())
+	raw, _ := os.ReadFile(qStatePath)
+	var st qState
+	_ = json.Unmarshal(raw, &st)
+	if _, ok := st.Approved["02:00:00:00:00:77"]; !ok {
+		t.Fatal("a learned approval was not written to the flash at once")
 	}
 }
 
