@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { Check, Lock, Pause, Play, ShieldCheck, ShieldOff, Trash2, UserCheck, UserX, Wifi } from "lucide-react";
+import { Check, Lock, Pause, Play, Radio, ShieldCheck, ShieldOff, Trash2, UserCheck, UserX, Wifi } from "lucide-react";
 import { api } from "../api";
 import type { QCandidate, QDevice, QResult, QuarantineProbe } from "../types";
 import { Banner, Button, Card, ConfirmDialog, EmptyState, Input, Modal, Pill, SegmentedControl, SkeletonRows, useToast } from "../components/ui";
@@ -136,6 +136,7 @@ export function QuarantinePage() {
           </Card>
 
           <WifiLayerCard probe={probe} busy={busy} onToggle={setWifiConfirm} />
+          <RadiusCard probe={probe} busy={busy} run={run} />
 
           <Card title={t("quarantine.pauseTitle")} icon={Pause}>
             {pauseActive ? (
@@ -181,6 +182,11 @@ export function QuarantinePage() {
                       <div className="font-medium truncate">{label(d)}</div>
                       <div className="text-small text-muted mono">{d.mac}{d.ip ? ` · ${d.ip}` : ""}</div>
                       {d.last_seen ? <div className="text-small text-muted">{t("quarantine.lastSeen", { when: fmtDate(d.last_seen) })}</div> : null}
+                      {d.pair_of ? (
+                        <div className="text-small text-accent">
+                          {t("quarantine.pairOf", { name: (() => { const a = probe.approved.find((x) => x.mac === d.pair_of); return a ? label(a) : d.pair_of; })() })}
+                        </div>
+                      ) : null}
                     </div>
                     <div className="w-48">
                       <Input placeholder={t("quarantine.namePlaceholder")} value={names[d.mac] ?? ""} maxLength={64}
@@ -298,6 +304,87 @@ function WifiLayerCard({ probe, busy, onToggle }: { probe: QuarantineProbe; busy
             : <Button icon={Wifi} disabled={busy || covered.length === 0} onClick={() => onToggle("on")}>{t("quarantine.wifiTurnOn")}</Button>}
         </div>
       </div>
+    </Card>
+  );
+}
+
+/** The access-point layer: a RADIUS server for MAC authentication. Turning
+ * it on only admits RADIUS and starts answering; joining changes once the
+ * access point is set to ask, which the user does there. */
+function RadiusCard({ probe, busy, run }: { probe: QuarantineProbe; busy: boolean; run: (fn: () => Promise<QResult>, ok?: string) => Promise<boolean> }) {
+  const { t } = useTranslation();
+  const { push } = useToast();
+  const r = probe.radius;
+  const zones = probe.zones.filter((z) => !z.wan);
+  const [pick, setPick] = useState<Set<string>>(new Set());
+  const [secret, setSecret] = useState("");
+  const [confirmOff, setConfirmOff] = useState(false);
+  const [confirmNew, setConfirmNew] = useState(false);
+  const fail = (e: unknown) => push({ tone: "danger", text: t("quarantine.actionFailed"), detail: e instanceof Error ? e.message : String(e) });
+  const show = async () => { try { setSecret((await api.quarantineRadiusSecret()).secret); } catch (e) { fail(e); } };
+  const renew = async () => { try { setSecret((await api.quarantineRadiusNewSecret()).secret); } catch (e) { fail(e); } finally { setConfirmNew(false); } };
+  const s = r.stats;
+  return (
+    <Card title={t("quarantine.radiusTitle")} icon={Radio}
+      action={r.enabled
+        ? (s.listening ? <Pill tone="ok" live>{t("quarantine.radiusListening")}</Pill> : <Pill tone="danger">{t("quarantine.radiusNotListening")}</Pill>)
+        : <Pill>{t("quarantine.wifiOff")}</Pill>}>
+      <div className="space-y-3">
+        <p className="text-small text-muted">{t("quarantine.radiusHelp")}</p>
+        {!r.enabled ? (
+          <>
+            <div className="text-small font-medium">{t("quarantine.radiusZones")}</div>
+            <div className="flex flex-wrap gap-3">
+              {zones.map((z) => (
+                <label key={z.name} className="flex items-center gap-2 text-small">
+                  <input type="checkbox" checked={pick.has(z.name)}
+                    onChange={() => setPick((p) => { const n = new Set(p); if (n.has(z.name)) n.delete(z.name); else n.add(z.name); return n; })} />
+                  {z.name}
+                </label>
+              ))}
+            </div>
+            <p className="text-small text-muted">{t("quarantine.radiusOutage")}</p>
+            <div className="flex justify-end">
+              <Button icon={Radio} disabled={busy || pick.size === 0}
+                onClick={() => run(() => api.quarantineRadius(true, [...pick]), t("quarantine.radiusOnOk"))}>{t("quarantine.radiusTurnOn")}</Button>
+            </div>
+          </>
+        ) : (
+          <>
+            {s.error && <Banner tone="danger">{s.error}</Banner>}
+            {s.bad_auth > 0 && <Banner tone="warn">{t("quarantine.radiusBadAuth", { count: s.bad_auth })}</Banner>}
+            <div className="text-small space-y-1">
+              {s.last_request
+                ? <div>{t("quarantine.radiusLast", { when: fmtDate(s.last_request) })} · {t("quarantine.radiusStats", { accepted: s.accepted, rejected: s.rejected })}</div>
+                : <div className="text-muted">{t("quarantine.radiusNoRequest")}</div>}
+              {s.clients.length > 0 && <div className="text-muted">{t("quarantine.radiusSeen", { clients: s.clients.join(", "), ssids: s.ssids.join(", ") || "-" })}</div>}
+            </div>
+            <div className="rounded border border-border p-3 space-y-2">
+              <div className="text-small font-medium">{t("quarantine.radiusSetup")}</div>
+              <div className="grid grid-cols-[auto,1fr] gap-x-3 gap-y-1 text-small">
+                <span className="text-muted">{t("quarantine.radiusServer")}</span><span className="mono">{r.addresses.join(", ") || "-"}</span>
+                <span className="text-muted">{t("quarantine.radiusPort")}</span><span className="mono">{r.port}</span>
+                <span className="text-muted">{t("quarantine.radiusSecret")}</span>
+                <span className="flex flex-wrap items-center gap-2">
+                  {secret ? <span className="mono select-all">{secret}</span> : <Button size="sm" variant="secondary" onClick={show}>{t("quarantine.radiusShowSecret")}</Button>}
+                  <Button size="sm" variant="ghost" onClick={() => setConfirmNew(true)}>{t("quarantine.radiusNewSecret")}</Button>
+                </span>
+              </div>
+              <p className="text-small text-muted">{t("quarantine.radiusStepsUnifi")}</p>
+            </div>
+            <p className="text-small text-muted">{t("quarantine.radiusOutage")}</p>
+            <div className="flex justify-end">
+              <Button variant="secondary" disabled={busy} onClick={() => setConfirmOff(true)}>{t("quarantine.radiusTurnOff")}</Button>
+            </div>
+          </>
+        )}
+      </div>
+      <ConfirmDialog open={confirmOff} onClose={() => setConfirmOff(false)} busy={busy}
+        title={t("quarantine.radiusOffTitle")} consequence={t("quarantine.radiusOffBody")} confirmLabel={t("quarantine.radiusTurnOff")}
+        onConfirm={async () => { await run(() => api.quarantineRadius(false, []), t("quarantine.radiusOffOk")); setConfirmOff(false); setSecret(""); }} />
+      <ConfirmDialog open={confirmNew} onClose={() => setConfirmNew(false)} busy={busy}
+        title={t("quarantine.radiusNewSecretTitle")} consequence={t("quarantine.radiusNewSecretBody")} confirmLabel={t("quarantine.radiusNewSecret")}
+        onConfirm={renew} />
     </Card>
   );
 }

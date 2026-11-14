@@ -29,6 +29,53 @@ func (s *Server) registerQuarantineRoutes() {
 	s.mux.HandleFunc("POST /api/quarantine/pause", s.requireAuth(s.handleQuarantinePause))
 	s.mux.HandleFunc("POST /api/quarantine/resume", s.requireAuth(s.handleQuarantineResume))
 	s.mux.HandleFunc("POST /api/quarantine/wifi", s.requireAuth(s.handleQuarantineWifi))
+	s.mux.HandleFunc("POST /api/quarantine/radius", s.requireAuth(s.handleQuarantineRadius))
+	s.mux.HandleFunc("GET /api/quarantine/radius/secret", s.requireAuth(s.handleQuarantineRadiusSecret))
+	s.mux.HandleFunc("POST /api/quarantine/radius/secret", s.requireAuth(s.handleQuarantineRadiusNewSecret))
+}
+
+// handleQuarantineRadius turns the RADIUS layer on (for access points in
+// the given zones) or off. On only admits RADIUS through the firewall and
+// starts answering; joining changes once the access point is set to ask.
+func (s *Server) handleQuarantineRadius(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Enabled bool     `json:"enabled"`
+		Zones   []string `json:"zones"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	s.riskyMu.Lock()
+	defer s.riskyMu.Unlock()
+	var p modules.QuarantineProbe
+	var err error
+	if req.Enabled {
+		p, err = modules.QuarantineRadiusEnable(req.Zones)
+	} else {
+		p, err = modules.QuarantineRadiusDisable()
+	}
+	writeModuleResult(w, p, false, err)
+}
+
+// The secret is shown on request only, to paste into the access point.
+func (s *Server) handleQuarantineRadiusSecret(w http.ResponseWriter, _ *http.Request) {
+	secret, err := modules.QuarantineRadiusSecret()
+	if err != nil {
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, map[string]string{"secret": secret})
+}
+
+func (s *Server) handleQuarantineRadiusNewSecret(w http.ResponseWriter, _ *http.Request) {
+	secret, err := modules.QuarantineRadiusNewSecret()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, map[string]string{"secret": secret})
 }
 
 // quarantineKeepCheck is a seam so confirm tests do not touch nft.

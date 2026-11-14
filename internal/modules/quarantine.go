@@ -100,6 +100,9 @@ type QPending struct {
 	LastSeen  int64  `json:"last_seen"`
 	IP        string `json:"ip,omitempty"`
 	Hostname  string `json:"hostname,omitempty"`
+	// PairOf: an approved MAC this one differs from only by one in the last
+	// octet, probably the same Wi-Fi 7 device's other address.
+	PairOf string `json:"pair_of,omitempty"`
 }
 
 // QPause is a time-limited pause. Kind "learn": still enforced, but new
@@ -126,6 +129,8 @@ type qState struct {
 	Notified map[string]int64 `json:"notified,omitempty"`
 	// Wifi is the Wi-Fi layer (phase 2).
 	Wifi QWifiState `json:"wifi"`
+	// Radius is the UniFi layer (phase 3).
+	Radius QRadiusState `json:"radius"`
 }
 
 // The state is kept in memory as its JSON (a fresh copy per load, so a
@@ -183,6 +188,7 @@ func saveQState(st *qState) error {
 		return err
 	}
 	qCacheRaw, qCachePath, qDirty, qLastFlush = raw, qStatePath, false, time.Now()
+	qRadiusRefresh(st)
 	return nil
 }
 
@@ -195,6 +201,7 @@ func saveQStateLazy(st *qState) {
 	qCacheMu.Lock()
 	qCacheRaw, qCachePath, qDirty = raw, qStatePath, true
 	qCacheMu.Unlock()
+	qRadiusRefresh(st)
 }
 
 // flushQState writes lazily saved state once qFlushEvery has passed since
@@ -727,23 +734,36 @@ type QDevice struct {
 	LastSeen  int64  `json:"last_seen,omitempty"`
 	At        int64  `json:"at,omitempty"`
 	Via       string `json:"via,omitempty"`
+	PairOf    string `json:"pair_of,omitempty"`
 }
 
 // QuarantineProbe is the API view. Enabled is the intent; Active and the
 // zones' Protected flags are what the firewall actually runs.
 type QuarantineProbe struct {
-	Applicable bool       `json:"applicable"`
-	Reason     string     `json:"reason,omitempty"`
-	Enabled    bool       `json:"enabled"`
-	Active     bool       `json:"active"`
-	Mode       string     `json:"mode"`
-	Zones      []QZone    `json:"zones"`
-	Wan        []string   `json:"wan"`
-	Approved   []QDevice  `json:"approved"`
-	Pending    []QDevice  `json:"pending"`
-	Pause      QPause     `json:"pause"`
-	Issues     []string   `json:"issues"`
-	Wifi       QWifiProbe `json:"wifi"`
+	Applicable bool         `json:"applicable"`
+	Reason     string       `json:"reason,omitempty"`
+	Enabled    bool         `json:"enabled"`
+	Active     bool         `json:"active"`
+	Mode       string       `json:"mode"`
+	Zones      []QZone      `json:"zones"`
+	Wan        []string     `json:"wan"`
+	Approved   []QDevice    `json:"approved"`
+	Pending    []QDevice    `json:"pending"`
+	Pause      QPause       `json:"pause"`
+	Issues     []string     `json:"issues"`
+	Wifi       QWifiProbe   `json:"wifi"`
+	Radius     QRadiusProbe `json:"radius"`
+}
+
+// QRadiusProbe is the RADIUS layer for the panel.
+type QRadiusProbe struct {
+	Enabled bool     `json:"enabled"`
+	Zones   []string `json:"zones"`
+	Port    int      `json:"port"`
+	// Addresses: the router's IPv4 addresses in those zones, for the
+	// access points' RADIUS profile.
+	Addresses []string     `json:"addresses"`
+	Stats     QRadiusStats `json:"stats"`
 }
 
 // qApplicable: a gateway with firewall4 and nft.
@@ -780,6 +800,8 @@ func probeQuarantineLocked() QuarantineProbe {
 		Zones: []QZone{}, Wan: []string{}, Approved: []QDevice{}, Pending: []QDevice{},
 		Pause: st.Pause, Issues: []string{},
 		Wifi: QWifiProbe{SSIDs: []QWifiSSID{}, Issues: []string{}},
+		Radius: QRadiusProbe{Enabled: st.Radius.Enabled, Zones: append([]string{}, st.Radius.Zones...), Port: qRadiusPort,
+			Addresses: []string{}, Stats: QuarantineRadiusStats()},
 	}
 	if !ok && !st.Enabled {
 		return p
@@ -797,6 +819,7 @@ func probeQuarantineLocked() QuarantineProbe {
 	p.Wan = append([]string{}, r.wan...)
 	if err == nil {
 		p.Wifi = qWifiProbeLocked(st, r)
+		p.Radius.Addresses = qZoneAddresses(r.zones, st.Radius.Zones)
 	}
 	p.Active = len(r.sections) > 0 && qLiveChainsPresent()
 	if !p.Pause.active(time.Now()) {
@@ -821,6 +844,7 @@ func probeQuarantineLocked() QuarantineProbe {
 		if d.Hostname == "" {
 			d.Hostname = pe.Hostname
 		}
+		d.PairOf = pe.PairOf
 		p.Pending = append(p.Pending, d)
 	}
 	sort.Slice(p.Approved, func(i, j int) bool { return p.Approved[i].MAC < p.Approved[j].MAC })
@@ -1802,6 +1826,14 @@ func qFullCheckLocked(st *qState, now time.Time) (r qRouter, live, ok bool) {
 // urgent: a device was approved (written at once); routine: only the
 // pending list or the announcements changed.
 func qRecordSeen(st *qState, seen []qElem, now time.Time) (urgent, routine bool) {
+	return qRecordSeenFrom(st, seen, now, true)
+}
+
+// qRecordSeenFrom does qRecordSeen. dataPlane: the MACs were seen in
+// traffic, so a Wi-Fi 7 data address can be paired with a RADIUS address
+// just accepted. Never for a RADIUS request itself: a join attempt one
+// apart from an accepted device must still wait for approval.
+func qRecordSeenFrom(st *qState, seen []qElem, now time.Time, dataPlane bool) (urgent, routine bool) {
 	learning := st.Pause.active(now) && st.Pause.Kind == "learn"
 	// During a pause "off" nothing is refused: record, but announce only
 	// once enforcement is back (the poller then sees them again).
@@ -1821,6 +1853,15 @@ func qRecordSeen(st *qState, seen []qElem, now time.Time) (urgent, routine bool)
 			continue
 		}
 		_, waiting := st.Pending[mac]
+		// A Wi-Fi 7 device asks RADIUS with one address and sends data
+		// with another (E1): the data address of a device RADIUS just let
+		// in is approved with it.
+		if x := qMLOFromRadius(mac, now, st); dataPlane && x != "" {
+			st.Approved[mac] = QApproved{At: now.Unix(), Via: "mlo", Name: st.Approved[x].Name}
+			delete(st.Pending, mac)
+			urgent = true
+			continue
+		}
 		if learning && !waiting && !excluded[mac] && len(st.Pause.Learned) < qMaxLearned {
 			st.Approved[mac] = QApproved{At: now.Unix(), Via: "pause"}
 			st.Pause.Learned = append(st.Pause.Learned, mac)
