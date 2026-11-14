@@ -69,6 +69,12 @@ func parseUCIShow(show, pkg string) map[string]uciSection {
 // match that shape is returned as one raw element.
 func parseUCIValues(val string) []string {
 	val = strings.TrimSpace(val)
+	if val == "" {
+		// uci show prints an empty list as `key=` with nothing after it:
+		// no values, not one empty value (2026-11-14: read as one, it made
+		// an unbound dnsmasq look bound to a list of interfaces).
+		return nil
+	}
 	if !strings.HasPrefix(val, "'") || !strings.HasSuffix(val, "'") {
 		return []string{val}
 	}

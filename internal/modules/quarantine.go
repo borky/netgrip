@@ -670,8 +670,17 @@ func qIncludeOps(existing []string, zones []string) []executor.Op {
 	)
 }
 
-// applyQIncludes is a seam: it runs the UCI ops (tests record them).
-var applyQIncludes = func(ops []executor.Op) error { return executor.Apply(ops, nil) }
+// applyQIncludes is a seam: it runs the UCI ops (tests record them). It
+// refuses when the firewall config has uncommitted changes made elsewhere:
+// its commit would publish them too.
+var applyQIncludes = func(ops []executor.Op) error {
+	if pending, err := qUCIPendingFn("firewall"); err != nil {
+		return fmt.Errorf("cannot check the firewall config for pending changes, nothing changed: %w", err)
+	} else if pending != "" {
+		return fmt.Errorf("the firewall config has uncommitted changes made outside NetGrip (%s); save or revert them first (LuCI: Unsaved changes, or uci revert firewall), nothing changed", qFirstLine(pending))
+	}
+	return executor.Apply(ops, nil)
+}
 
 // qVerifyLive checks the actual result: chains loaded, every protected
 // zone jumps into them, and the must-keep MAC is in the live set.

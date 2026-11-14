@@ -609,7 +609,12 @@ func qWifiOpsFor(v qWifiView, p qWifiPlan) qOps {
 	// (two instances serving one range would hand out the same address).
 	serving := qDnsmasqFor(v.dhcp, p.ownNetwork)
 	for _, name := range sortedSections(v.dhcp, "dnsmasq") {
-		ifs := v.dhcp[name].Options["interface"]
+		var ifs []string
+		for _, i := range v.dhcp[name].Options["interface"] {
+			if strings.TrimSpace(i) != "" {
+				ifs = append(ifs, i)
+			}
+		}
 		has := false
 		for _, i := range ifs {
 			has = has || i == qNet
@@ -926,6 +931,23 @@ func qWifiApplyLocked(v qWifiView, p qWifiPlan) error {
 	for _, r := range names {
 		ops = append(ops, executor.Op{Kind: "wifi_reload", Args: []string{r}})
 	}
+	// Committing a config also commits whatever else is pending in it:
+	// refuse to publish changes nobody here made.
+	for _, c := range []struct {
+		pkg string
+		n   int
+	}{{"network", len(o.network)}, {"dhcp", len(o.dhcp)}, {"firewall", len(o.firewall)}, {"wireless", len(o.wireless)}} {
+		if c.n == 0 {
+			continue
+		}
+		pending, err := qUCIPendingFn(c.pkg)
+		if err != nil {
+			return fmt.Errorf("cannot check the %s config for pending changes, nothing changed: %w", c.pkg, err)
+		}
+		if pending != "" {
+			return fmt.Errorf("the %s config has uncommitted changes made outside NetGrip (%s); save or revert them first (LuCI: Unsaved changes, or uci revert %s), nothing changed", c.pkg, qFirstLine(pending), c.pkg)
+		}
+	}
 	// DHCP is what every other network depends on: record what dnsmasq
 	// serves before, and put the DHCP config back if the change made it
 	// stop serving a network (2026-11-14: dnsmasq ended up bound to the
@@ -947,7 +969,14 @@ func qWifiApplyLocked(v qWifiView, p qWifiPlan) error {
 	if len(o.dhcp) > 0 {
 		qDnsmasqWaitFn(started)
 		own := qOwnDHCP{bridge: firstNonEmpty(p.bridge, v.network[qDevSection].Option("name")), routerIP: firstNonEmpty(p.routerIP, v.network[qNet].Option("ipaddr"))}
-		if why := qDHCPRegression(dhcpBefore, qDnsmasqRuntimeFn(), own); why != "" {
+		why := qDHCPRegression(dhcpBefore, qDnsmasqRuntimeFn(), own)
+		if why != "" {
+			// A network that is briefly down after a reload has no range
+			// until procd reloads dnsmasq for it: look once more.
+			time.Sleep(qDHCPRecheckDelay)
+			why = qDHCPRegression(dhcpBefore, qDnsmasqRuntimeFn(), own)
+		}
+		if why != "" {
 			log.Printf("netgrip: quarantine: DHCP check failed (%s); restoring the DHCP config", why)
 			if err := qRestoreFn("dhcp", dhcpSnap); err != nil {
 				log.Printf("netgrip: quarantine: restoring the DHCP config: %v", err)
@@ -955,7 +984,7 @@ func qWifiApplyLocked(v qWifiView, p qWifiPlan) error {
 			if err := applyQWifiOps([]executor.Op{{Kind: "initd", Args: []string{"dnsmasq", "reload"}}}); err != nil {
 				log.Printf("netgrip: quarantine: reloading dnsmasq: %v", err)
 			}
-			return fmt.Errorf("the change would have stopped DHCP on other networks (%s); the DHCP config was put back", why)
+			return &qDHCPError{why}
 		}
 	}
 	// A restarted SSID reconnects everyone anyway; elsewhere only the
@@ -995,25 +1024,56 @@ func qWifiApplyLocked(v qWifiView, p qWifiPlan) error {
 	return nil
 }
 
-// qDnsmasqServing is what the running dnsmasq instances serve, from the
-// configs their init script generated: the DHCP ranges and the interfaces
-// they are bound to (none: every interface).
+// qDnsmasqServing is what each running dnsmasq instance serves, from the
+// config its init script generated (/var/etc/dnsmasq.conf.<section>): its
+// DHCP ranges and the lines that restrict where it answers.
 type qDnsmasqServing struct {
-	ok         bool
-	ranges     map[string]bool
-	interfaces map[string]bool
+	ok        bool
+	instances map[string]qDnsmasqInstance
 }
 
-var qSnapshotFn = executor.Snapshot
-var qRestoreFn = executor.Restore
+type qDnsmasqInstance struct {
+	ranges   map[string]bool
+	restrict map[string]bool // "interface=x", "listen-address=y", "except-interface=z", "no-dhcp-interface=w"
+}
 
-// qDnsmasqWaitFn waits (up to 5 s) until dnsmasq's generated config is
+// qDHCPError is a change that would have cost another network its DHCP.
+type qDHCPError struct{ why string }
+
+func (e *qDHCPError) Error() string {
+	return "the change would have stopped DHCP on other networks (" + e.why + "); the DHCP config was put back"
+}
+
+var (
+	qSnapshotFn       = executor.Snapshot
+	qRestoreFn        = executor.Restore
+	qDHCPRecheckDelay = 5 * time.Second
+)
+
+// qUCIPendingFn lists a config's uncommitted changes ("" when none).
+var qUCIPendingFn = func(pkg string) (string, error) {
+	out, err := exec.Command("uci", "changes", pkg).Output()
+	return strings.TrimSpace(string(out)), err
+}
+
+func qFirstLine(s string) string {
+	line, _, _ := strings.Cut(s, "\n")
+	if len(line) > 80 {
+		line = line[:80] + "..."
+	}
+	return line
+}
+
+// qDnsmasqWaitFn waits (up to 5 s) until a dnsmasq generated config is
 // newer than since, so the check reads what the reload produced.
 var qDnsmasqWaitFn = func(since time.Time) {
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		files, _ := filepath.Glob("/var/etc/dnsmasq.conf.*")
 		for _, f := range files {
+			if strings.Count(filepath.Base(f), ".") != 2 {
+				continue
+			}
 			if st, err := os.Stat(f); err == nil && !st.ModTime().Before(since.Truncate(time.Second)) {
 				return
 			}
@@ -1022,48 +1082,53 @@ var qDnsmasqWaitFn = func(since time.Time) {
 	}
 }
 
-// qDnsmasqRuntimeFn reads /var/etc/dnsmasq.conf.* (one per instance).
+// qDnsmasqRuntimeFn reads every instance's generated config. Only
+// dnsmasq.conf.<section>: the init script writes <section>.<pid> first and
+// renames it, and a half-written file must not be read.
 var qDnsmasqRuntimeFn = func() qDnsmasqServing {
 	files, _ := filepath.Glob("/var/etc/dnsmasq.conf.*")
-	var all []byte
+	confs := map[string]string{}
 	for _, f := range files {
+		if strings.Count(filepath.Base(f), ".") != 2 {
+			continue
+		}
 		if b, err := os.ReadFile(f); err == nil {
-			all = append(all, b...)
-			all = append(all, '\n')
+			confs[filepath.Base(f)] = string(b)
 		}
 	}
-	return parseDnsmasqServing(string(all), len(files) > 0)
+	return parseDnsmasqServing(confs)
 }
 
-// parseDnsmasqServing extracts the ranges and bound interfaces from
-// dnsmasq config text. A range is keyed by its addresses, without tags or
-// lease times, so an unrelated option change does not count. Pure.
-func parseDnsmasqServing(conf string, ok bool) qDnsmasqServing {
-	d := qDnsmasqServing{ok: ok, ranges: map[string]bool{}, interfaces: map[string]bool{}}
-	for _, line := range strings.Split(conf, "\n") {
-		line = strings.TrimSpace(line)
-		switch {
-		case strings.HasPrefix(line, "dhcp-range="):
-			var addrs []string
-			for _, f := range strings.Split(strings.TrimPrefix(line, "dhcp-range="), ",") {
-				if ip := net.ParseIP(strings.TrimSpace(f)); ip != nil {
-					addrs = append(addrs, ip.String())
+// parseDnsmasqServing extracts each instance's ranges and restrictions. A
+// range is keyed by its addresses, without tags or lease times, so an
+// unrelated option change does not count. Pure.
+func parseDnsmasqServing(confs map[string]string) qDnsmasqServing {
+	d := qDnsmasqServing{ok: len(confs) > 0, instances: map[string]qDnsmasqInstance{}}
+	for name, conf := range confs {
+		in := qDnsmasqInstance{ranges: map[string]bool{}, restrict: map[string]bool{}}
+		for _, line := range strings.Split(conf, "\n") {
+			line = strings.TrimSpace(line)
+			key, val, _ := strings.Cut(line, "=")
+			switch key {
+			case "dhcp-range":
+				var addrs []string
+				for _, f := range strings.Split(val, ",") {
+					if ip := net.ParseIP(strings.TrimSpace(f)); ip != nil {
+						addrs = append(addrs, ip.String())
+					}
 				}
+				if len(addrs) > 0 {
+					in.ranges[strings.Join(addrs, "-")] = true
+				}
+			case "interface", "listen-address", "except-interface", "no-dhcp-interface":
+				in.restrict[line] = true
 			}
-			if len(addrs) > 0 {
-				d.ranges[strings.Join(addrs, "-")] = true
-			}
-		case strings.HasPrefix(line, "interface="):
-			d.interfaces[strings.TrimPrefix(line, "interface=")] = true
 		}
+		d.instances[name] = in
 	}
 	return d
 }
 
-// qDHCPRegression says how dnsmasq serves less after a change than
-// before, ignoring the quarantine network's own range and bridge: a range
-// that disappeared, or a binding to interfaces where there was none, or to
-// fewer of them. "" when nothing was lost (or nothing could be read).
 // qOwnDHCP identifies the quarantine network's own DHCP, which may come
 // and go with the layer.
 type qOwnDHCP struct{ bridge, routerIP string }
@@ -1082,6 +1147,12 @@ func (o qOwnDHCP) isOwnRange(r string) bool {
 
 func (o qOwnDHCP) isOwnIface(i string) bool { return i == qNet || (o.bridge != "" && i == o.bridge) }
 
+// qDHCPRegression says how an instance serves less after a change than
+// before, ignoring the quarantine network's own range and binding: a range
+// of another network gone, a new restriction (an instance that answered
+// everywhere now bound to interfaces, an excluded interface, a listen
+// address), or a bound instance no longer serving one of its interfaces.
+// "" when nothing was lost (or nothing could be read before).
 func qDHCPRegression(before, after qDnsmasqServing, own qOwnDHCP) string {
 	if !before.ok {
 		return ""
@@ -1089,27 +1160,45 @@ func qDHCPRegression(before, after qDnsmasqServing, own qOwnDHCP) string {
 	if !after.ok {
 		return "dnsmasq has no running config any more"
 	}
-	for r := range before.ranges {
-		if !after.ranges[r] && !own.isOwnRange(r) {
-			return "the DHCP range " + r + " is no longer served"
-		}
+	names := make([]string, 0, len(before.instances))
+	for n := range before.instances {
+		names = append(names, n)
 	}
-	if len(before.interfaces) == 0 && len(after.interfaces) > 0 {
-		names := make([]string, 0, len(after.interfaces))
-		for i := range after.interfaces {
-			names = append(names, i)
+	sort.Strings(names)
+	for _, n := range names {
+		b := before.instances[n]
+		a, ok := after.instances[n]
+		if !ok {
+			return "a dnsmasq instance stopped (" + n + ")"
 		}
-		sort.Strings(names)
-		return "dnsmasq became bound to " + strings.Join(names, ", ") + " only"
-	}
-	for i := range before.interfaces {
-		if !after.interfaces[i] && !own.isOwnIface(i) {
-			return "dnsmasq no longer serves " + i
+		for r := range b.ranges {
+			if !a.ranges[r] && !own.isOwnRange(r) {
+				return "the DHCP range " + r + " is no longer served"
+			}
 		}
-	}
-	for i := range after.interfaces {
-		if !before.interfaces[i] && !own.isOwnIface(i) {
-			return "dnsmasq became bound to " + i
+		bound := false
+		for l := range b.restrict {
+			bound = bound || strings.HasPrefix(l, "interface=")
+		}
+		for l := range a.restrict {
+			if b.restrict[l] {
+				continue
+			}
+			key, val, _ := strings.Cut(l, "=")
+			// A bound instance may gain the quarantine network; one that
+			// answered everywhere must not become bound, not even to it.
+			if key == "interface" && bound && own.isOwnIface(val) {
+				continue
+			}
+			return "dnsmasq gained the restriction " + l
+		}
+		for l := range b.restrict {
+			if !a.restrict[l] {
+				key, val, _ := strings.Cut(l, "=")
+				if key == "interface" && !own.isOwnIface(val) {
+					return "dnsmasq no longer serves " + val
+				}
+			}
 		}
 	}
 	return ""
@@ -1346,6 +1435,25 @@ func qWifiSyncLocked(st *qState, r qRouter, now time.Time) (QWifiProbe, error) {
 	}
 	p.ssids = held
 	if err := qWifiApplyLocked(v, p); err != nil {
+		var dhcpErr *qDHCPError
+		if errors.As(err, &dhcpErr) {
+			// Never retry something that cost other networks their DHCP:
+			// the layer goes off, with the reason, until the user acts.
+			log.Printf("netgrip: quarantine: %v; turning the Wi-Fi layer off", err)
+			if v2, rerr := readQWifiView(); rerr == nil {
+				if terr := qWifiApplyLocked(v2, qWifiPlan{}); terr != nil {
+					log.Printf("netgrip: quarantine: removing the Wi-Fi layer: %v", terr)
+				}
+			}
+			st.Wifi.Enabled = false
+			st.Wifi.OffReason = err.Error()
+			_ = saveQState(st)
+			if fw, ferr := uciShowFn("firewall"); ferr == nil {
+				_ = applyQIncludes(qIncludeOps(qIncludeSections(fw), qHookZones(st)))
+			}
+			wp.Enabled = false
+			return wp, nil
+		}
 		return wp, err
 	}
 	wp.Quarantined = qWifiHealLocked(st, v, p, now)
