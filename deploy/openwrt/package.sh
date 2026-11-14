@@ -162,7 +162,8 @@ cat > "$PKG_DIR/CONTROL/prerm" << 'PRERM'
 # section the feature created goes (netgrip_quarantine*, and the first
 # release's netgrip_q_* includes).
 qchanged=
-for s in $(uci -q show wireless | sed -n 's/^wireless\.\([A-Za-z0-9_]*\)\.netgrip_quarantine_network=.*/\1/p'); do
+# -X: unnamed SSIDs get their real section names
+for s in $(uci -q -X show wireless | sed -n 's/^wireless\.\([A-Za-z0-9_]*\)\.netgrip_quarantine_network=.*/\1/p'); do
 	n=$(uci -q get "wireless.$s.netgrip_quarantine_network")
 	if [ "$(uci -q get "wireless.$s.network")" = netgrip_quarantine ] && [ -n "$n" ]; then
 		uci -q set "wireless.$s.network=$n"
@@ -170,11 +171,21 @@ for s in $(uci -q show wireless | sed -n 's/^wireless\.\([A-Za-z0-9_]*\)\.netgri
 	uci -q delete "wireless.$s.netgrip_quarantine_network"
 	uci -q delete "wireless.$s.dynamic_vlan"
 	qchanged=1
+	qwifi=1
+done
+# a dnsmasq bound to a list of interfaces had the quarantine network added
+for s in $(uci -q -X show dhcp | sed -n "s/^dhcp\.\([A-Za-z0-9_]*\)\.interface=.*'netgrip_quarantine'.*/\1/p"); do
+	uci -q del_list "dhcp.$s.interface=netgrip_quarantine"
+	qchanged=1
+	qdhcp=1
 done
 for c in wireless network dhcp firewall; do
 	q=$(uci -q show "$c" | sed -n -e "s/^$c\.\(netgrip_quarantine[A-Za-z0-9_]*\)=.*/\1/p" -e "s/^$c\.\(netgrip_q_[A-Za-z0-9_]*\)=include\$/\1/p")
-	for s in $q; do uci -q delete "$c.$s"; qchanged=1; done
-	uci -q commit "$c"
+	for s in $q; do uci -q delete "$c.$s"; done
+	if [ -n "$q" ] || { [ "$c" = wireless ] && [ -n "$qwifi" ]; } || { [ "$c" = dhcp ] && [ -n "$qdhcp" ]; }; then
+		uci -q commit "$c"
+		qchanged=1
+	fi
 done
 if [ -n "$qchanged" ]; then
 	/etc/init.d/network reload 2>/dev/null || true

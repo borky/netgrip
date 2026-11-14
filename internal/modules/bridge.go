@@ -62,28 +62,46 @@ func parseUCIShow(show, pkg string) map[string]uciSection {
 }
 
 // parseUCIValues splits a `uci show` value into its list elements. uci show
-// renders a list option as space-separated quoted tokens
-// ('a' 'b' 'c'); a scalar is a single quoted token ('a'). Anything that does
-// not match that shape exactly (no quotes, embedded spaces in values) is
-// returned as one raw element, matching the previous behavior.
+// renders a list option as space-separated quoted tokens ('a' 'b' 'c') and a
+// scalar as one ('a'). A single quote inside a value closes the quoted
+// part, follows as a backslash-escaped quote, and reopens it: the value
+// it's is shown as 'it' + \' + 's' with no spaces. Anything that does not
+// match that shape is returned as one raw element.
 func parseUCIValues(val string) []string {
 	val = strings.TrimSpace(val)
 	if !strings.HasPrefix(val, "'") || !strings.HasSuffix(val, "'") {
 		return []string{val}
 	}
 	var out []string
-	rest := val
-	for rest != "" {
-		rest = strings.TrimPrefix(rest, "'")
-		v, _, ok := strings.Cut(rest, "'")
-		if !ok {
-			return []string{val} // unbalanced quotes: raw fallback
-		}
-		out = append(out, v)
-		rest = strings.TrimSpace(strings.TrimPrefix(rest, v+"'"))
-		if rest != "" && !strings.HasPrefix(rest, "'") {
+	var cur strings.Builder
+	inTok := false
+	for i := 0; i < len(val); {
+		switch c := val[i]; {
+		case c == '\'':
+			j := strings.IndexByte(val[i+1:], '\'')
+			if j < 0 {
+				return []string{val} // unbalanced quotes: raw fallback
+			}
+			cur.WriteString(val[i+1 : i+1+j])
+			inTok = true
+			i += j + 2
+		case c == '\\' && i+1 < len(val) && val[i+1] == '\'':
+			cur.WriteByte('\'')
+			inTok = true
+			i += 2
+		case c == ' ':
+			if inTok {
+				out = append(out, cur.String())
+				cur.Reset()
+				inTok = false
+			}
+			i++
+		default:
 			return []string{val} // not a clean quoted list: raw fallback
 		}
+	}
+	if inTok {
+		out = append(out, cur.String())
 	}
 	if len(out) == 0 {
 		return []string{val}

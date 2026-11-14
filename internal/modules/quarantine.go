@@ -1137,6 +1137,11 @@ func QuarantineEnable(req QEnableRequest, requesterIP string) (QuarantineProbe, 
 		return probeQuarantineLocked(), err
 	}
 	st := loadQState()
+	// Anything left of a Wi-Fi layer from before (a failed teardown) goes
+	// first: phase 1 starts without it.
+	if err := qWifiTeardownLocked(st); err != nil {
+		return probeQuarantineLocked(), fmt.Errorf("removing what is left of the Wi-Fi layer: %w", err)
+	}
 	now := time.Now().Unix()
 	for _, a := range req.Approve {
 		mac := strings.ToLower(strings.TrimSpace(a.MAC))
