@@ -66,7 +66,7 @@ func qZoneMap(zones []QZone) map[string]QZone {
 	return out
 }
 
-func TestQZonesFromMasqTunnelIsNotAnUplink(t *testing.T) {
+func TestQZonesFromVPNServerIsNotAnUplink(t *testing.T) {
 	fw := `firewall.@zone[0]=zone
 firewall.@zone[0].name='peers'
 firewall.@zone[0].network='rw'
@@ -77,34 +77,73 @@ firewall.@zone[1].network='lte'
 firewall.@zone[1].masq='1'
 firewall.@zone[2]=zone
 firewall.@zone[2].name='vpnout'
-firewall.@zone[2].network='tun'
+firewall.@zone[2].network='tun' 'ovpn'
 firewall.@zone[2].masq='1'
+`
+	netw := `network.rw=interface
+network.rw.proto='wireguard'
+network.rw.listen_port='51820'
+network.@wireguard_rw[0]=wireguard_rw
+network.@wireguard_rw[0].allowed_ips='10.99.0.2/32' 'fd99::2/128'
+network.peer2=wireguard_rw
+network.peer2.allowed_ips='10.99.0.3/32'
+network.tun=interface
+network.tun.proto='wireguard'
+network.@wireguard_tun[0]=wireguard_tun
+network.@wireguard_tun[0].allowed_ips='0.0.0.0/0' '::/0'
+network.@wireguard_tun[0].route_allowed_ips='0'
+network.ovpn=interface
+network.ovpn.proto='none'
+network.lte=interface
+network.lte.proto='qmi'
 `
 	ifaces := []ubus.InterfaceState{
 		{Name: "rw", Proto: "wireguard", Device: "wg9", Up: true},       // a VPN server: routes to its peers only
 		{Name: "lte", Proto: "qmi", Device: "/dev/cdc-wdm9", Up: false}, // a backup uplink, down right now
-		{Name: "tun", Proto: "wireguard", Device: "wg8", Up: true, HasDefaultRoute: true},
+		{Name: "tun", Proto: "wireguard", Device: "wg8", Up: true},      // a pbr client: no default route netifd knows of
+		{Name: "ovpn", Proto: "none", Device: "tun0", Up: true},
 	}
-	got := qZoneMap(qZonesFrom(fw, "", nil, ifaces))
+	servers := qVPNServerNetworks(netw)
+	if !servers["rw"] || servers["tun"] || servers["lte"] || servers["ovpn"] {
+		t.Fatalf("VPN servers: %v", servers)
+	}
+	got := qZoneMap(qZonesFrom(fw, "", nil, ifaces, servers))
 	if got["peers"].Wan {
 		t.Fatalf("a masquerading VPN server zone was taken for an uplink: %+v", got["peers"])
 	}
-	if !got["backup"].Wan {
-		t.Fatalf("a masquerading modem uplink that is down was not taken for an uplink: %+v", got["backup"])
+	if !got["backup"].Wan || !got["vpnout"].Wan {
+		t.Fatalf("a down modem or a VPN client without a default route is not an uplink: %+v", got)
 	}
-	if !got["vpnout"].Wan {
-		t.Fatalf("a full-tunnel VPN client was not taken for an uplink: %+v", got["vpnout"])
+	devs, _ := qWanDevicesFrom(qZonesFrom(fw, "", nil, ifaces, servers), nil, ifaces)
+	if strings.Join(devs, ",") != "tun0,wg8" {
+		t.Fatalf("uplink devices: %v", devs)
 	}
-	devs, _ := qWanDevicesFrom(qZonesFrom(fw, "", nil, ifaces), nil, ifaces)
-	for _, d := range devs {
-		if d == "wg9" {
-			t.Fatalf("the VPN server's device is in the uplink set: %v", devs)
-		}
+}
+
+func TestQStickyWanKeepsAReconnectingLink(t *testing.T) {
+	qWanStickyMu.Lock()
+	old := qWanSticky
+	qWanSticky = map[string]map[string]bool{}
+	qWanStickyMu.Unlock()
+	t.Cleanup(func() { qWanStickyMu.Lock(); qWanSticky = old; qWanStickyMu.Unlock() })
+	zones := []QZone{{Name: "up", Networks: []string{"uplink"}, Wan: true}, {Name: "home", Networks: []string{"home"}}}
+	up := []ubus.InterfaceState{{Name: "uplink", Device: "eth9", L3Device: "pppoe-uplink"}, {Name: "home", Device: "br-home"}}
+	if got := qStickyWan(zones, up, []string{"eth9", "pppoe-uplink"}); strings.Join(got, ",") != "eth9,pppoe-uplink" {
+		t.Fatalf("up: %v", got)
+	}
+	down := []ubus.InterfaceState{{Name: "uplink", Device: "eth9"}, {Name: "home", Device: "br-home"}}
+	if got := qStickyWan(zones, down, []string{"eth9"}); strings.Join(got, ",") != "eth9,pppoe-uplink" {
+		t.Fatalf("the PPPoE device left the set during a reconnect: %v", got)
+	}
+	// A network that stops being an uplink takes its devices with it.
+	zones[0].Wan = false
+	if got := qStickyWan(zones, down, nil); len(got) != 0 {
+		t.Fatalf("devices of a former uplink kept: %v", got)
 	}
 }
 
 func TestQZonesFromFindsUplinksWithoutNames(t *testing.T) {
-	got := qZoneMap(qZonesFrom(qTestFirewall, qTestDhcp, []string{"guests"}, qTestIfaces))
+	got := qZoneMap(qZonesFrom(qTestFirewall, qTestDhcp, []string{"guests"}, qTestIfaces, nil))
 	if !got["up"].Wan || got["up"].Suggested {
 		t.Fatalf("masquerading zone: %+v", got["up"])
 	}
@@ -118,16 +157,16 @@ func TestQZonesFromFindsUplinksWithoutNames(t *testing.T) {
 		t.Fatalf("protected flags: %+v", got)
 	}
 	masq6 := qTestFirewall + "firewall.@zone[3].masq6='1'\n"
-	if !qZoneMap(qZonesFrom(masq6, "", nil, []ubus.InterfaceState{{Name: "tunnel", Proto: "dhcpv6"}}))["vpn"].Wan {
-		t.Fatal("masq6 over an uplink protocol must mark an uplink")
+	if !qZoneMap(qZonesFrom(masq6, "", nil, nil, nil))["vpn"].Wan {
+		t.Fatal("masq6 must mark an uplink")
 	}
-	if qZoneMap(qZonesFrom(masq6, "", nil, []ubus.InterfaceState{{Name: "tunnel", Proto: "wireguard"}}))["vpn"].Wan {
-		t.Fatal("masq6 over a tunnel without a default route is not an uplink")
+	if qZoneMap(qZonesFrom(masq6, "", nil, nil, map[string]bool{"tunnel": true}))["vpn"].Wan {
+		t.Fatal("a VPN server's zone is not an uplink, masq6 or not")
 	}
 }
 
 func TestQWanDevicesFrom(t *testing.T) {
-	zones := qZonesFrom(qTestFirewall, "", nil, qTestIfaces)
+	zones := qZonesFrom(qTestFirewall, "", nil, qTestIfaces, nil)
 	devs, patterns := qWanDevicesFrom(zones, qZoneExtras(qTestFirewall), qTestIfaces)
 	if strings.Join(devs, ",") != "eth8,eth9,pppoe-uplink,tun9" {
 		t.Fatalf("wan devices: %v", devs)
@@ -157,7 +196,7 @@ firewall.other.chain='input_x'
 }
 
 func TestValidateZones(t *testing.T) {
-	zones := qZonesFrom(qTestFirewall, qTestDhcp, nil, qTestIfaces)
+	zones := qZonesFrom(qTestFirewall, qTestDhcp, nil, qTestIfaces, nil)
 	for _, bad := range [][]string{nil, {"up"}, {"transit"}, {"nope"}, {"home'; drop"}} {
 		if _, err := validateZones(bad, zones); err == nil {
 			t.Fatalf("accepted %v", bad)
@@ -373,13 +412,20 @@ func newQFake(t *testing.T) *qFake {
 	oldDir, oldState := quarantineDir, qStatePath
 	quarantineDir = filepath.Join(dir, "q")
 	qStatePath = filepath.Join(dir, "quarantine.json")
-	oldMissing, oldFlush, oldFull := qMissingPolls, qLastFlush, qLastFullCheck
+	oldMissing, oldFlush, oldFull, oldForce := qMissingPolls, qLastFlush, qLastFullCheck, qForceFull
+	qWanStickyMu.Lock()
+	oldSticky := qWanSticky
+	qWanSticky = map[string]map[string]bool{}
+	qWanStickyMu.Unlock()
 	oldBudget, oldUsed, oldSum := qBudgetStart, qBudgetUsed, qBudgetSummaries
-	qMissingPolls, qLastFlush, qLastFullCheck = 0, time.Time{}, time.Time{}
+	qMissingPolls, qLastFlush, qLastFullCheck, qForceFull = 0, time.Time{}, time.Time{}, false
 	qBudgetStart, qBudgetUsed, qBudgetSummaries = time.Time{}, 0, 0
 	t.Cleanup(func() {
 		quarantineDir, qStatePath = oldDir, oldState
-		qMissingPolls, qLastFlush, qLastFullCheck = oldMissing, oldFlush, oldFull
+		qMissingPolls, qLastFlush, qLastFullCheck, qForceFull = oldMissing, oldFlush, oldFull, oldForce
+		qWanStickyMu.Lock()
+		qWanSticky = oldSticky
+		qWanStickyMu.Unlock()
 		qBudgetStart, qBudgetUsed, qBudgetSummaries = oldBudget, oldUsed, oldSum
 	})
 
@@ -393,6 +439,9 @@ func newQFake(t *testing.T) *qFake {
 	uciShowFn = func(pkg string) (string, error) {
 		if pkg == "dhcp" {
 			return qTestDhcp, nil
+		}
+		if pkg == "network" {
+			return "", nil
 		}
 		if f.showErr != nil {
 			return "", f.showErr
@@ -792,7 +841,7 @@ func TestQPollMACFloodSparesTheFlash(t *testing.T) {
 	now := time.Now()
 	qPoll(now)
 	base, _ := os.Stat(qStatePath)
-	writes := 0
+	writes, late := 0, 0
 	last := base.ModTime()
 	for i := 0; i < 60; i++ { // five minutes of a new random MAC every poll
 		time.Sleep(2 * time.Millisecond)
@@ -800,11 +849,16 @@ func TestQPollMACFloodSparesTheFlash(t *testing.T) {
 		qPoll(now.Add(time.Duration(i+1) * qPollInterval))
 		if st, _ := os.Stat(qStatePath); !st.ModTime().Equal(last) {
 			writes++
+			if i >= qNotifyPerHour {
+				late++
+			}
 			last = st.ModTime()
 		}
 	}
-	if writes > 1 {
-		t.Fatalf("%d flash writes in five minutes of new MACs", writes)
+	// Each device announced on its own is written (the hourly budget
+	// bounds that); once the budget is spent the flood writes nothing.
+	if writes > qNotifyPerHour+1 || late > 1 {
+		t.Fatalf("%d flash writes in five minutes of new MACs, %d after the budget was spent", writes, late)
 	}
 	// The panel still sees every device at once.
 	if p := ProbeQuarantine(); len(p.Pending) != 60 {
@@ -944,6 +998,29 @@ func TestQApproveDropsAMACUsedAsName(t *testing.T) {
 	}
 	if qDeviceName("02:00:00:00:00:5a", "02:00:00:00:00:5A") != "" || qDeviceName("02:00:00:00:00:51", "Kitchen plug") != "Kitchen plug" {
 		t.Fatal("an upper-case MAC was kept, or a real name dropped")
+	}
+}
+
+func TestQPollRetriesAFailedFullCheckNextPoll(t *testing.T) {
+	f := newQFake(t)
+	f.enable(t, "internet", "home")
+	now := time.Now()
+	qPoll(now) // a full check
+	reads := 0
+	show := uciShowFn
+	uciShowFn = func(pkg string) (string, error) {
+		if pkg == "firewall" {
+			reads++
+			if reads == 1 {
+				return "", errors.New("uci busy")
+			}
+		}
+		return show(pkg)
+	}
+	qPoll(now.Add(qFullCheckEvery)) // due, fails
+	qPoll(now.Add(qFullCheckEvery + qPollInterval))
+	if reads != 2 {
+		t.Fatalf("a failed full check was retried after %d reads, want on the next poll", reads)
 	}
 }
 

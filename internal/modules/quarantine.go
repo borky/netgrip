@@ -76,6 +76,8 @@ var (
 	qMissingPolls int
 	// qLastFullCheck is when the poller last read the whole router.
 	qLastFullCheck time.Time
+	// qForceFull asks the next poll for a full check (a failed one).
+	qForceFull bool
 	// The announcement budget (see qNotifyBudget).
 	qBudgetStart                  time.Time
 	qBudgetUsed, qBudgetSummaries int
@@ -348,21 +350,59 @@ func qDHCPDNSServers(uciDhcp string) []string {
 // qZonesFrom builds the zone list. A zone is an uplink when it masquerades
 // (IPv4 or IPv6) or when one of its networks holds a default route. Pure,
 // for tests.
-// qUplinkProtos6 adds the IPv6 uplink protocols to multi-WAN's wanProtos.
-var qUplinkProtos6 = map[string]bool{
-	"dhcpv6": true, "6in4": true, "6rd": true, "6to4": true, "dslite": true, "map": true,
+// qVPNServerNetworks lists the WireGuard networks that serve peers rather
+// than reach the internet: no peer is allowed a default route (0/0, ::/0
+// or its two halves). Pure, for tests.
+func qVPNServerNetworks(uciNetwork string) map[string]bool {
+	proto, typ, allowed := map[string]string{}, map[string]string{}, map[string][]string{}
+	for _, line := range strings.Split(uciNetwork, "\n") {
+		key, val, ok := strings.Cut(strings.TrimSpace(line), "=")
+		if !ok {
+			continue
+		}
+		key = strings.TrimPrefix(key, "network.")
+		sec, opt, hasOpt := strings.Cut(key, ".")
+		switch {
+		case !hasOpt:
+			typ[sec] = strings.Trim(val, "'")
+		case opt == "proto":
+			proto[sec] = strings.Trim(val, "'")
+		case opt == "allowed_ips":
+			for _, m := range reUCIValue.FindAllStringSubmatch(val, -1) {
+				allowed[sec] = append(allowed[sec], m[1])
+			}
+		}
+	}
+	out := map[string]bool{}
+	for sec, p := range proto {
+		if p == "wireguard" {
+			out[sec] = true
+		}
+	}
+	for sec, t := range typ {
+		iface, ok := strings.CutPrefix(t, "wireguard_")
+		if !ok {
+			continue
+		}
+		for _, a := range allowed[sec] {
+			switch strings.TrimSpace(a) {
+			case "0.0.0.0/0", "::/0", "0.0.0.0/1", "128.0.0.0/1", "::/1", "8000::/1":
+				delete(out, iface)
+			}
+		}
+	}
+	return out
 }
 
-func qZonesFrom(uciFirewall, uciDhcp string, protected []string, ifaces []ubus.InterfaceState) []QZone {
+var reUCIValue = regexp.MustCompile(`'([^']*)'`)
+
+func qZonesFrom(uciFirewall, uciDhcp string, protected []string, ifaces []ubus.InterfaceState, vpnServers map[string]bool) []QZone {
 	served := dhcpServedNetworks(uciDhcp)
 	extras := qZoneExtras(uciFirewall)
-	defRoute, uplinkProto := map[string]bool{}, map[string]bool{}
+	defRoute := map[string]bool{}
 	for _, i := range ifaces {
 		if i.HasDefaultRoute || i.HasDefaultRoute6 {
 			defRoute[i.Name] = true
-		}
-		if wanProtos[i.Proto] || qUplinkProtos6[i.Proto] {
-			uplinkProto[i.Name] = true
 		}
 	}
 	prot := map[string]bool{}
@@ -371,14 +411,21 @@ func qZonesFrom(uciFirewall, uciDhcp string, protected []string, ifaces []ubus.I
 	}
 	out := []QZone{}
 	for _, z := range parseFWZonesFrom(uciFirewall) {
-		// An uplink zone carries a default route, or masquerades over an
-		// uplink protocol (one that is down right now has no route). A
-		// masquerading tunnel without a default route, such as a VPN
-		// server's zone, leads to its peers, not to the internet.
+		// An uplink zone masquerades or carries a default route. The one
+		// masquerading zone that is not an uplink is a VPN server's: its
+		// tunnel leads to the peers, not to the internet. A VPN client
+		// (pbr, redirect-gateway) often has no default route netifd
+		// knows of, so masquerading alone still makes an uplink.
 		q := QZone{Name: z.Name, Networks: z.Network, Protected: prot[z.Name]}
-		masq := z.Masq || extras[z.Name].masq6
+		servers := len(z.Network) > 0
 		for _, n := range z.Network {
-			if defRoute[n] || (masq && uplinkProto[n]) {
+			if !vpnServers[n] {
+				servers = false
+			}
+		}
+		q.Wan = (z.Masq || extras[z.Name].masq6) && !servers
+		for _, n := range z.Network {
+			if defRoute[n] {
 				q.Wan = true
 			}
 		}
@@ -451,15 +498,71 @@ func readQRouter() (qRouter, error) {
 	if err != nil {
 		return qRouter{}, fmt.Errorf("reading the DHCP config: %w", err)
 	}
+	netw, err := uciShowFn("network")
+	if err != nil {
+		return qRouter{}, fmt.Errorf("reading the network config: %w", err)
+	}
 	ifaces, err := dumpInterfacesFn()
 	if err != nil {
 		return qRouter{}, fmt.Errorf("reading the interfaces: %w", err)
 	}
 	r := qRouter{firewall: fw, sections: qIncludeSections(fw), actual: qActualZones(fw)}
-	r.zones = qZonesFrom(fw, dhcp, r.actual, ifaces)
+	r.zones = qZonesFrom(fw, dhcp, r.actual, ifaces, qVPNServerNetworks(netw))
 	r.wan, r.wanPatterns = qWanDevicesFrom(r.zones, qZoneExtras(fw), ifaces)
+	r.wan = qStickyWan(r.zones, ifaces, r.wan)
 	r.dns = qDHCPDNSServers(dhcp)
 	return r, nil
+}
+
+// Uplink devices exist only while their link is up (a PPPoE session's
+// interface goes away on every reconnect). qStickyWan keeps every device an
+// uplink network has had in this run, so a sync during a reconnect or a
+// failover does not take it out of the set and cut quarantined devices off
+// the internet until the next full check.
+var (
+	qWanStickyMu sync.Mutex
+	qWanSticky   = map[string]map[string]bool{} // network -> devices
+)
+
+func qStickyWan(zones []QZone, ifaces []ubus.InterfaceState, devs []string) []string {
+	qWanStickyMu.Lock()
+	defer qWanStickyMu.Unlock()
+	uplink := map[string]bool{}
+	for _, z := range zones {
+		if z.Wan {
+			for _, n := range z.Networks {
+				uplink[n] = true
+			}
+		}
+	}
+	for n := range qWanSticky {
+		if !uplink[n] {
+			delete(qWanSticky, n) // no longer an uplink network
+		}
+	}
+	for _, i := range ifaces {
+		if !uplink[i.Name] {
+			continue
+		}
+		for _, d := range []string{i.L3Device, i.Device} {
+			if d == "" || strings.HasPrefix(d, "/") {
+				continue
+			}
+			if qWanSticky[i.Name] == nil {
+				qWanSticky[i.Name] = map[string]bool{}
+			}
+			if len(qWanSticky[i.Name]) < 8 {
+				qWanSticky[i.Name][d] = true
+			}
+		}
+	}
+	out := append([]string(nil), devs...)
+	for _, ds := range qWanSticky {
+		for d := range ds {
+			out = append(out, d)
+		}
+	}
+	return sortedIfnames(out)
 }
 
 func (r qRouter) ruleSet(st *qState) qRuleSet {
@@ -1435,7 +1538,14 @@ func qPoll(now time.Time) {
 	// commands) runs every qFullCheckEvery, and at once when the set cannot
 	// be read (the firewall lost the feature) or a device was just approved.
 	seen, seenErr := qSeenFn()
-	full := seenErr != nil || now.Sub(qLastFullCheck) >= qFullCheckEvery
+	full := seenErr != nil || qForceFull || now.Sub(qLastFullCheck) >= qFullCheckEvery
+	if !full && st.offRemaining(now) > 0 {
+		// A firewall reload empties the kernel-timed pause: put it back
+		// now, not at the next full check.
+		if off, err := qSetElements(qSetOff); err != nil || len(off) == 0 {
+			full = true
+		}
+	}
 	var r qRouter
 	live := false
 	if full {
@@ -1469,7 +1579,12 @@ func qPoll(now time.Time) {
 	}
 	switch {
 	case urgent:
-		_ = saveQState(st)
+		if err := saveQState(st); err != nil {
+			// Keep memory in step with what goes live, or the next full
+			// check would take the change back out.
+			log.Printf("netgrip: quarantine: saving the state: %v", err)
+			saveQStateLazy(st)
+		}
 	case routine:
 		saveQStateLazy(st)
 	}
@@ -1487,6 +1602,7 @@ func qPoll(now time.Time) {
 	if full && live && qLiveDrifted(st, r, now) {
 		if err := qSyncLocked(st, r); err != nil {
 			log.Printf("netgrip: quarantine sync: %v", err)
+			qForceFull = true // retry on the next poll
 		}
 	}
 }
@@ -1497,9 +1613,10 @@ func qPoll(now time.Time) {
 func qFullCheckLocked(st *qState, now time.Time) (r qRouter, live, ok bool) {
 	r, err := readQRouter()
 	if err != nil {
+		qForceFull = true // retry on the next poll
 		return r, false, false
 	}
-	qLastFullCheck = now
+	qLastFullCheck, qForceFull = now, false
 	live = qLiveChainsPresent()
 	if len(r.sections) == 0 && !live {
 		// Reverted by the confirm window, or removed by hand: once the
@@ -1586,6 +1703,15 @@ func qRecordSeen(st *qState, seen []qElem, now time.Time) (urgent, routine bool)
 	}
 	if len(announce) > 0 {
 		announce = qNotifyBudget(announce, now)
+		for _, d := range announce {
+			// A device announced on its own is written at once, so a
+			// restart neither repeats the notice nor lets a learning
+			// pause approve a device that was already waiting. The
+			// budget bounds these writes.
+			if d.MAC != "" {
+				urgent = true
+			}
+		}
 		go qNotifyPendingBatch(announce, qChannelsFn, qNotifyFn)
 	}
 	return urgent, routine
