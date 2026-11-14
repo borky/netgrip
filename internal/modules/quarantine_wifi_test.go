@@ -158,6 +158,17 @@ func qApplyOps(t *testing.T, v *qWifiView, ops []executor.Op) {
 				t.Fatalf("add_list on missing section %q", op.Args[0])
 			}
 			s.Options[opt] = append(s.Options[opt], op.Args[1])
+		case "uci_del_list":
+			m, sec, opt := split(op.Args[0])
+			if s, ok := m[sec]; ok {
+				kept := []string{}
+				for _, v := range s.Options[opt] {
+					if v != op.Args[1] {
+						kept = append(kept, v)
+					}
+				}
+				s.Options[opt] = kept
+			}
 		case "uci_delete":
 			m, sec, opt := split(op.Args[0])
 			if opt == "" {
@@ -561,4 +572,132 @@ func TestQuarantineWifiHealsAMisplacedApprovedDevice(t *testing.T) {
 	if len(w.kicked) != 2 {
 		t.Fatalf("not retried after %v: %v", qKickEvery, w.kicked)
 	}
+}
+
+func TestParseUCIValuesDecodesEscapedQuotes(t *testing.T) {
+	for in, want := range map[string]string{
+		`'it'\''s'`:        "it's",
+		`'a' 'b c' 'd'`:    "a|b c|d",
+		`''`:               "",
+		`'x'\'''\''y' 'z'`: "x''y|z",
+		`'pa;ss'`:          "pa;ss",
+		`unquoted`:         "unquoted",
+		`'unbalanced`:      "'unbalanced",
+	} {
+		if got := strings.Join(parseUCIValues(in), "|"); got != want {
+			t.Errorf("%s: got %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestQWifiSSIDsPasswordsAndNames(t *testing.T) {
+	v := qWifiTestView()
+	v.wireless["home2"].Options["key"] = []string{"it's fine"}
+	v.wireless["home5"].Options["key"] = []string{"no;way"}
+	v.wireless["@wifi-iface[3]"] = uciSection{Type: "wifi-iface", Options: map[string][]string{
+		"device": {"radio9"}, "mode": {"ap"}, "ssid": {"Anon"}, "encryption": {"psk2"}, "key": {"dummy-pass-5"}, "network": {"home"},
+	}}
+	got := map[string]QWifiSSID{}
+	for _, s := range qWifiSSIDs(v, qWifiTestZones, []string{"home"}) {
+		got[s.Section] = s
+	}
+	if !got["home2"].Covered {
+		t.Fatalf("an apostrophe in the password must be fine: %+v", got["home2"])
+	}
+	if got["home5"].Covered || !strings.Contains(got["home5"].Reason, "cannot write") {
+		t.Fatalf("a password the executor refuses: %+v", got["home5"])
+	}
+	if got["@wifi-iface[3]"].Covered {
+		t.Fatalf("an unnamed section was covered: %+v", got["@wifi-iface[3]"])
+	}
+}
+
+func TestQWifiHeldSSIDStaysWhileTurnedOff(t *testing.T) {
+	v := qWifiTestView()
+	o := qWifiOpsFor(v, qTestPlan(v, []string{"02:00:00:00:00:0a"}))
+	qApplyOps(t, &v, append(append(append(o.network, o.dhcp...), o.firewall...), o.wireless...))
+	v.wireless["home2"].Options["disabled"] = []string{"1"} // a Wi-Fi schedule's night
+	for _, s := range qWifiSSIDs(v, qWifiTestZones, []string{"home"}) {
+		if s.Section == "home2" && (!s.Covered || !s.Applied) {
+			t.Fatalf("a held SSID left the layer when turned off: %+v", s)
+		}
+	}
+	if again := qWifiOpsFor(v, qTestPlan(v, []string{"02:00:00:00:00:0a"})); again.any() {
+		t.Fatalf("turning an SSID off changed the layer: %+v", again.wireless)
+	}
+}
+
+func TestQWifiLastRevokeStillReconnects(t *testing.T) {
+	v := qWifiTestView()
+	o := qWifiOpsFor(v, qTestPlan(v, []string{"02:00:00:00:00:0a"}))
+	qApplyOps(t, &v, append(append(append(o.network, o.dhcp...), o.firewall...), o.wireless...))
+	o = qWifiOpsFor(v, qTestPlan(v, nil))
+	if strings.Join(o.moved["home2"], ",") != "02:00:00:00:00:0a" {
+		t.Fatalf("the last revoked device is not reconnected: %v", o.moved)
+	}
+}
+
+func TestQTakenSubnetsIgnoresDefaultAndSplitRoutes(t *testing.T) {
+	taken := qTakenSubnets(qWifiView{}, nil, []string{"0.0.0.0/1", "128.0.0.0/1", "0.0.0.0/0", "198.51.100.0/24"})
+	if len(taken) != 1 || taken[0].String() != "198.51.100.0/24" {
+		t.Fatalf("taken: %v", taken)
+	}
+	if _, err := qPickRouterIP(taken); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestQWifiDnsmasqInterfaceList(t *testing.T) {
+	v := qWifiTestView()
+	v.dhcp["main"] = uciSection{Type: "dnsmasq", Options: map[string][]string{"interface": {"home"}}}
+	o := qWifiOpsFor(v, qTestPlan(v, []string{"02:00:00:00:00:0a"}))
+	qApplyOps(t, &v, append(append(append(o.network, o.dhcp...), o.firewall...), o.wireless...))
+	if strings.Join(v.dhcp["main"].Options["interface"], ",") != "home,"+qNet {
+		t.Fatalf("a bound dnsmasq does not serve the quarantine network: %v", v.dhcp["main"].Options["interface"])
+	}
+	o = qWifiOpsFor(v, qWifiPlan{})
+	qApplyOps(t, &v, append(append(append(o.network, o.dhcp...), o.firewall...), o.wireless...))
+	if strings.Join(v.dhcp["main"].Options["interface"], ",") != "home" {
+		t.Fatalf("not removed again: %v", v.dhcp["main"].Options["interface"])
+	}
+}
+
+func TestQuarantineWifiRevertIsRecordedNotRebuilt(t *testing.T) {
+	f := newQFake(t)
+	f.enable(t, "internet", "home")
+	w := newQWifiFake(t, f)
+	before := qWifiView{wireless: qCopySections(w.v.wireless), network: qCopySections(w.v.network), dhcp: qCopySections(w.v.dhcp), firewall: qCopySections(w.v.firewall)}
+	beforeIncludes := map[string]map[string]string{}
+	for k, v := range f.sections {
+		beforeIncludes[k] = v
+	}
+	if _, err := QuarantineWifiEnable("192.0.2.10", false); err != nil {
+		t.Fatal(err)
+	}
+	// The confirm window ran out: every config is put back.
+	w.v = before
+	f.sections = beforeIncludes
+	w.ops = nil
+	qPoll(time.Now().Add(time.Hour))
+	if loadQState().Wifi.Enabled {
+		t.Fatal("the reverted layer is still recorded as on")
+	}
+	if _, ok := w.v.network[qNet]; ok {
+		t.Fatal("the reverted quarantine network was rebuilt")
+	}
+	if strings.Join(qActualZones(mustShowPkg(t, "firewall")), ",") != "home" {
+		t.Fatalf("hooks after the revert: %v", qActualZones(mustShowPkg(t, "firewall")))
+	}
+}
+
+func qCopySections(m map[string]uciSection) map[string]uciSection {
+	out := map[string]uciSection{}
+	for k, s := range m {
+		opts := map[string][]string{}
+		for o, v := range s.Options {
+			opts[o] = append([]string(nil), v...)
+		}
+		out[k] = uciSection{Type: s.Type, Options: opts}
+	}
+	return out
 }

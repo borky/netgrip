@@ -33,6 +33,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -95,12 +96,28 @@ type qWifiView struct {
 	firewall map[string]uciSection
 }
 
+// qWirelessShowFn reads the Wi-Fi config with `uci -X`: an unnamed
+// wifi-iface (added by LuCI) gets the real section name netifd and the
+// executor use, not an @wifi-iface[N] index.
+var qWirelessShowFn = func() (string, error) {
+	out, err := exec.Command("uci", "-X", "show", "wireless").Output()
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
+}
+
 func readQWifiView() (qWifiView, error) {
 	v := qWifiView{}
+	show, err := qWirelessShowFn()
+	if err != nil {
+		return v, fmt.Errorf("reading the wireless config: %w", err)
+	}
+	v.wireless = parseUCIShow(show, "wireless")
 	for _, c := range []struct {
 		pkg string
 		dst *map[string]uciSection
-	}{{"wireless", &v.wireless}, {"network", &v.network}, {"dhcp", &v.dhcp}, {"firewall", &v.firewall}} {
+	}{{"network", &v.network}, {"dhcp", &v.dhcp}, {"firewall", &v.firewall}} {
 		show, err := uciShowFn(c.pkg)
 		if err != nil {
 			return v, fmt.Errorf("reading the %s config: %w", c.pkg, err)
@@ -109,6 +126,9 @@ func readQWifiView() (qWifiView, error) {
 	}
 	return v, nil
 }
+
+// qUCIUnsafe matches what the executor refuses to write.
+var qUCIUnsafe = regexp.MustCompile("[;\n\r`]")
 
 func sortedSections(m map[string]uciSection, typ string) []string {
 	out := []string{}
@@ -187,21 +207,28 @@ func qWifiSSIDs(v qWifiView, zones []QZone, protected []string) []QWifiSSID {
 			q.Network = own[0]
 			q.Zone = zoneOf[own[0]]
 		}
-		q.Applied = s.Option(qWifiMarker) != "" && s.Option("network") == qNet
+		held := s.Option(qWifiMarker) != ""
+		q.Applied = held && s.Option("network") == qNet
 		mode := s.Option("mode")
 		switch {
+		case strings.ContainsAny(name, "@[]"):
+			q.Reason = "its config section has no name"
 		case q.Zone == "" || !prot[q.Zone]:
 			q.Reason = "its network is not in a protected zone"
 		case len(own) != 1:
 			q.Reason = "it is attached to more than one network"
 		case mode != "" && mode != "ap":
 			q.Reason = "it is not an access point (mode " + mode + ")"
-		case s.Option("disabled") == "1":
+		case s.Option("disabled") == "1" && !held:
+			// One the layer already holds stays in it while off (a Wi-Fi
+			// schedule turns SSIDs off every night).
 			q.Reason = "it is turned off"
 		case !qPSKEncryption(s.Option("encryption")):
 			q.Reason = "it does not use a shared password (WPA2 or WPA3 Personal)"
 		case s.Option("key") == "":
 			q.Reason = "its password is not stored in the config"
+		case qUCIUnsafe.MatchString(s.Option("key")):
+			q.Reason = "its password contains a character NetGrip cannot write (; or `)"
 		case s.Option("wds") == "1":
 			q.Reason = "it is a WDS link"
 		case s.Option("wpa_psk_file") != "" || s.Option("sae_password_file") != "":
@@ -223,8 +250,12 @@ func qWifiSSIDs(v qWifiView, zones []QZone, protected []string) []QWifiSSID {
 func qTakenSubnets(v qWifiView, ifaces []ubus.InterfaceState, routes []string) []*net.IPNet {
 	var out []*net.IPNet
 	add := func(cidr string) {
+		// A default route, or a VPN's split one (0.0.0.0/1 + 128.0.0.0/1),
+		// covers everything: it says nothing about which networks exist.
 		if _, n, err := net.ParseCIDR(cidr); err == nil && n.IP.To4() != nil {
-			out = append(out, n)
+			if ones, _ := n.Mask.Size(); ones >= 8 {
+				out = append(out, n)
+			}
 		}
 	}
 	for name, s := range v.network {
@@ -465,7 +496,7 @@ func qWifiOpsFor(v qWifiView, p qWifiPlan) qOps {
 			ensureOption(&o.wireless, s, key, "dynamic_vlan", []string{"1"})
 			ensureOption(&o.wireless, s, key, qWifiMarker, []string{c.Network})
 			if len(o.wireless) > before {
-				o.radios[s.Option("device")] = true
+				markRadios(o.radios, s)
 			}
 			continue
 		}
@@ -479,7 +510,7 @@ func qWifiOpsFor(v qWifiView, p qWifiPlan) qOps {
 			if s.Option("dynamic_vlan") != "" {
 				o.wireless = append(o.wireless, executor.Op{Kind: "uci_delete", Args: []string{key + ".dynamic_vlan"}})
 			}
-			o.radios[s.Option("device")] = true
+			markRadios(o.radios, s)
 		}
 	}
 
@@ -491,7 +522,6 @@ func qWifiOpsFor(v qWifiView, p qWifiPlan) qOps {
 			continue
 		}
 		s := v.wireless[name]
-		radio := s.Option("device")
 		vlan, sta := qVlanPfx+name, qStaPfx+name
 		wantVlan[vlan], wantSta[sta] = true, true
 		before := len(o.wireless)
@@ -499,12 +529,13 @@ func qWifiOpsFor(v qWifiView, p qWifiPlan) qOps {
 			"name": {qVlanName}, "vid": {qVlanID}, "network": {c.Network}, "iface": {name},
 		})
 		if len(o.wireless) > before {
-			o.radios[radio] = true
+			markRadios(o.radios, s)
 		}
 		if len(p.approved) == 0 {
-			if _, ok := v.wireless[sta]; ok {
+			if old, ok := v.wireless[sta]; ok {
 				o.wireless = append(o.wireless, executor.Op{Kind: "uci_delete", Args: []string{"wireless." + sta}})
-				o.stationRadios[radio] = true
+				markRadios(o.stationRadios, s)
+				o.moved[name] = qMACDiff(old.Options["mac"], nil)
 			}
 			continue
 		}
@@ -513,7 +544,7 @@ func qWifiOpsFor(v qWifiView, p qWifiPlan) qOps {
 			"key": {s.Option("key")}, "vid": {qVlanID}, "mac": p.approved, "iface": {name},
 		})
 		if len(o.wireless) > before {
-			o.stationRadios[radio] = true
+			markRadios(o.stationRadios, s)
 			o.moved[name] = qMACDiff(v.wireless[sta].Options["mac"], p.approved)
 		}
 	}
@@ -522,7 +553,25 @@ func qWifiOpsFor(v qWifiView, p qWifiPlan) qOps {
 	})
 	for n := range v.wireless {
 		if (strings.HasPrefix(n, qVlanPfx) && !wantVlan[n]) || (strings.HasPrefix(n, qStaPfx) && !wantSta[n]) {
-			o.radios[v.wireless[strings.TrimPrefix(strings.TrimPrefix(n, qVlanPfx), qStaPfx)].Option("device")] = true
+			markRadios(o.radios, v.wireless[strings.TrimPrefix(strings.TrimPrefix(n, qVlanPfx), qStaPfx)])
+		}
+	}
+
+	// A dnsmasq bound to a list of interfaces must also serve this one.
+	for _, name := range sortedSections(v.dhcp, "dnsmasq") {
+		ifs := v.dhcp[name].Options["interface"]
+		if len(ifs) == 0 {
+			continue
+		}
+		has := false
+		for _, i := range ifs {
+			has = has || i == qNet
+		}
+		key := "dhcp." + name + ".interface"
+		if p.enabled && !has {
+			o.dhcp = append(o.dhcp, executor.Op{Kind: "uci_add_list", Args: []string{key, qNet}})
+		} else if !p.enabled && has {
+			o.dhcp = append(o.dhcp, executor.Op{Kind: "uci_del_list", Args: []string{key, qNet}})
 		}
 	}
 
@@ -547,6 +596,7 @@ func qWifiOpsFor(v qWifiView, p qWifiPlan) qOps {
 	})
 	dhcpOpts := map[string][]string{
 		"interface": {qNet}, "start": {"100"}, "limit": {"150"}, "leasetime": {"1h"},
+		"dhcpv4": {"server"}, // read when odhcpd serves DHCPv4; dnsmasq ignores it
 	}
 	if len(p.dns) > 0 {
 		dhcpOpts["dhcp_option"] = p.dns
@@ -601,6 +651,25 @@ func qWifiOpsFor(v qWifiView, p qWifiPlan) qOps {
 	delete(o.radios, "")
 	delete(o.stationRadios, "")
 	return o
+}
+
+// markRadios marks every radio an SSID runs on (one, or several for a
+// multi-radio SSID).
+func markRadios(m map[string]bool, s uciSection) {
+	for _, d := range s.Options["device"] {
+		if d != "" {
+			m[d] = true
+		}
+	}
+}
+
+func anyRadio(m map[string]bool, s uciSection) bool {
+	for _, d := range s.Options["device"] {
+		if m[d] {
+			return true
+		}
+	}
+	return false
 }
 
 // qMACDiff lists the MACs in one list and not the other, both ways.
@@ -809,11 +878,13 @@ func qWifiApplyLocked(v qWifiView, p qWifiPlan) error {
 		return err
 	}
 	// A restarted SSID reconnects everyone anyway; elsewhere only the
-	// stations whose entry changed must reconnect.
+	// stations whose entry changed must reconnect, once hostapd has
+	// re-read its station files (wifi reload returns before that).
 	if len(o.moved) > 0 {
+		time.Sleep(qKickDelay)
 		bss := qBSSFn()
 		for section, macs := range o.moved {
-			if o.radios[v.wireless[section].Option("device")] {
+			if anyRadio(o.radios, v.wireless[section]) {
 				continue
 			}
 			b, ok := bss[section]
@@ -835,6 +906,9 @@ func qWifiApplyLocked(v qWifiView, p qWifiPlan) error {
 	}
 	return nil
 }
+
+// qKickDelay is how long a reload is given before stations are kicked.
+var qKickDelay = 3 * time.Second
 
 // qKicked remembers when a misplaced station was last disconnected.
 var qKicked = map[string]time.Time{}
@@ -1026,6 +1100,28 @@ func qWifiSyncLocked(st *qState, r qRouter, now time.Time) (QWifiProbe, error) {
 	if !p.enabled {
 		return wp, nil
 	}
+	if !qWifiMarked(v) {
+		// No SSID carries the layer any more: a confirm-window revert put
+		// the configs back, or someone removed it by hand. Record it as
+		// off and clear what is left, rather than rebuild it.
+		log.Printf("netgrip: quarantine: no Wi-Fi network is on the quarantine network any more; recording the Wi-Fi layer as off")
+		if err := qWifiApplyLocked(v, qWifiPlan{}); err != nil {
+			return wp, err
+		}
+		st.Wifi.Enabled = false
+		if err := saveQState(st); err != nil {
+			return wp, err
+		}
+		fw, err := uciShowFn("firewall")
+		if err != nil {
+			return wp, err
+		}
+		if err := applyQIncludes(qIncludeOps(qIncludeSections(fw), qHookZones(st))); err != nil {
+			return wp, err
+		}
+		wp.Enabled = false
+		return wp, nil
+	}
 	wp.Subnet = p.routerIP + "/24"
 	// Only SSIDs the layer already holds: a newly covered SSID waits for
 	// the user (a zone change or turning the layer on again).
@@ -1044,6 +1140,16 @@ func qWifiSyncLocked(st *qState, r qRouter, now time.Time) (QWifiProbe, error) {
 	}
 	wp.Quarantined = qWifiHealLocked(st, v, p, now)
 	return wp, nil
+}
+
+// qWifiMarked reports whether any SSID carries the layer's marker.
+func qWifiMarked(v qWifiView) bool {
+	for _, name := range sortedSections(v.wireless, "wifi-iface") {
+		if v.wireless[name].Option(qWifiMarker) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // qWifiFollowZonesLocked brings the layer in line with the protected
@@ -1083,6 +1189,15 @@ func qWifiProbeLocked(st *qState, r qRouter) QWifiProbe {
 	}
 	if s, ok := v.network[qDevSection]; ok {
 		wp.Quarantined = len(qQuarantineFDBFn(s.Option("name")))
+	}
+	dns := map[string]bool{}
+	for _, s := range wp.SSIDs {
+		if s.Applied {
+			dns[strings.Join(qDNSFor(v.dhcp, s.Network), " ")] = true
+		}
+	}
+	if len(dns) > 1 {
+		wp.Issues = append(wp.Issues, "the protected Wi-Fi networks hand out different DNS servers; the quarantine network uses those of the first one")
 	}
 	for _, s := range wp.SSIDs {
 		switch {

@@ -490,6 +490,10 @@ func newQFake(t *testing.T) *qFake {
 	qWanStickyMu.Unlock()
 	oldBudget, oldUsed, oldSum := qBudgetStart, qBudgetUsed, qBudgetSummaries
 	qMissingPolls, qLastFlush, qLastFullCheck, qForceFull = 0, time.Time{}, time.Time{}, false
+	oWireless, oKickDelay := qWirelessShowFn, qKickDelay
+	qWirelessShowFn = func() (string, error) { return uciShowFn("wireless") }
+	qKickDelay = 0
+	t.Cleanup(func() { qWirelessShowFn, qKickDelay = oWireless, oKickDelay })
 	qBudgetStart, qBudgetUsed, qBudgetSummaries = time.Time{}, 0, 0
 	t.Cleanup(func() {
 		quarantineDir, qStatePath = oldDir, oldState
