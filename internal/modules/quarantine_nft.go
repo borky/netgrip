@@ -6,7 +6,7 @@ package modules
 // through a table of its own:
 //
 //   - one `table-prepend` include holds the sets and the two chains
-//     (netgrip_q_input, netgrip_q_forward), with the approved MACs written
+//     (netgrip_quarantine_input, netgrip_quarantine_forward), with the approved MACs written
 //     into the set, so a firewall reload or a reboot recreates everything
 //     already filled: there is no empty-set window in which approved devices
 //     would be cut off;
@@ -36,23 +36,36 @@ import (
 )
 
 const (
-	qTable        = "fw4" // firewall4's table: the include lives inside it
-	qSetOK        = "netgrip_q_ok"
-	qSetSeen      = "netgrip_q_seen"
-	qSetWan       = "netgrip_q_wan"
-	qSetPriv4     = "netgrip_q_private4"
-	qSetPriv6     = "netgrip_q_private6"
-	qSetDNS4      = "netgrip_q_dns4"
-	qSetDNS6      = "netgrip_q_dns6"
-	qSetOff       = "netgrip_q_off"
-	qChainInput   = "netgrip_q_input"
-	qChainForward = "netgrip_q_forward"
+	qTable = "fw4" // firewall4's table: the include lives inside it
+	// Every name says what made it: netgrip_quarantine_*. Each rule, set
+	// and chain also carries a "netgrip quarantine: ..." comment.
+	qSetOK        = "netgrip_quarantine_approved"
+	qSetSeen      = "netgrip_quarantine_seen"
+	qSetWan       = "netgrip_quarantine_uplinks"
+	qSetPriv4     = "netgrip_quarantine_private4"
+	qSetPriv6     = "netgrip_quarantine_private6"
+	qSetDNS4      = "netgrip_quarantine_dns4"
+	qSetDNS6      = "netgrip_quarantine_dns6"
+	qSetOff       = "netgrip_quarantine_paused"
+	qChainInput   = "netgrip_quarantine_input"
+	qChainForward = "netgrip_quarantine_forward"
 
-	// UCI section names of the includes. All start with qSectionPrefix so
-	// the feature can find and remove every one of its sections.
-	qSectionPrefix = "netgrip_q"
-	qSectionTable  = "netgrip_q_table"
+	// UCI section names of the includes: qSectionPrefix + table, input_<n>,
+	// forward_<n>. qLegacyPrefix is the first release's naming
+	// (netgrip_q_table, netgrip_q_in_<n>, netgrip_q_fw_<n>): still the
+	// feature's own, renamed by the poller.
+	qSectionPrefix = "netgrip_quarantine_"
+	qSectionTable  = "netgrip_quarantine_table"
+	qLegacyPrefix  = "netgrip_q_"
+
+	// qCommentPrefix starts every comment the feature writes.
+	qCommentPrefix = "netgrip quarantine: "
 )
+
+// qc appends the feature's comment to a rule.
+func qc(rule, what string) string {
+	return rule + ` comment "` + qCommentPrefix + what + `"`
+}
 
 // quarantineDir holds the include files; a var so tests can redirect it.
 var quarantineDir = "/etc/netgrip/quarantine"
@@ -79,7 +92,7 @@ const qSeenTimeout = 3600
 
 // qRuleSet is everything the generated chains depend on. A pause "off" is
 // not part of it: it lives in the kernel as a timed element of
-// netgrip_q_off, so it ends on time even without NetGrip. A firewall reload
+// netgrip_quarantine_paused, so it ends on time even without NetGrip. A firewall reload
 // starts the set empty; while NetGrip runs, its poller puts the remaining
 // pause back.
 type qRuleSet struct {
@@ -146,10 +159,10 @@ func elementsLine(elems []string) string {
 // then, during a pause "off", leaves too.
 func qHeadRules() []string {
 	return []string{
-		"meta iiftype != ether return",
-		"ether saddr @" + qSetOK + " return",
-		"update @" + qSetSeen + " { ether saddr }",
-		"meta nfproto @" + qSetOff + " return",
+		qc("meta iiftype != ether return", "no MAC to check (VPN, PPP), not affected"),
+		qc("ether saddr @"+qSetOK+" return", "approved device, normal access"),
+		qc("update @"+qSetSeen+" { ether saddr }", "record a device that is not approved"),
+		qc("meta nfproto @"+qSetOff+" return", "protection paused"),
 	}
 }
 
@@ -157,41 +170,43 @@ func qHeadRules() []string {
 // DNAT, to whatever port) or when it goes to a resolver DHCP hands out.
 func qDNSRules() []string {
 	return []string{
-		"ct status dnat ct original proto-dst 53 return",
-		"ip daddr @" + qSetDNS4 + " meta l4proto { tcp, udp } th dport 53 return",
-		"ip6 daddr @" + qSetDNS6 + " meta l4proto { tcp, udp } th dport 53 return",
+		qc("ct status dnat ct original proto-dst 53 return", "DNS redirected by the router"),
+		qc("ip daddr @"+qSetDNS4+" meta l4proto { tcp, udp } th dport 53 return", "DNS to the resolver DHCP hands out"),
+		qc("ip6 daddr @"+qSetDNS6+" meta l4proto { tcp, udp } th dport 53 return", "DNS to the resolver DHCP hands out"),
 	}
 }
 
-// qInputRules are the rules of netgrip_q_input, one per line. A device that
+// qInputRules are the rules of netgrip_quarantine_input, one per line. A device that
 // is not approved may still get an address and names from the router (DHCP,
 // DHCPv6, DNS, NTP, IPv6 neighbour discovery); everything else addressed to
 // the router - the panel, SSH, LuCI - is refused.
 func qInputRules(rs qRuleSet) []string {
 	r := append(qHeadRules(), qDNSRules()...)
 	return append(r,
-		"udp dport { 53, 67, 123, 547 } return",
-		"tcp dport 53 return",
-		"icmpv6 type { nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert } return",
-		`counter reject comment "netgrip quarantine"`,
+		qc("udp dport { 53, 67, 123, 547 } return", "address, DNS and time from the router"),
+		qc("tcp dport 53 return", "DNS from the router"),
+		qc("icmpv6 type { nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert } return", "IPv6 neighbour discovery"),
+		qc("counter reject", "not approved, router access refused"),
 	)
 }
 
-// qForwardRules are the rules of netgrip_q_forward. "internet": out through
+// qForwardRules are the rules of netgrip_quarantine_forward. "internet": out through
 // a WAN interface, to a public address, only. "nothing": no forwarding.
 // With no WAN interface known the oifname test matches everything, so
 // "internet" fails closed rather than open.
 func qForwardRules(rs qRuleSet) []string {
 	r := append(qHeadRules(), qDNSRules()...)
 	if rs.Mode == "internet" {
+		// The drift check tells the modes apart by "oifname": keep that
+		// word out of the comments.
 		return append(r,
-			`oifname != @`+qSetWan+` counter reject comment "netgrip quarantine"`,
-			`ip daddr @`+qSetPriv4+` counter reject comment "netgrip quarantine"`,
-			`ip6 daddr @`+qSetPriv6+` counter reject comment "netgrip quarantine"`,
-			"return",
+			qc(`oifname != @`+qSetWan+` counter reject`, "not approved, internet only"),
+			qc(`ip daddr @`+qSetPriv4+` counter reject`, "not approved, no private addresses"),
+			qc(`ip6 daddr @`+qSetPriv6+` counter reject`, "not approved, no private addresses"),
+			qc("return", "not approved, internet allowed"),
 		)
 	}
-	return append(r, `counter reject comment "netgrip quarantine"`)
+	return append(r, qc("counter reject", "not approved, no access"))
 }
 
 // renderQTable renders the table-prepend include: sets and chains, as fw4
@@ -199,22 +214,30 @@ func qForwardRules(rs qRuleSet) []string {
 func renderQTable(rs qRuleSet) string {
 	var b strings.Builder
 	b.WriteString("# Generated by NetGrip (device quarantine). Do not edit: rewritten on every change.\n")
-	fmt.Fprintf(&b, "set %s { type ether_addr;%s }\n", qSetOK, elementsLine(sortedMACs(rs.Approved)))
-	fmt.Fprintf(&b, "set %s { type ether_addr; size 16384; flags dynamic, timeout; timeout %ds; }\n", qSetSeen, qSeenTimeout)
-	fmt.Fprintf(&b, "set %s { type nf_proto; flags timeout; }\n", qSetOff)
-	fmt.Fprintf(&b, "set %s { type ifname;%s }\n", qSetWan, elementsLine(quoted(sortedIfnames(rs.Wan))))
-	fmt.Fprintf(&b, "set %s { type ipv4_addr; flags interval;%s }\n", qSetPriv4, elementsLine(qPrivate4))
-	fmt.Fprintf(&b, "set %s { type ipv6_addr; flags interval;%s }\n", qSetPriv6, elementsLine(qPrivate6))
+	set := func(name, spec, what string) {
+		fmt.Fprintf(&b, "set %s { %s comment \"%s%s\"; }\n", name, spec, qCommentPrefix, what)
+	}
+	set(qSetOK, "type ether_addr;"+elementsLine(sortedMACs(rs.Approved)), "approved devices")
+	set(qSetSeen, fmt.Sprintf("type ether_addr; size 16384; flags dynamic, timeout; timeout %ds;", qSeenTimeout), "devices seen that are not approved")
+	set(qSetOff, "type nf_proto; flags timeout;", "protection paused until the timeout")
+	set(qSetWan, "type ifname;"+elementsLine(quoted(sortedIfnames(rs.Wan))), "uplink interfaces (the internet)")
+	set(qSetPriv4, "type ipv4_addr; flags interval;"+elementsLine(qPrivate4), "addresses that are not the internet")
+	set(qSetPriv6, "type ipv6_addr; flags interval;"+elementsLine(qPrivate6), "addresses that are not the internet")
 	dns4, dns6 := splitIPs(rs.DNS)
-	fmt.Fprintf(&b, "set %s { type ipv4_addr;%s }\n", qSetDNS4, elementsLine(dns4))
-	fmt.Fprintf(&b, "set %s { type ipv6_addr;%s }\n", qSetDNS6, elementsLine(dns6))
-	writeChain(&b, qChainInput, qInputRules(rs), "")
-	writeChain(&b, qChainForward, qForwardRules(rs), "")
+	set(qSetDNS4, "type ipv4_addr;"+elementsLine(dns4), "resolvers DHCP hands out")
+	set(qSetDNS6, "type ipv6_addr;"+elementsLine(dns6), "resolvers DHCP hands out")
+	writeChain(&b, qChainInput, qInputRules(rs), "", "devices that are not approved, to the router")
+	writeChain(&b, qChainForward, qForwardRules(rs), "", "devices that are not approved, through the router")
 	return b.String()
 }
 
-func writeChain(b *strings.Builder, name string, rules []string, indent string) {
+// writeChain renders a chain; what, when set, becomes the chain's comment
+// (left out of a runtime update, which only refills an existing chain).
+func writeChain(b *strings.Builder, name string, rules []string, indent, what string) {
 	fmt.Fprintf(b, "%schain %s {\n", indent, name)
+	if what != "" {
+		fmt.Fprintf(b, "%s\tcomment \"%s%s\"\n", indent, qCommentPrefix, what)
+	}
 	for _, r := range rules {
 		fmt.Fprintf(b, "%s\t%s\n", indent, r)
 	}
@@ -222,8 +245,12 @@ func writeChain(b *strings.Builder, name string, rules []string, indent string) 
 }
 
 // The chain-prepend includes: one line each, the same for every zone.
-func renderQInputJump() string   { return "jump " + qChainInput + "\n" }
-func renderQForwardJump() string { return "jump " + qChainForward + "\n" }
+func renderQInputJump() string {
+	return qc("jump "+qChainInput, "check devices that are not approved") + "\n"
+}
+func renderQForwardJump() string {
+	return qc("jump "+qChainForward, "check devices that are not approved") + "\n"
+}
 
 // renderQRuntimeUpdate is one nft transaction that brings the live chains,
 // the approved set and the WAN set in line with rs, without a firewall
@@ -250,8 +277,8 @@ func renderQRuntimeUpdate(rs qRuleSet) string {
 		fmt.Fprintf(&b, "add element inet %s %s { %s }\n", qTable, qSetDNS6, strings.Join(dns6, ", "))
 	}
 	fmt.Fprintf(&b, "table inet %s {\n", qTable)
-	writeChain(&b, qChainInput, qInputRules(rs), "\t")
-	writeChain(&b, qChainForward, qForwardRules(rs), "\t")
+	writeChain(&b, qChainInput, qInputRules(rs), "\t", "")
+	writeChain(&b, qChainForward, qForwardRules(rs), "\t", "")
 	b.WriteString("}\n")
 	return b.String()
 }
@@ -261,7 +288,7 @@ func renderQRuntimeUpdate(rs qRuleSet) string {
 // before the real firewall ever loads it.
 func renderQCheck(rs qRuleSet) string {
 	var b strings.Builder
-	b.WriteString("table inet netgrip_q_check {\n")
+	b.WriteString("table inet netgrip_quarantine_check {\n")
 	b.WriteString(renderQTable(rs))
 	b.WriteString("chain zone_input {\n\t" + strings.TrimSpace(renderQInputJump()) + "\n}\n")
 	b.WriteString("chain zone_forward {\n\t" + strings.TrimSpace(renderQForwardJump()) + "\n}\n")

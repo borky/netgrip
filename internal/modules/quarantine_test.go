@@ -229,11 +229,11 @@ func TestQDHCPDNSServers(t *testing.T) {
 }
 
 func TestQActualZones(t *testing.T) {
-	show := `firewall.netgrip_q_table=include
-firewall.netgrip_q_in_0=include
-firewall.netgrip_q_in_0.chain='input_guests'
-firewall.netgrip_q_fw_0.chain='forward_guests'
-firewall.netgrip_q_in_1.chain='input_home'
+	show := `firewall.netgrip_quarantine_table=include
+firewall.netgrip_quarantine_input_0=include
+firewall.netgrip_quarantine_input_0.chain='input_guests'
+firewall.netgrip_quarantine_forward_0.chain='forward_guests'
+firewall.netgrip_quarantine_input_1.chain='input_home'
 firewall.other.chain='input_x'
 `
 	if got := strings.Join(qActualZones(show), ","); got != "guests,home" {
@@ -259,29 +259,54 @@ func TestRenderQTable(t *testing.T) {
 		Wan: []string{"pppoe-x", "eth9", "bad name"}, DNS: []string{"192.0.2.53", "2001:db8::53", "junk"}}
 	out := renderQTable(rs)
 	for _, want := range []string{
-		"set netgrip_q_ok { type ether_addr; elements = { 02:00:00:00:00:0a, 02:00:00:00:00:0b }; }",
-		`set netgrip_q_wan { type ifname; elements = { "eth9", "pppoe-x" }; }`,
-		"set netgrip_q_off { type nf_proto; flags timeout; }",
-		"set netgrip_q_dns4 { type ipv4_addr; elements = { 192.0.2.53 }; }",
-		"set netgrip_q_dns6 { type ipv6_addr; elements = { 2001:db8::53 }; }",
+		`set netgrip_quarantine_approved { type ether_addr; elements = { 02:00:00:00:00:0a, 02:00:00:00:00:0b }; comment "netgrip quarantine: approved devices"; }`,
+		`set netgrip_quarantine_uplinks { type ifname; elements = { "eth9", "pppoe-x" }; comment "netgrip quarantine: uplink interfaces (the internet)"; }`,
+		`set netgrip_quarantine_paused { type nf_proto; flags timeout; comment "netgrip quarantine: protection paused until the timeout"; }`,
+		"set netgrip_quarantine_dns4 { type ipv4_addr; elements = { 192.0.2.53 };",
+		"set netgrip_quarantine_dns6 { type ipv6_addr; elements = { 2001:db8::53 };",
 		"flags dynamic, timeout",
 		"meta iiftype != ether return",
 		"ct status dnat ct original proto-dst 53 return",
 		"udp dport { 53, 67, 123, 547 } return",
-		"oifname != @netgrip_q_wan counter reject",
-		"ip daddr @netgrip_q_private4 counter reject",
-		"ip6 daddr @netgrip_q_private6 counter reject",
+		"oifname != @netgrip_quarantine_uplinks counter reject",
+		"ip daddr @netgrip_quarantine_private4 counter reject",
+		"ip6 daddr @netgrip_quarantine_private6 counter reject",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("missing %q in:\n%s", want, out)
 		}
 	}
 	empty := renderQTable(qRuleSet{Mode: "nothing"})
-	if strings.Contains(empty, "elements = {  }") || !strings.Contains(empty, "set netgrip_q_ok { type ether_addr; }") {
+	if strings.Contains(empty, "elements = {  }") || !strings.Contains(empty, `set netgrip_quarantine_approved { type ether_addr; comment "netgrip quarantine: approved devices"; }`) {
 		t.Fatalf("empty sets:\n%s", empty)
 	}
 	if strings.Contains(empty, "oifname") {
 		t.Fatal("nothing mode must not allow the WAN")
+	}
+}
+
+// Everything the feature puts in the firewall says so: every rule, set and
+// chain, and the jumps it adds to the zones' own chains.
+func TestQEverythingIsLabelled(t *testing.T) {
+	for _, mode := range []string{"internet", "nothing"} {
+		rs := qRuleSet{Mode: mode, Approved: []string{"02:00:00:00:00:0a"}, Wan: []string{"eth9"}, DNS: []string{"192.0.2.53"}}
+		for _, line := range strings.Split(renderQTable(rs)+renderQInputJump()+renderQForwardJump(), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" || line == "}" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			if strings.HasPrefix(line, "set ") || strings.HasPrefix(line, "chain ") {
+				if !strings.Contains(line, "netgrip_quarantine_") {
+					t.Errorf("not named after the feature: %s", line)
+				}
+				if strings.HasPrefix(line, "chain ") {
+					continue // the chain's comment is its first line
+				}
+			}
+			if !strings.Contains(line, `comment "`+qCommentPrefix) {
+				t.Errorf("no feature comment: %s", line)
+			}
+		}
 	}
 }
 
@@ -293,12 +318,12 @@ func TestQRuleOrder(t *testing.T) {
 		qInputRules(qRuleSet{Mode: "internet"}),
 		qForwardRules(qRuleSet{Mode: "nothing"}),
 	} {
-		if rules[0] != "meta iiftype != ether return" || !strings.HasPrefix(rules[1], "ether saddr @netgrip_q_ok return") {
+		if !strings.HasPrefix(rules[0], "meta iiftype != ether return") || !strings.HasPrefix(rules[1], "ether saddr @netgrip_quarantine_approved return") {
 			t.Fatalf("head: %v", rules)
 		}
 		off, firstReject := -1, -1
 		for i, r := range rules {
-			if strings.Contains(r, "@netgrip_q_off return") {
+			if strings.Contains(r, "@netgrip_quarantine_paused return") {
 				off = i
 			}
 			if strings.Contains(r, "reject") && firstReject < 0 {
@@ -318,7 +343,7 @@ func TestQRuleOrder(t *testing.T) {
 }
 
 func TestQOffPauseScript(t *testing.T) {
-	if s := qOffPauseScript(90); !strings.Contains(s, "flush set inet fw4 netgrip_q_off") || !strings.Contains(s, "ipv4 timeout 90s, ipv6 timeout 90s") {
+	if s := qOffPauseScript(90); !strings.Contains(s, "flush set inet fw4 netgrip_quarantine_paused") || !strings.Contains(s, "ipv4 timeout 90s, ipv6 timeout 90s") {
 		t.Fatalf("set: %s", s)
 	}
 	if s := qOffPauseScript(0); strings.Contains(s, "add element") {
@@ -329,9 +354,9 @@ func TestQOffPauseScript(t *testing.T) {
 func TestRenderQRuntimeUpdateIsOneTransaction(t *testing.T) {
 	out := renderQRuntimeUpdate(qRuleSet{Mode: "internet", Approved: []string{"02:00:00:00:00:01"}, Wan: []string{"eth9"}, DNS: []string{"192.0.2.53"}})
 	for _, want := range []string{
-		"flush chain inet fw4 netgrip_q_input", "flush chain inet fw4 netgrip_q_forward",
-		"flush set inet fw4 netgrip_q_ok", "add element inet fw4 netgrip_q_ok { 02:00:00:00:00:01 }",
-		`add element inet fw4 netgrip_q_wan { "eth9" }`, "add element inet fw4 netgrip_q_dns4 { 192.0.2.53 }", "table inet fw4 {",
+		"flush chain inet fw4 netgrip_quarantine_input", "flush chain inet fw4 netgrip_quarantine_forward",
+		"flush set inet fw4 netgrip_quarantine_approved", "add element inet fw4 netgrip_quarantine_approved { 02:00:00:00:00:01 }",
+		`add element inet fw4 netgrip_quarantine_uplinks { "eth9" }`, "add element inet fw4 netgrip_quarantine_dns4 { 192.0.2.53 }", "table inet fw4 {",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("missing %q", want)
@@ -343,7 +368,7 @@ func TestRenderQRuntimeUpdateIsOneTransaction(t *testing.T) {
 }
 
 func TestQIncludeOpsAreValidAndOwned(t *testing.T) {
-	ops := qIncludeOps([]string{"netgrip_q_table", "netgrip_q_in_0"}, []string{"guests", "home"})
+	ops := qIncludeOps([]string{"netgrip_quarantine_table", "netgrip_quarantine_input_0"}, []string{"guests", "home"})
 	for _, op := range ops {
 		if err := executor.Validate(op); err != nil {
 			t.Fatalf("op rejected by the executor: %v", err)
@@ -351,17 +376,17 @@ func TestQIncludeOpsAreValidAndOwned(t *testing.T) {
 	}
 	joined := fmtOps(ops)
 	for _, want := range []string{
-		"uci_delete firewall.netgrip_q_table", "uci_delete firewall.netgrip_q_in_0",
-		"uci_set firewall.netgrip_q_table.position table-prepend",
-		"uci_set firewall.netgrip_q_in_0.chain input_guests",
-		"uci_set firewall.netgrip_q_fw_1.chain forward_home",
+		"uci_delete firewall.netgrip_quarantine_table", "uci_delete firewall.netgrip_quarantine_input_0",
+		"uci_set firewall.netgrip_quarantine_table.position table-prepend",
+		"uci_set firewall.netgrip_quarantine_input_0.chain input_guests",
+		"uci_set firewall.netgrip_quarantine_forward_1.chain forward_home",
 		"uci_commit firewall", "initd firewall reload",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("missing %q in\n%s", want, joined)
 		}
 	}
-	if strings.Contains(fmtOps(qIncludeOps([]string{"netgrip_q_table"}, nil)), "uci_set") {
+	if strings.Contains(fmtOps(qIncludeOps([]string{"netgrip_quarantine_table"}, nil)), "uci_set") {
 		t.Fatal("disable must not create sections")
 	}
 }
@@ -375,20 +400,20 @@ func fmtOps(ops []executor.Op) string {
 }
 
 func TestQIncludeSectionsOnlyOwned(t *testing.T) {
-	show := `firewall.netgrip_q_table=include
-firewall.netgrip_q_table.path='/x'
-firewall.netgrip_q_in_0=include
+	show := `firewall.netgrip_quarantine_table=include
+firewall.netgrip_quarantine_table.path='/x'
+firewall.netgrip_quarantine_input_0=include
 firewall.user_include=include
 firewall.netgrip_qos=rule
 firewall.@include[0]=include
 `
-	if got := strings.Join(qIncludeSections(show), ","); got != "netgrip_q_in_0,netgrip_q_table" {
+	if got := strings.Join(qIncludeSections(show), ","); got != "netgrip_quarantine_input_0,netgrip_quarantine_table" {
 		t.Fatalf("got %s", got)
 	}
 }
 
 func TestParseNftSetElements(t *testing.T) {
-	raw := `{"nftables":[{"metainfo":{}},{"set":{"family":"inet","name":"netgrip_q_seen","elem":[
+	raw := `{"nftables":[{"metainfo":{}},{"set":{"family":"inet","name":"netgrip_quarantine_seen","elem":[
 		"02:00:00:00:00:01",
 		{"elem":{"val":"02:00:00:00:00:0A","timeout":3600,"expires":3500}}]}}]}`
 	got, err := parseNftSetElementsTimed([]byte(raw))
@@ -607,7 +632,7 @@ func TestQuarantineEnableAlwaysTrustsTheRequester(t *testing.T) {
 			t.Fatalf("missing include file %s", file)
 		}
 	}
-	if f.sections["netgrip_q_in_0"]["chain"] != "input_home" || f.sections["netgrip_q_fw_0"]["chain"] != "forward_home" {
+	if f.sections["netgrip_quarantine_input_0"]["chain"] != "input_home" || f.sections["netgrip_quarantine_forward_0"]["chain"] != "forward_home" {
 		t.Fatalf("sections: %v", f.sections)
 	}
 }
@@ -813,7 +838,7 @@ func TestQPollRecordsAndNotifiesOnceEvenAfterForget(t *testing.T) {
 	if _, err := QuarantineForget("02:00:00:00:00:99"); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(strings.Join(f.nft, "\n"), "delete element inet fw4 netgrip_q_seen { 02:00:00:00:00:99 }") {
+	if !strings.Contains(strings.Join(f.nft, "\n"), "delete element inet fw4 netgrip_quarantine_seen { 02:00:00:00:00:99 }") {
 		t.Fatal("forget did not clear the live record")
 	}
 	qPoll(now.Add(10 * time.Second))
@@ -984,7 +1009,7 @@ func TestQPauseOffLivesInTheKernel(t *testing.T) {
 		t.Fatal(err)
 	}
 	live := strings.Join(f.nft, "\n")
-	if !strings.Contains(live, "add element inet fw4 netgrip_q_off { ipv4 timeout") {
+	if !strings.Contains(live, "add element inet fw4 netgrip_quarantine_paused { ipv4 timeout") {
 		t.Fatalf("pause off not set in the kernel:\n%s", live)
 	}
 	table, _ := os.ReadFile(qTableFile())
@@ -1099,6 +1124,34 @@ func TestQPollPersistentSyncFailureKeepsThePace(t *testing.T) {
 	}
 }
 
+func TestQPollRenamesTheFirstReleasesRules(t *testing.T) {
+	f := newQFake(t)
+	f.enable(t, "internet", "home")
+	// The firewall as the first release left it.
+	legacy := map[string]map[string]string{}
+	for name, sec := range f.sections {
+		old := strings.NewReplacer("netgrip_quarantine_input_", "netgrip_q_in_", "netgrip_quarantine_forward_", "netgrip_q_fw_", "netgrip_quarantine_table", "netgrip_q_table").Replace(name)
+		legacy[old] = sec
+	}
+	f.sections = legacy
+	fw, _ := uciShowFn("firewall")
+	if got := qActualZones(fw); strings.Join(got, ",") != "home" {
+		t.Fatalf("legacy sections not read as the feature's own: %v", got)
+	}
+	qPoll(time.Now())
+	for name := range f.sections {
+		if !strings.HasPrefix(name, "netgrip_quarantine_") {
+			t.Fatalf("legacy section left behind: %v", f.sections)
+		}
+	}
+	if len(f.sections) != 3 || f.sections["netgrip_quarantine_input_0"]["chain"] != "input_home" {
+		t.Fatalf("renamed sections: %v", f.sections)
+	}
+	if !loadQState().Enabled {
+		t.Fatal("the rename turned the feature off")
+	}
+}
+
 func TestQPollFullCheckIsPaced(t *testing.T) {
 	f := newQFake(t)
 	f.enable(t, "internet", "home")
@@ -1150,7 +1203,7 @@ func TestQPollReconcilesDrift(t *testing.T) {
 	qLiveDrifted = func(*qState, qRouter, time.Time) bool { return drift }
 	f.nft = nil
 	qPoll(time.Now())
-	if !strings.Contains(strings.Join(f.nft, "\n"), "flush chain inet fw4 netgrip_q_input") {
+	if !strings.Contains(strings.Join(f.nft, "\n"), "flush chain inet fw4 netgrip_quarantine_input") {
 		t.Fatal("drift was not repaired")
 	}
 	drift = false

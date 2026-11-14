@@ -158,7 +158,7 @@ cat > "$PKG_DIR/CONTROL/prerm" << 'PRERM'
 /etc/init.d/netgrip disable 2>/dev/null || true
 # Remove the device quarantine's firewall hooks: without NetGrip nothing
 # could approve a device or turn them off.
-q=$(uci -q show firewall | sed -n 's/^firewall\.\(netgrip_q[A-Za-z0-9_]*\)=include$/\1/p')
+q=$(uci -q show firewall | sed -n -e 's/^firewall\.\(netgrip_quarantine_[A-Za-z0-9_]*\)=include$/\1/p' -e 's/^firewall\.\(netgrip_q_[A-Za-z0-9_]*\)=include$/\1/p')
 if [ -n "$q" ]; then
 	for s in $q; do uci -q delete "firewall.$s"; done
 	uci -q commit firewall
