@@ -498,24 +498,39 @@ func TestQuarantineWifiLayerEndToEnd(t *testing.T) {
 		t.Fatalf("probe: %+v", p.Wifi)
 	}
 
-	// Approving a connected device: its entry, and it reconnects.
+	// Approving a connected device on a WPA3 SSID: its entry, and one
+	// restart of its radio a little later (hostapd reads SAE entries only
+	// when the BSS starts; a kick would resume the old placement).
 	w.kicked = nil
+	base := time.Now()
+	qNowFn = func() time.Time { return base }
 	if _, err := QuarantineApprove([]QApproveItem{{MAC: "02:00:00:00:00:66"}}); err != nil {
 		t.Fatal(err)
 	}
 	if got := w.v.wireless[qStaPfx+"home2"].Options["mac"]; strings.Join(got, ",") != "02:00:00:00:00:10,02:00:00:00:00:66" {
 		t.Fatalf("station entries after approve: %v", got)
 	}
-	if strings.Join(w.kicked, ";") != "phy9-ap0 02:00:00:00:00:66" {
-		t.Fatalf("kicked: %v", w.kicked)
+	if len(w.kicked) != 0 || qRestartDue["radio9"].IsZero() {
+		t.Fatalf("kicked %v, restart due %v: want a scheduled restart", w.kicked, qRestartDue)
 	}
-	// Revoking it: entry gone, reconnected onto the quarantine network.
-	w.kicked = nil
+	// Revoking it soon after joins the same restart.
+	qNowFn = func() time.Time { return base.Add(5 * time.Second) }
 	if _, err := QuarantineRevoke("02:00:00:00:00:66", "192.0.2.10", false); err != nil {
 		t.Fatal(err)
 	}
-	if strings.Join(w.kicked, ";") != "phy9-ap0 02:00:00:00:00:66" {
-		t.Fatalf("revoked device not reconnected: %v", w.kicked)
+	w.ops = nil
+	qPoll(base.Add(10 * time.Second)) // not due yet
+	qPoll(base.Add(5*time.Second + qRestartDebounce))
+	restarts := 0
+	for _, batch := range w.ops {
+		for _, op := range batch {
+			if op.Kind == "wifi_bounce" && op.Args[0] == "radio9" {
+				restarts++
+			}
+		}
+	}
+	if restarts != 1 {
+		t.Fatalf("%d restarts for an approve and a revoke in a row, want one", restarts)
 	}
 
 	// The poller syncs the layer and finds it settled: nothing to write.
@@ -581,6 +596,8 @@ func TestQuarantineWifiHealsAMisplacedApprovedDevice(t *testing.T) {
 	old := qKicked
 	qKicked = map[string]time.Time{}
 	t.Cleanup(func() { qKicked = old })
+	// On a WPA2-only SSID a kick is enough.
+	w.v.wireless["home2"].Options["encryption"] = []string{"psk2"}
 	// The approved requester and an unknown device are both heard on the
 	// quarantine network.
 	qQuarantineFDBFn = func(string) map[string]bool {
@@ -1090,5 +1107,33 @@ func TestQWifiRestoresAnExplicitOKC(t *testing.T) {
 	qApplyOps(t, &v, append(append(append(o.network, o.dhcp...), o.firewall...), o.wireless...))
 	if v.wireless["home2"].Option("okc") != "1" || v.wireless["home2"].Option(qOKCMarker) != "" {
 		t.Fatalf("restored: %+v", v.wireless["home2"].Options)
+	}
+}
+
+func TestQuarantineWifiHealOnWPA3RestartsTheRadioOnce(t *testing.T) {
+	f := newQFake(t)
+	f.enable(t, "internet", "home")
+	w := newQWifiFake(t, f)
+	if _, err := QuarantineWifiEnable("192.0.2.10", false); err != nil {
+		t.Fatal(err)
+	}
+	old := qKicked
+	qKicked = map[string]time.Time{}
+	t.Cleanup(func() { qKicked = old })
+	qQuarantineFDBFn = func(string) map[string]bool { return map[string]bool{"02:00:00:00:00:10": true} }
+	w.kicked, w.ops = nil, nil
+	now := time.Now().Add(time.Hour)
+	qPoll(now)
+	qPoll(now.Add(qRestartDebounce + time.Second))
+	restarts := 0
+	for _, batch := range w.ops {
+		for _, op := range batch {
+			if op.Kind == "wifi_bounce" {
+				restarts++
+			}
+		}
+	}
+	if len(w.kicked) != 0 || restarts != 1 {
+		t.Fatalf("kicked %v, %d restarts: want one radio restart and no kick", w.kicked, restarts)
 	}
 }
