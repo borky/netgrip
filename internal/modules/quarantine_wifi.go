@@ -447,6 +447,7 @@ func qResolverIPs(opts []string) []string {
 
 // qWifiPlan is what the layer should look like.
 type qWifiPlan struct {
+	radiosOf   map[string][]string // wifi-iface section -> its radios
 	enabled    bool
 	ownNetwork string // the first covered SSID's own network: DNS and dnsmasq instance come from it
 	routerIP   string
@@ -899,6 +900,7 @@ func qWifiPlanLocked(st *qState, r qRouter, v qWifiView) (qWifiPlan, error) {
 		return p, nil
 	}
 	p.ssids = qWifiSSIDs(v, r.zones, st.Zones)
+	p.radiosOf = qRadiosOf(v)
 	p.approved = st.approvedMACs()
 	p.uplinks = qUplinkZones(r.zones)
 	p.bridge = qBridgeName(v, qNetdevsFn())
@@ -1373,7 +1375,13 @@ var qAttachTimeout = 30 * time.Second
 // qMisattached lists the covered SSIDs whose running interface is not a
 // port of the quarantine bridge: what the router actually does, not what
 // the config says.
-func qMisattached(p qWifiPlan) []QWifiSSID {
+func qMisattached(p qWifiPlan) []QWifiSSID { return qCheckAttached(p, false) }
+
+// qCheckAttached lists covered SSIDs not on the quarantine bridge. strict
+// (right after the layer moved them): anything but a port of it counts.
+// Otherwise only a port of another bridge counts, and radios restarting
+// are left alone.
+func qCheckAttached(p qWifiPlan, strict bool) []QWifiSSID {
 	bss := qBSSFn()
 	var bad []QWifiSSID
 	for _, s := range p.ssids {
@@ -1383,8 +1391,13 @@ func qMisattached(p qWifiPlan) []QWifiSSID {
 		// Only a running interface can sit in the wrong bridge: one that
 		// is off (or waiting out a DFS check) is created on the right one
 		// when it comes up.
+		// Stuck means in another bridge. In none yet is a radio still
+		// coming up; a radio restarting (or due to) is not judged at all.
 		b, ok := bss[s.Section]
-		if ok && b.Ifname != "" && qMasterFn(b.Ifname) != p.bridge {
+		if !ok || b.Ifname == "" || (!strict && qRadioSettling(s.Section, p)) {
+			continue
+		}
+		if m := qMasterFn(b.Ifname); m != p.bridge && (strict || m != "") {
 			bad = append(bad, s)
 		}
 	}
@@ -1405,7 +1418,7 @@ func qSSIDNames(l []QWifiSSID) string {
 func qWaitAttached(p qWifiPlan, timeout time.Duration) []QWifiSSID {
 	deadline := time.Now().Add(timeout)
 	for {
-		bad := qMisattached(p)
+		bad := qCheckAttached(p, true)
 		if len(bad) == 0 || !time.Now().Before(deadline) {
 			return bad
 		}
@@ -1435,6 +1448,36 @@ func qScheduleRestart(radio string, now time.Time) {
 	qRestartDue[radio] = due
 }
 
+// qRadiosOf maps every wifi-iface section to its radios.
+func qRadiosOf(v qWifiView) map[string][]string {
+	out := map[string][]string{}
+	for _, name := range sortedSections(v.wireless, "wifi-iface") {
+		out[name] = v.wireless[name].Options["device"]
+	}
+	return out
+}
+
+// qRestarted is when each radio was last restarted for the layer.
+var qRestarted = map[string]time.Time{}
+
+// qSettleTime is how long after a restart a radio is left to come up.
+const qSettleTime = time.Minute
+
+// qRadioSettling reports a radio of the SSID with a restart pending or
+// done within qSettleTime: its interface may be anywhere meanwhile.
+func qRadioSettling(section string, p qWifiPlan) bool {
+	now := qNowFn()
+	for _, r := range p.radiosOf[section] {
+		if _, due := qRestartDue[r]; due {
+			return true
+		}
+		if t, ok := qRestarted[r]; ok && now.Sub(t) < qSettleTime {
+			return true
+		}
+	}
+	return false
+}
+
 // qRunDueRestartsLocked restarts the radios whose time has come.
 func qRunDueRestartsLocked(now time.Time) {
 	for radio, due := range qRestartDue {
@@ -1443,6 +1486,7 @@ func qRunDueRestartsLocked(now time.Time) {
 		}
 		delete(qRestartDue, radio)
 		delete(qRestartFirst, radio)
+		qRestarted[radio] = now
 		log.Printf("netgrip: quarantine: restarting %s so its WPA3 per-device entries take effect", radio)
 		if err := applyQWifiOps([]executor.Op{{Kind: "wifi_bounce", Args: []string{radio}}}); err != nil {
 			log.Printf("netgrip: quarantine: restarting %s: %v", radio, err)
@@ -1706,6 +1750,7 @@ func qWifiSyncLocked(st *qState, r qRouter, now time.Time) (QWifiProbe, error) {
 					continue
 				}
 				qBounced[radio] = now
+				qRestarted[radio] = now
 				log.Printf("netgrip: quarantine: %s is not on the quarantine network; restarting %s", qSSIDNames(bad), radio)
 				if err := applyQWifiOps([]executor.Op{{Kind: "wifi_bounce", Args: []string{radio}}}); err != nil {
 					log.Printf("netgrip: quarantine: restarting %s: %v", radio, err)
@@ -1839,7 +1884,7 @@ func qWifiProbeLocked(st *qState, r qRouter) QWifiProbe {
 		wp.Issues = append(wp.Issues, "the protected Wi-Fi networks hand out different DNS servers; the quarantine network uses those of the first one")
 	}
 	if s, ok := v.network[qDevSection]; ok {
-		held := qWifiPlan{bridge: s.Option("name")}
+		held := qWifiPlan{bridge: s.Option("name"), radiosOf: qRadiosOf(v)}
 		for _, x := range wp.SSIDs {
 			if x.Covered && x.Applied {
 				held.ssids = append(held.ssids, x)

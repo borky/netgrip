@@ -1142,3 +1142,29 @@ func TestQuarantineWifiHealOnWPA3RestartsTheRadioOnce(t *testing.T) {
 		t.Fatalf("kicked %v, %d restarts: want one radio restart and no kick", w.kicked, restarts)
 	}
 }
+
+func TestQWifiRestartingRadioIsNotReportedStuck(t *testing.T) {
+	f := newQFake(t)
+	f.enable(t, "internet", "home")
+	w := newQWifiFake(t, f)
+	if _, err := QuarantineWifiEnable("192.0.2.10", false); err != nil {
+		t.Fatal(err)
+	}
+	// During a restart the interface is in no bridge yet.
+	qMasterFn = func(string) string { return "" }
+	if p := ProbeQuarantine(); len(p.Wifi.Issues) != 0 {
+		t.Fatalf("a radio coming up was reported stuck: %v", p.Wifi.Issues)
+	}
+	// In another bridge while its restart is due: not judged yet.
+	w.stuck = true
+	qMasterFn = func(string) string { return "br-home" }
+	qRestartDue["radio9"] = time.Now().Add(10 * time.Second)
+	if p := ProbeQuarantine(); len(p.Wifi.Issues) != 0 {
+		t.Fatalf("a radio due to restart was reported stuck: %v", p.Wifi.Issues)
+	}
+	// Settled, and in another bridge: stuck.
+	delete(qRestartDue, "radio9")
+	if p := ProbeQuarantine(); len(p.Wifi.Issues) == 0 {
+		t.Fatal("a really stuck SSID was not reported")
+	}
+}

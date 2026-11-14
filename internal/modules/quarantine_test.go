@@ -492,7 +492,9 @@ func newQFake(t *testing.T) *qFake {
 	qMissingPolls, qLastFlush, qLastFullCheck, qForceFull = 0, time.Time{}, time.Time{}, false
 	oDue, oFirst, oNow := qRestartDue, qRestartFirst, qNowFn
 	qRestartDue, qRestartFirst = map[string]time.Time{}, map[string]time.Time{}
-	t.Cleanup(func() { qRestartDue, qRestartFirst, qNowFn = oDue, oFirst, oNow })
+	oRestarted := qRestarted
+	qRestarted = map[string]time.Time{}
+	t.Cleanup(func() { qRestartDue, qRestartFirst, qNowFn, qRestarted = oDue, oFirst, oNow, oRestarted })
 	oWireless, oKickDelay := qWirelessShowFn, qKickDelay
 	qWirelessShowFn = func() (string, error) { return uciShowFn("wireless") }
 	qKickDelay = 0
