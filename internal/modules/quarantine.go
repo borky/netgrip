@@ -49,14 +49,17 @@ import (
 var qStatePath = "/etc/netgrip/quarantine.json"
 
 const (
-	qMaxPending       = 500
-	qPendingTTL       = 7 * 24 * time.Hour
-	qNotifiedTTL      = 7 * 24 * time.Hour
-	qMaxPause         = 24 * time.Hour
-	qMaxLearned       = 64
-	qPollInterval     = 5 * time.Second
-	qLearnPollEvery   = 2 * time.Second
-	qLightSaveEvery   = 10 * time.Minute
+	qMaxPending     = 500
+	qPendingTTL     = 7 * 24 * time.Hour
+	qNotifiedTTL    = 7 * 24 * time.Hour
+	qMaxPause       = 24 * time.Hour
+	qMaxLearned     = 64
+	qPollInterval   = 5 * time.Second
+	qLearnPollEvery = 2 * time.Second
+	// qFlushEvery bounds how often the poller's bookkeeping (devices seen,
+	// announcements, last-seen times) reaches the flash: a neighbour
+	// cycling random MACs must not turn into a write every poll.
+	qFlushEvery       = 10 * time.Minute
 	qNotifyPerPoll    = 3
 	qNotifyPerHour    = 20
 	qSummariesPerHour = 2
@@ -66,9 +69,6 @@ const (
 
 var (
 	qMu sync.Mutex
-	// qLastLightSave throttles saves that only refresh "last seen" times,
-	// to spare the router's flash.
-	qLastLightSave time.Time
 	// qMissingPolls counts consecutive polls without the feature in the
 	// firewall; one bad read must not turn it off.
 	qMissingPolls int
@@ -118,9 +118,33 @@ type qState struct {
 	Notified map[string]int64 `json:"notified,omitempty"`
 }
 
+// The state is kept in memory as its JSON (a fresh copy per load, so a
+// caller that changes it and then fails changes nothing). saveQState
+// writes it to the flash at once; saveQStateLazy only updates memory and
+// leaves the write to flushQState, at most once per qFlushEvery.
+var (
+	qCacheMu   sync.Mutex
+	qCacheRaw  []byte
+	qCachePath string
+	qDirty     bool
+	qLastFlush time.Time
+)
+
 func loadQState() *qState {
 	st := &qState{Mode: "internet"}
-	if raw, err := os.ReadFile(qStatePath); err == nil {
+	qCacheMu.Lock()
+	raw := qCacheRaw
+	if qCachePath != qStatePath {
+		raw = nil
+	}
+	if raw == nil {
+		if b, err := os.ReadFile(qStatePath); err == nil {
+			raw = b
+			qCacheRaw, qCachePath, qDirty = b, qStatePath, false
+		}
+	}
+	qCacheMu.Unlock()
+	if raw != nil {
 		_ = json.Unmarshal(raw, st)
 	}
 	if st.Approved == nil {
@@ -143,7 +167,39 @@ func saveQState(st *qState) error {
 	if err != nil {
 		return err
 	}
-	return writeFileDurable(qStatePath, raw)
+	qCacheMu.Lock()
+	defer qCacheMu.Unlock()
+	if err := writeFileDurable(qStatePath, raw); err != nil {
+		return err
+	}
+	qCacheRaw, qCachePath, qDirty, qLastFlush = raw, qStatePath, false, time.Now()
+	return nil
+}
+
+// saveQStateLazy records the state in memory only; flushQState writes it.
+func saveQStateLazy(st *qState) {
+	raw, err := json.MarshalIndent(st, "", "  ")
+	if err != nil {
+		return
+	}
+	qCacheMu.Lock()
+	qCacheRaw, qCachePath, qDirty = raw, qStatePath, true
+	qCacheMu.Unlock()
+}
+
+// flushQState writes lazily saved state once qFlushEvery has passed since
+// the last write.
+func flushQState(now time.Time) {
+	qCacheMu.Lock()
+	defer qCacheMu.Unlock()
+	if !qDirty || qCachePath != qStatePath || now.Sub(qLastFlush) < qFlushEvery {
+		return
+	}
+	if err := writeFileDurable(qStatePath, qCacheRaw); err != nil {
+		log.Printf("netgrip: quarantine: saving the device list: %v", err)
+		return
+	}
+	qDirty, qLastFlush = false, now
 }
 
 func (st *qState) approvedMACs() []string {
@@ -1368,31 +1424,35 @@ func qPoll(now time.Time) {
 		return
 	}
 	qMissingPolls = 0
-	material := false
+	// urgent: decisions that change who gets through, written at once.
+	// routine: bookkeeping, kept in memory and written at most once per
+	// qFlushEvery.
+	urgent := false
 	if strings.Join(r.actual, ",") != strings.Join(st.Zones, ",") && len(r.actual) > 0 {
 		st.Zones = append([]string(nil), r.actual...)
-		material = true
+		urgent = true
 	}
 	if st.Pause.Until != 0 && !st.Pause.active(now) {
 		qEndPauseLocked(st)
-		material = true
+		urgent = true
 	}
 
-	light := false
+	routine := false
 	if seen, err := qSeenFn(); err == nil {
-		m, l := qRecordSeen(st, seen, now)
-		material = material || m
-		light = light || l
+		u, rt := qRecordSeen(st, seen, now)
+		urgent = urgent || u
+		routine = routine || rt
 	}
 	if qPrunePending(st, now) {
-		material = true
+		routine = true
 	}
-	if material || light {
-		if material || now.Sub(qLastLightSave) >= qLightSaveEvery {
-			_ = saveQState(st)
-			qLastLightSave = now
-		}
+	switch {
+	case urgent:
+		_ = saveQState(st)
+	case routine:
+		saveQStateLazy(st)
 	}
+	flushQState(now)
 	if live && qLiveDrifted(st, r, now) {
 		if err := qSyncLocked(st, r); err != nil {
 			log.Printf("netgrip: quarantine sync: %v", err)
@@ -1402,8 +1462,9 @@ func qPoll(now time.Time) {
 
 // qRecordSeen folds the live "seen" set into the state: it approves new
 // devices during a learning pause and records and announces the rest.
-// material: something worth saving at once; light: only times changed.
-func qRecordSeen(st *qState, seen []qElem, now time.Time) (material, light bool) {
+// urgent: a device was approved (written at once); routine: only the
+// pending list or the announcements changed.
+func qRecordSeen(st *qState, seen []qElem, now time.Time) (urgent, routine bool) {
 	learning := st.Pause.active(now) && st.Pause.Kind == "learn"
 	// During a pause "off" nothing is refused: record, but announce only
 	// once enforcement is back (the poller then sees them again).
@@ -1426,7 +1487,7 @@ func qRecordSeen(st *qState, seen []qElem, now time.Time) (material, light bool)
 		if learning && !waiting && !excluded[mac] && len(st.Pause.Learned) < qMaxLearned {
 			st.Approved[mac] = QApproved{At: now.Unix(), Via: "pause"}
 			st.Pause.Learned = append(st.Pause.Learned, mac)
-			material = true
+			urgent = true
 			continue
 		}
 		if ident == nil {
@@ -1437,7 +1498,7 @@ func qRecordSeen(st *qState, seen []qElem, now time.Time) (material, light bool)
 		p := st.Pending[mac]
 		if !waiting {
 			p.FirstSeen = now.Unix()
-			material = true
+			routine = true
 		}
 		last := now.Unix()
 		if e.Expires > 0 && e.Expires <= qSeenTimeout {
@@ -1445,20 +1506,20 @@ func qRecordSeen(st *qState, seen []qElem, now time.Time) (material, light bool)
 		}
 		if last > p.LastSeen {
 			p.LastSeen = last
-			light = true
+			routine = true
 		}
 		if d.IP != "" && d.IP != p.IP {
 			p.IP = d.IP
-			light = true
+			routine = true
 		}
 		if d.Hostname != "" && d.Hostname != p.Hostname {
 			p.Hostname = d.Hostname
-			light = true
+			routine = true
 		}
 		st.Pending[mac] = p
 		if _, done := st.Notified[mac]; !done && !quiet {
 			st.Notified[mac] = now.Unix()
-			material = true
+			routine = true
 			d.IP, d.Hostname = p.IP, p.Hostname
 			announce = append(announce, d)
 		}
@@ -1467,7 +1528,7 @@ func qRecordSeen(st *qState, seen []qElem, now time.Time) (material, light bool)
 		announce = qNotifyBudget(announce, now)
 		go qNotifyPendingBatch(announce, qChannelsFn, qNotifyFn)
 	}
-	return material, light
+	return urgent, routine
 }
 
 // qPrunePending drops entries not seen for a week, caps the list (oldest
