@@ -28,6 +28,7 @@ func (s *Server) registerQuarantineRoutes() {
 	s.mux.HandleFunc("POST /api/quarantine/forget", s.requireAuth(s.handleQuarantineForget))
 	s.mux.HandleFunc("POST /api/quarantine/pause", s.requireAuth(s.handleQuarantinePause))
 	s.mux.HandleFunc("POST /api/quarantine/resume", s.requireAuth(s.handleQuarantineResume))
+	s.mux.HandleFunc("POST /api/quarantine/wifi", s.requireAuth(s.handleQuarantineWifi))
 }
 
 // quarantineKeepCheck is a seam so confirm tests do not touch nft.
@@ -59,11 +60,26 @@ func (s *Server) handleQuarantineCandidates(w http.ResponseWriter, r *http.Reque
 	writeJSON(w, map[string]any{"candidates": modules.QuarantineCandidates(requesterIP(r))})
 }
 
+// qFirewallConfigs is what a firewall-only change can alter; the Wi-Fi
+// layer also creates a network with DHCP and changes SSIDs (a router
+// without Wi-Fi or DHCP config cannot have the layer, so for a zone change
+// those are optional).
+var (
+	qFirewallConfigs = []string{"firewall"}
+	qWifiConfigs     = []string{"firewall", "network", "dhcp", "wireless"}
+	qWifiOptional    = []string{"network", "dhcp", "wireless"}
+)
+
 // runRiskyFirewall wraps a firewall-reloading change in the confirm window.
 func (s *Server) runRiskyFirewall(w http.ResponseWriter, apply func() (modules.QuarantineProbe, error)) {
+	s.runRisky(w, qFirewallConfigs, nil, apply)
+}
+
+// runRisky wraps a change of configs in the confirm window.
+func (s *Server) runRisky(w http.ResponseWriter, required, optional []string, apply func() (modules.QuarantineProbe, error)) {
 	s.riskyMu.Lock()
 	defer s.riskyMu.Unlock()
-	snapshots, err := snapshotForConfirm([]string{"firewall"}, nil)
+	snapshots, err := snapshotForConfirm(required, optional)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -89,6 +105,30 @@ func (s *Server) handleQuarantineEnable(w http.ResponseWriter, r *http.Request) 
 	s.runRiskyFirewall(w, func() (modules.QuarantineProbe, error) { return modules.QuarantineEnable(req, ip) })
 }
 
+// handleQuarantineWifi turns the Wi-Fi layer on (a network, a firewall
+// zone, the SSIDs restarted: inside the confirm window) or off (it only
+// gives the SSIDs their own networks back).
+func (s *Server) handleQuarantineWifi(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Enabled          bool `json:"enabled"`
+		AllowNoRequester bool `json:"allow_no_requester,omitempty"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if !req.Enabled {
+		s.riskyMu.Lock()
+		defer s.riskyMu.Unlock()
+		p, err := modules.QuarantineWifiDisable()
+		writeModuleResult(w, p, false, err)
+		return
+	}
+	ip := requesterIP(r)
+	s.runRisky(w, qWifiConfigs, nil, func() (modules.QuarantineProbe, error) {
+		return modules.QuarantineWifiEnable(ip, req.AllowNoRequester)
+	})
+}
+
 func (s *Server) handleQuarantineZones(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Zones            []string `json:"zones"`
@@ -98,7 +138,8 @@ func (s *Server) handleQuarantineZones(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ip := requesterIP(r)
-	s.runRiskyFirewall(w, func() (modules.QuarantineProbe, error) {
+	// With the Wi-Fi layer on, the SSIDs follow the zones.
+	s.runRisky(w, qFirewallConfigs, qWifiOptional, func() (modules.QuarantineProbe, error) {
 		return modules.QuarantineSetZones(req.Zones, ip, req.AllowNoRequester)
 	})
 }

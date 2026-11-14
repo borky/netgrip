@@ -156,13 +156,30 @@ cat > "$PKG_DIR/CONTROL/prerm" << 'PRERM'
 #!/bin/sh
 /etc/init.d/netgrip stop 2>/dev/null || true
 /etc/init.d/netgrip disable 2>/dev/null || true
-# Remove the device quarantine's firewall hooks: without NetGrip nothing
-# could approve a device or turn them off.
-q=$(uci -q show firewall | sed -n -e 's/^firewall\.\(netgrip_quarantine_[A-Za-z0-9_]*\)=include$/\1/p' -e 's/^firewall\.\(netgrip_q_[A-Za-z0-9_]*\)=include$/\1/p')
-if [ -n "$q" ]; then
-	for s in $q; do uci -q delete "firewall.$s"; done
-	uci -q commit firewall
+# Remove the device quarantine: without NetGrip nothing could approve a
+# device or turn it off. Every SSID gets its own network back, then every
+# section the feature created goes (netgrip_quarantine*, and the first
+# release's netgrip_q_* includes).
+qchanged=
+for s in $(uci -q show wireless | sed -n 's/^wireless\.\([A-Za-z0-9_]*\)\.netgrip_quarantine_network=.*/\1/p'); do
+	n=$(uci -q get "wireless.$s.netgrip_quarantine_network")
+	if [ "$(uci -q get "wireless.$s.network")" = netgrip_quarantine ] && [ -n "$n" ]; then
+		uci -q set "wireless.$s.network=$n"
+	fi
+	uci -q delete "wireless.$s.netgrip_quarantine_network"
+	uci -q delete "wireless.$s.dynamic_vlan"
+	qchanged=1
+done
+for c in wireless network dhcp firewall; do
+	q=$(uci -q show "$c" | sed -n -e "s/^$c\.\(netgrip_quarantine[A-Za-z0-9_]*\)=.*/\1/p" -e "s/^$c\.\(netgrip_q_[A-Za-z0-9_]*\)=include\$/\1/p")
+	for s in $q; do uci -q delete "$c.$s"; qchanged=1; done
+	uci -q commit "$c"
+done
+if [ -n "$qchanged" ]; then
+	/etc/init.d/network reload 2>/dev/null || true
+	/etc/init.d/dnsmasq reload 2>/dev/null || true
 	/etc/init.d/firewall reload 2>/dev/null || true
+	wifi reload 2>/dev/null || true
 fi
 exit 0
 PRERM

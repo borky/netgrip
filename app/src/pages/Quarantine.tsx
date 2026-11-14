@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { Check, Lock, Pause, Play, ShieldCheck, ShieldOff, Trash2, UserCheck, UserX } from "lucide-react";
+import { Check, Lock, Pause, Play, ShieldCheck, ShieldOff, Trash2, UserCheck, UserX, Wifi } from "lucide-react";
 import { api } from "../api";
 import type { QCandidate, QDevice, QResult, QuarantineProbe } from "../types";
 import { Banner, Button, Card, ConfirmDialog, EmptyState, Input, Modal, Pill, SegmentedControl, SkeletonRows, useToast } from "../components/ui";
@@ -34,6 +34,7 @@ export function QuarantinePage() {
   const [zonesOpen, setZonesOpen] = useState(false);
   const [confirmOff, setConfirmOff] = useState(false);
   const [revoke, setRevoke] = useState<QDevice | null>(null);
+  const [wifiConfirm, setWifiConfirm] = useState<"on" | "off" | null>(null);
   const [names, setNames] = useState<Record<string, string>>({});
   const [pauseMinutes, setPauseMinutes] = useState("30");
   const [now, setNow] = useState(() => Date.now() / 1000);
@@ -134,6 +135,8 @@ export function QuarantinePage() {
             </div>
           </Card>
 
+          <WifiLayerCard probe={probe} busy={busy} onToggle={setWifiConfirm} />
+
           <Card title={t("quarantine.pauseTitle")} icon={Pause}>
             {pauseActive ? (
               <Banner tone="warn" action={<Button size="sm" icon={Play} disabled={busy} onClick={() => run(() => api.quarantineResume(), t("quarantine.resumed"))}>{t("quarantine.resume")}</Button>}>
@@ -145,6 +148,7 @@ export function QuarantinePage() {
               <div className="space-y-3">
                 <p className="text-small text-muted">{t("quarantine.pauseHelp")}</p>
                 <p className="text-small text-muted">{t("quarantine.pauseOffNote")}</p>
+                {probe.wifi.enabled && <p className="text-small text-muted">{t("quarantine.wifiPauseNote")}</p>}
                 <div className="flex flex-wrap items-center gap-2">
                   <SegmentedControl<string>
                     ariaLabel={t("quarantine.pauseLength")}
@@ -240,8 +244,60 @@ export function QuarantinePage() {
         consequence={you ? t("quarantine.revokeBody") : `${t("quarantine.revokeBody")} ${t("quarantine.revokeYouUnknown")}`}
         confirmLabel={t("quarantine.revoke")}
         onConfirm={async () => { if (revoke) await run(() => api.quarantineRevoke(revoke.mac, !you), t("quarantine.revokedOk")); setRevoke(null); }} />
+      <ConfirmDialog open={wifiConfirm !== null} onClose={() => setWifiConfirm(null)} busy={busy}
+        title={wifiConfirm === "on" ? t("quarantine.wifiOnTitle") : t("quarantine.wifiOffTitle")}
+        consequence={wifiConfirm === "on"
+          ? `${t("quarantine.wifiOnBody", { ssids: probe.wifi.ssids.filter((x) => x.covered).map((x) => x.ssid || x.section).join(", ") })}${you ? "" : ` ${t("quarantine.youUnknown")}`}`
+          : t("quarantine.wifiOffBody")}
+        confirmLabel={wifiConfirm === "on" ? t("quarantine.wifiTurnOn") : t("quarantine.wifiTurnOff")}
+        onConfirm={async () => {
+          const on = wifiConfirm === "on";
+          await run(() => api.quarantineWifi(on, on && !you), on ? t("quarantine.wifiOnOk") : t("quarantine.wifiOffOk"));
+          setWifiConfirm(null);
+        }} />
       <RollbackConfirmModal pending={rc.pending} seconds={rc.seconds} onKeep={rc.keep} onRevert={rc.revert} />
     </div>
+  );
+}
+
+/** The Wi-Fi layer: this router's own SSIDs move unapproved devices to a
+ * quarantine network. Turning it on runs inside the rollback-confirm window. */
+function WifiLayerCard({ probe, busy, onToggle }: { probe: QuarantineProbe; busy: boolean; onToggle: (v: "on" | "off") => void }) {
+  const { t } = useTranslation();
+  const w = probe.wifi;
+  if (w.ssids.length === 0 && !w.enabled) return null;
+  const covered = w.ssids.filter((s) => s.covered);
+  return (
+    <Card title={t("quarantine.wifiTitle")} icon={Wifi}
+      action={w.enabled ? <Pill tone="ok" live>{t("quarantine.wifiOn")}</Pill> : <Pill>{t("quarantine.wifiOff")}</Pill>}>
+      <div className="space-y-3">
+        <p className="text-small text-muted">{t("quarantine.wifiHelp")}</p>
+        {w.issues.map((i) => <Banner key={i} tone="warn">{i}</Banner>)}
+        {w.enabled && (
+          <div className="flex flex-wrap gap-x-4 gap-y-1 text-small">
+            {w.subnet && <span>{t("quarantine.wifiSubnet", { subnet: w.subnet })}</span>}
+            <span className="text-muted">{t("quarantine.wifiQuarantined", { count: w.quarantined })}</span>
+          </div>
+        )}
+        <ul className="space-y-1">
+          {w.ssids.map((s) => (
+            <li key={s.section} className="flex flex-wrap items-center gap-2 text-small">
+              <span className="font-medium">{s.ssid || s.section}</span>
+              <span className="text-muted">{s.network}</span>
+              {s.covered
+                ? <Pill tone={s.applied ? "ok" : "accent"}>{t("quarantine.wifiCovered")}</Pill>
+                : <span className="text-muted">{t("quarantine.wifiNotCovered")}{s.reason ? ` · ${s.reason}` : ""}</span>}
+            </li>
+          ))}
+        </ul>
+        {!w.enabled && covered.length === 0 && <p className="text-small text-muted">{t("quarantine.wifiNoneCovered")}</p>}
+        <div className="flex justify-end">
+          {w.enabled
+            ? <Button variant="secondary" disabled={busy} onClick={() => onToggle("off")}>{t("quarantine.wifiTurnOff")}</Button>
+            : <Button icon={Wifi} disabled={busy || covered.length === 0} onClick={() => onToggle("on")}>{t("quarantine.wifiTurnOn")}</Button>}
+        </div>
+      </div>
+    </Card>
   );
 }
 

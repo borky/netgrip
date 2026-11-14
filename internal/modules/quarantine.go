@@ -124,6 +124,8 @@ type qState struct {
 	// Notified remembers when each MAC was announced, so forgetting a
 	// pending entry or pruning it does not announce it again.
 	Notified map[string]int64 `json:"notified,omitempty"`
+	// Wifi is the Wi-Fi layer (phase 2).
+	Wifi QWifiState `json:"wifi"`
 }
 
 // The state is kept in memory as its JSON (a fresh copy per load, so a
@@ -723,17 +725,18 @@ type QDevice struct {
 // QuarantineProbe is the API view. Enabled is the intent; Active and the
 // zones' Protected flags are what the firewall actually runs.
 type QuarantineProbe struct {
-	Applicable bool      `json:"applicable"`
-	Reason     string    `json:"reason,omitempty"`
-	Enabled    bool      `json:"enabled"`
-	Active     bool      `json:"active"`
-	Mode       string    `json:"mode"`
-	Zones      []QZone   `json:"zones"`
-	Wan        []string  `json:"wan"`
-	Approved   []QDevice `json:"approved"`
-	Pending    []QDevice `json:"pending"`
-	Pause      QPause    `json:"pause"`
-	Issues     []string  `json:"issues"`
+	Applicable bool       `json:"applicable"`
+	Reason     string     `json:"reason,omitempty"`
+	Enabled    bool       `json:"enabled"`
+	Active     bool       `json:"active"`
+	Mode       string     `json:"mode"`
+	Zones      []QZone    `json:"zones"`
+	Wan        []string   `json:"wan"`
+	Approved   []QDevice  `json:"approved"`
+	Pending    []QDevice  `json:"pending"`
+	Pause      QPause     `json:"pause"`
+	Issues     []string   `json:"issues"`
+	Wifi       QWifiProbe `json:"wifi"`
 }
 
 // qApplicable: a gateway with firewall4 and nft.
@@ -769,6 +772,7 @@ func probeQuarantineLocked() QuarantineProbe {
 		Applicable: ok, Reason: why, Enabled: st.Enabled, Mode: st.Mode,
 		Zones: []QZone{}, Wan: []string{}, Approved: []QDevice{}, Pending: []QDevice{},
 		Pause: st.Pause, Issues: []string{},
+		Wifi: QWifiProbe{SSIDs: []QWifiSSID{}, Issues: []string{}},
 	}
 	if !ok && !st.Enabled {
 		return p
@@ -777,8 +781,16 @@ func probeQuarantineLocked() QuarantineProbe {
 	if err != nil {
 		p.Issues = append(p.Issues, err.Error())
 	}
-	p.Zones = r.zones
+	p.Zones = []QZone{}
+	for _, z := range r.zones {
+		if z.Name != qNet { // the Wi-Fi layer's own zone is not the user's to pick
+			p.Zones = append(p.Zones, z)
+		}
+	}
 	p.Wan = append([]string{}, r.wan...)
+	if err == nil {
+		p.Wifi = qWifiProbeLocked(st, r)
+	}
 	p.Active = len(r.sections) > 0 && qLiveChainsPresent()
 	if !p.Pause.active(time.Now()) {
 		p.Pause = QPause{}
@@ -1072,7 +1084,7 @@ func validateZones(req []string, zones []QZone) ([]string, error) {
 	for _, name := range req {
 		z, ok := known[name]
 		switch {
-		case !reZoneName.MatchString(name) || !ok:
+		case !reZoneName.MatchString(name) || !ok || name == qNet:
 			return nil, fmt.Errorf("unknown zone %q", name)
 		case z.Wan:
 			return nil, fmt.Errorf("zone %q is an uplink (it masquerades or carries a default route) and cannot be protected", name)
@@ -1172,6 +1184,10 @@ func QuarantineEnable(req QEnableRequest, requesterIP string) (QuarantineProbe, 
 // them fails, the rules are still enforced, and the feature must stay
 // visible and manageable (the poller keeps reconciling it).
 func qDisableLocked(st *qState) error {
+	// The Wi-Fi layer first: its SSIDs get their own networks back.
+	if err := qWifiTeardownLocked(st); err != nil {
+		return fmt.Errorf("the Wi-Fi layer could not be removed, the quarantine stays on: %w", err)
+	}
 	fw, err := uciShowFn("firewall")
 	if err != nil {
 		return fmt.Errorf("reading the firewall config: %w", err)
@@ -1230,15 +1246,26 @@ func QuarantineSetZones(zones []string, requesterIP string, allowUnknown bool) (
 	if err := saveQState(st); err != nil {
 		return probeQuarantineLocked(), err
 	}
-	if err := applyQIncludes(qIncludeOps(r.sections, z)); err != nil {
+	prevZones := st.Zones
+	st.Zones = z
+	hook := qHookZones(st)
+	if err := applyQIncludes(qIncludeOps(r.sections, hook)); err != nil {
 		qRestoreZonesLocked(r.actual)
 		return probeQuarantineLocked(), fmt.Errorf("changing the zones failed; the previous zones were put back: %w", err)
 	}
-	if err := qVerifyLive(z, requester); err != nil {
+	if err := qVerifyLive(hook, requester); err != nil {
 		qRestoreZonesLocked(r.actual)
 		return probeQuarantineLocked(), fmt.Errorf("the new zones did not come up as expected; the previous zones were put back: %w", err)
 	}
-	st.Zones = z
+	// The Wi-Fi layer follows: SSIDs of newly protected zones join it,
+	// those of unprotected ones get their own networks back.
+	if st.Wifi.Enabled {
+		if err := qWifiFollowZonesLocked(st); err != nil {
+			st.Zones = prevZones
+			qRestoreZonesLocked(r.actual)
+			return probeQuarantineLocked(), fmt.Errorf("the Wi-Fi layer could not follow the new zones; the previous zones were put back: %w", err)
+		}
+	}
 	_ = saveQState(st)
 	return probeQuarantineLocked(), nil
 }
@@ -1295,6 +1322,11 @@ func qChangeLocked(st *qState) error {
 	}
 	if err := qSyncLocked(st, r); err != nil {
 		return fmt.Errorf("saved, but not applied yet (it will be retried): %w", err)
+	}
+	if st.Wifi.Enabled {
+		if _, err := qWifiSyncLocked(st, r, time.Now()); err != nil {
+			return fmt.Errorf("saved, but the Wi-Fi entries are not updated yet (it will be retried): %w", err)
+		}
 	}
 	return nil
 }
@@ -1588,8 +1620,8 @@ func qPoll(now time.Time) {
 	// routine: bookkeeping, kept in memory and written at most once per
 	// qFlushEvery.
 	urgent := false
-	if full && len(r.actual) > 0 && strings.Join(r.actual, ",") != strings.Join(st.Zones, ",") {
-		st.Zones = append([]string(nil), r.actual...)
+	if actual := qUserZones(r.actual); full && len(actual) > 0 && strings.Join(actual, ",") != strings.Join(st.Zones, ",") {
+		st.Zones = actual
 		urgent = true
 	}
 	if st.Pause.Until != 0 && !st.Pause.active(now) {
@@ -1642,6 +1674,13 @@ func qPoll(now time.Time) {
 	if full && live && qLiveDrifted(st, r, now) {
 		if err := qSyncLocked(st, r); err != nil {
 			log.Printf("netgrip: quarantine sync: %v", err)
+			qFullFailedLocked(now)
+			return
+		}
+	}
+	if full && live && st.Wifi.Enabled {
+		if _, err := qWifiSyncLocked(st, r, now); err != nil {
+			log.Printf("netgrip: quarantine Wi-Fi sync: %v", err)
 			qFullFailedLocked(now)
 			return
 		}
@@ -1723,6 +1762,11 @@ func qFullCheckLocked(st *qState, now time.Time) (r qRouter, live, ok bool) {
 		qMissingPolls++
 		if qMissingPolls >= qMissingToRevert {
 			log.Printf("netgrip: the firewall no longer has the quarantine (reverted or removed); recording it as off")
+			// Without phase 1 nobody could approve a device: the SSIDs get
+			// their own networks back (a confirm revert already did that).
+			if err := qWifiTeardownLocked(st); err != nil {
+				log.Printf("netgrip: quarantine: removing the Wi-Fi layer: %v", err)
+			}
 			st.Enabled = false
 			st.Pause = QPause{}
 			_ = saveQState(st)
