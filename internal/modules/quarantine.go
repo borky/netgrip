@@ -608,7 +608,7 @@ func qIncludeSections(uciFirewall string) []string {
 			continue
 		}
 		sec := strings.TrimPrefix(key, "firewall.")
-		if sec != key && !strings.Contains(sec, ".") && strings.HasPrefix(sec, qSectionPrefix) {
+		if sec != key && !strings.Contains(sec, ".") && (strings.HasPrefix(sec, qSectionPrefix) || strings.HasPrefix(sec, qLegacyPrefix)) {
 			out = append(out, sec)
 		}
 	}
@@ -623,7 +623,8 @@ func qActualZones(uciFirewall string) []string {
 	out := []string{}
 	for _, line := range strings.Split(uciFirewall, "\n") {
 		key, val, ok := strings.Cut(strings.TrimSpace(line), "=")
-		if !ok || !strings.HasPrefix(key, "firewall."+qSectionPrefix+"_in_") || !strings.HasSuffix(key, ".chain") {
+		owned := strings.HasPrefix(key, "firewall."+qSectionPrefix+"input_") || strings.HasPrefix(key, "firewall."+qLegacyPrefix+"in_")
+		if !ok || !owned || !strings.HasSuffix(key, ".chain") {
 			continue
 		}
 		if z, ok := strings.CutPrefix(strings.Trim(val, "'"), "input_"); ok && z != "" {
@@ -657,8 +658,8 @@ func qIncludeOps(existing []string, zones []string) []executor.Op {
 	if len(zones) > 0 {
 		add(qSectionTable, qTableFile(), "table-prepend", "")
 		for i, z := range zones {
-			add(fmt.Sprintf("%s_in_%d", qSectionPrefix, i), qInputFile(), "chain-prepend", "input_"+z)
-			add(fmt.Sprintf("%s_fw_%d", qSectionPrefix, i), qForwardFile(), "chain-prepend", "forward_"+z)
+			add(fmt.Sprintf("%sinput_%d", qSectionPrefix, i), qInputFile(), "chain-prepend", "input_"+z)
+			add(fmt.Sprintf("%sforward_%d", qSectionPrefix, i), qForwardFile(), "chain-prepend", "forward_"+z)
 		}
 	}
 	return append(ops,
@@ -1627,6 +1628,17 @@ func qPoll(now time.Time) {
 		}
 		full = true
 	}
+	if full && qHasLegacySections(r.sections) {
+		// The first release's names: rename everything once.
+		if err := qMigrateLocked(st, r); err != nil {
+			log.Printf("netgrip: quarantine: renaming the firewall rules: %v", err)
+			qFullFailedLocked(now)
+		} else {
+			log.Printf("netgrip: quarantine: firewall rules renamed to netgrip_quarantine_*")
+			qFullFails = 0
+		}
+		return
+	}
 	if full && live && qLiveDrifted(st, r, now) {
 		if err := qSyncLocked(st, r); err != nil {
 			log.Printf("netgrip: quarantine sync: %v", err)
@@ -1637,6 +1649,32 @@ func qPoll(now time.Time) {
 	if full {
 		qFullFails = 0
 	}
+}
+
+func qHasLegacySections(sections []string) bool {
+	for _, s := range sections {
+		if strings.HasPrefix(s, qLegacyPrefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// qMigrateLocked moves the first release's rules to the current names:
+// the include files (checked by nft first) and the UCI sections are
+// rewritten and the firewall reloaded, which loads the same approved list
+// under the new names. The old chains and sets go with the reload.
+func qMigrateLocked(st *qState, r qRouter) error {
+	if err := writeQFiles(r.ruleSet(st)); err != nil {
+		return err
+	}
+	if err := applyQIncludes(qIncludeOps(r.sections, r.actual)); err != nil {
+		return err
+	}
+	if err := qVerifyLive(r.actual, ""); err != nil {
+		return err
+	}
+	return nftApply(qOffPauseScript(st.offRemaining(time.Now())))
 }
 
 // qFullFailedLocked retries a failed full check on the next poll once;
