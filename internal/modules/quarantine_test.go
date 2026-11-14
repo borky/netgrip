@@ -1150,6 +1150,15 @@ func TestQPollRenamesTheFirstReleasesRules(t *testing.T) {
 	if !loadQState().Enabled {
 		t.Fatal("the rename turned the feature off")
 	}
+	cmds := strings.Join(f.nft, "\n")
+	for _, want := range []string{"delete chain inet fw4 netgrip_q_input", "delete chain inet fw4 netgrip_q_forward", "delete set inet fw4 netgrip_q_ok", "delete set inet fw4 netgrip_q_off"} {
+		if !strings.Contains(cmds, want) {
+			t.Errorf("old object not removed: %s", want)
+		}
+	}
+	if strings.Index(cmds, "delete set inet fw4 netgrip_q_ok") < strings.Index(cmds, "delete chain inet fw4 netgrip_q_forward") {
+		t.Error("a set was deleted before the chains that use it")
+	}
 }
 
 func TestQPollFullCheckIsPaced(t *testing.T) {

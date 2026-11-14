@@ -1663,7 +1663,8 @@ func qHasLegacySections(sections []string) bool {
 // qMigrateLocked moves the first release's rules to the current names:
 // the include files (checked by nft first) and the UCI sections are
 // rewritten and the firewall reloaded, which loads the same approved list
-// under the new names. The old chains and sets go with the reload.
+// under the new names. A reload only empties fw4's table, so the old
+// chains and sets, unused by then, are deleted afterwards.
 func qMigrateLocked(st *qState, r qRouter) error {
 	if err := writeQFiles(r.ruleSet(st)); err != nil {
 		return err
@@ -1674,7 +1675,26 @@ func qMigrateLocked(st *qState, r qRouter) error {
 	if err := qVerifyLive(r.actual, ""); err != nil {
 		return err
 	}
+	qDeleteLegacyObjects()
 	return nftApply(qOffPauseScript(st.offRemaining(time.Now())))
+}
+
+// qLegacyChains and qLegacySets are the first release's nft names.
+var (
+	qLegacyChains = []string{"netgrip_q_input", "netgrip_q_forward"}
+	qLegacySets   = []string{"netgrip_q_ok", "netgrip_q_seen", "netgrip_q_wan", "netgrip_q_private4",
+		"netgrip_q_private6", "netgrip_q_dns4", "netgrip_q_dns6", "netgrip_q_off"}
+)
+
+// qDeleteLegacyObjects removes them, chains first (a set in use cannot
+// go). One at a time and best effort: one already gone stops nothing.
+func qDeleteLegacyObjects() {
+	for _, c := range qLegacyChains {
+		_, _ = nftRunFn("", "delete", "chain", "inet", qTable, c)
+	}
+	for _, set := range qLegacySets {
+		_, _ = nftRunFn("", "delete", "set", "inet", qTable, set)
+	}
 }
 
 // qFullFailedLocked retries a failed full check on the next poll once;
