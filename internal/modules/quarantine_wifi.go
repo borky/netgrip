@@ -33,6 +33,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -925,8 +926,37 @@ func qWifiApplyLocked(v qWifiView, p qWifiPlan) error {
 	for _, r := range names {
 		ops = append(ops, executor.Op{Kind: "wifi_reload", Args: []string{r}})
 	}
+	// DHCP is what every other network depends on: record what dnsmasq
+	// serves before, and put the DHCP config back if the change made it
+	// stop serving a network (2026-11-14: dnsmasq ended up bound to the
+	// quarantine network alone and every other network lost DHCP).
+	var dhcpBefore qDnsmasqServing
+	var dhcpSnap string
+	if len(o.dhcp) > 0 {
+		dhcpBefore = qDnsmasqRuntimeFn()
+		snap, err := qSnapshotFn("dhcp")
+		if err != nil {
+			return fmt.Errorf("cannot take a snapshot of the DHCP config, nothing changed: %w", err)
+		}
+		dhcpSnap = snap
+	}
+	started := time.Now()
 	if err := applyQWifiOps(ops); err != nil {
 		return err
+	}
+	if len(o.dhcp) > 0 {
+		qDnsmasqWaitFn(started)
+		own := qOwnDHCP{bridge: firstNonEmpty(p.bridge, v.network[qDevSection].Option("name")), routerIP: firstNonEmpty(p.routerIP, v.network[qNet].Option("ipaddr"))}
+		if why := qDHCPRegression(dhcpBefore, qDnsmasqRuntimeFn(), own); why != "" {
+			log.Printf("netgrip: quarantine: DHCP check failed (%s); restoring the DHCP config", why)
+			if err := qRestoreFn("dhcp", dhcpSnap); err != nil {
+				log.Printf("netgrip: quarantine: restoring the DHCP config: %v", err)
+			}
+			if err := applyQWifiOps([]executor.Op{{Kind: "initd", Args: []string{"dnsmasq", "reload"}}}); err != nil {
+				log.Printf("netgrip: quarantine: reloading dnsmasq: %v", err)
+			}
+			return fmt.Errorf("the change would have stopped DHCP on other networks (%s); the DHCP config was put back", why)
+		}
 	}
 	// A restarted SSID reconnects everyone anyway; elsewhere only the
 	// stations whose entry changed must reconnect, once hostapd has
@@ -963,6 +993,126 @@ func qWifiApplyLocked(v qWifiView, p qWifiPlan) error {
 		}
 	}
 	return nil
+}
+
+// qDnsmasqServing is what the running dnsmasq instances serve, from the
+// configs their init script generated: the DHCP ranges and the interfaces
+// they are bound to (none: every interface).
+type qDnsmasqServing struct {
+	ok         bool
+	ranges     map[string]bool
+	interfaces map[string]bool
+}
+
+var qSnapshotFn = executor.Snapshot
+var qRestoreFn = executor.Restore
+
+// qDnsmasqWaitFn waits (up to 5 s) until dnsmasq's generated config is
+// newer than since, so the check reads what the reload produced.
+var qDnsmasqWaitFn = func(since time.Time) {
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		files, _ := filepath.Glob("/var/etc/dnsmasq.conf.*")
+		for _, f := range files {
+			if st, err := os.Stat(f); err == nil && !st.ModTime().Before(since.Truncate(time.Second)) {
+				return
+			}
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+// qDnsmasqRuntimeFn reads /var/etc/dnsmasq.conf.* (one per instance).
+var qDnsmasqRuntimeFn = func() qDnsmasqServing {
+	files, _ := filepath.Glob("/var/etc/dnsmasq.conf.*")
+	var all []byte
+	for _, f := range files {
+		if b, err := os.ReadFile(f); err == nil {
+			all = append(all, b...)
+			all = append(all, '\n')
+		}
+	}
+	return parseDnsmasqServing(string(all), len(files) > 0)
+}
+
+// parseDnsmasqServing extracts the ranges and bound interfaces from
+// dnsmasq config text. A range is keyed by its addresses, without tags or
+// lease times, so an unrelated option change does not count. Pure.
+func parseDnsmasqServing(conf string, ok bool) qDnsmasqServing {
+	d := qDnsmasqServing{ok: ok, ranges: map[string]bool{}, interfaces: map[string]bool{}}
+	for _, line := range strings.Split(conf, "\n") {
+		line = strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(line, "dhcp-range="):
+			var addrs []string
+			for _, f := range strings.Split(strings.TrimPrefix(line, "dhcp-range="), ",") {
+				if ip := net.ParseIP(strings.TrimSpace(f)); ip != nil {
+					addrs = append(addrs, ip.String())
+				}
+			}
+			if len(addrs) > 0 {
+				d.ranges[strings.Join(addrs, "-")] = true
+			}
+		case strings.HasPrefix(line, "interface="):
+			d.interfaces[strings.TrimPrefix(line, "interface=")] = true
+		}
+	}
+	return d
+}
+
+// qDHCPRegression says how dnsmasq serves less after a change than
+// before, ignoring the quarantine network's own range and bridge: a range
+// that disappeared, or a binding to interfaces where there was none, or to
+// fewer of them. "" when nothing was lost (or nothing could be read).
+// qOwnDHCP identifies the quarantine network's own DHCP, which may come
+// and go with the layer.
+type qOwnDHCP struct{ bridge, routerIP string }
+
+func (o qOwnDHCP) isOwnRange(r string) bool {
+	if o.routerIP == "" {
+		return false
+	}
+	first, _, _ := strings.Cut(r, "-")
+	ip, own := net.ParseIP(first), net.ParseIP(o.routerIP)
+	if ip == nil || own == nil {
+		return false
+	}
+	return (&net.IPNet{IP: own.Mask(net.CIDRMask(24, 32)), Mask: net.CIDRMask(24, 32)}).Contains(ip)
+}
+
+func (o qOwnDHCP) isOwnIface(i string) bool { return i == qNet || (o.bridge != "" && i == o.bridge) }
+
+func qDHCPRegression(before, after qDnsmasqServing, own qOwnDHCP) string {
+	if !before.ok {
+		return ""
+	}
+	if !after.ok {
+		return "dnsmasq has no running config any more"
+	}
+	for r := range before.ranges {
+		if !after.ranges[r] && !own.isOwnRange(r) {
+			return "the DHCP range " + r + " is no longer served"
+		}
+	}
+	if len(before.interfaces) == 0 && len(after.interfaces) > 0 {
+		names := make([]string, 0, len(after.interfaces))
+		for i := range after.interfaces {
+			names = append(names, i)
+		}
+		sort.Strings(names)
+		return "dnsmasq became bound to " + strings.Join(names, ", ") + " only"
+	}
+	for i := range before.interfaces {
+		if !after.interfaces[i] && !own.isOwnIface(i) {
+			return "dnsmasq no longer serves " + i
+		}
+	}
+	for i := range after.interfaces {
+		if !before.interfaces[i] && !own.isOwnIface(i) {
+			return "dnsmasq became bound to " + i
+		}
+	}
+	return ""
 }
 
 // qKickDelay is how long a reload is given before stations are kicked.
