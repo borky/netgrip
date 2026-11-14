@@ -674,12 +674,10 @@ func qIncludeOps(existing []string, zones []string) []executor.Op {
 // refuses when the firewall config has uncommitted changes made elsewhere:
 // its commit would publish them too.
 var applyQIncludes = func(ops []executor.Op) error {
-	if pending, err := qUCIPendingFn("firewall"); err != nil {
-		return fmt.Errorf("cannot check the firewall config for pending changes, nothing changed: %w", err)
-	} else if pending != "" {
-		return fmt.Errorf("the firewall config has uncommitted changes made outside NetGrip (%s); save or revert them first (LuCI: Unsaved changes, or uci revert firewall), nothing changed", qFirstLine(pending))
+	if err := QuarantinePendingCheck([]string{"firewall"}); err != nil {
+		return err
 	}
-	return executor.Apply(ops, nil)
+	return qApplyClean(ops)
 }
 
 // qVerifyLive checks the actual result: chains loaded, every protected
@@ -1693,6 +1691,9 @@ func qPoll(now time.Time) {
 			qFullFailedLocked(now)
 			return
 		}
+	}
+	if full && live && !st.Wifi.Enabled {
+		qWifiRemoveLeftoversLocked(st)
 	}
 	if full && live && st.Wifi.Enabled {
 		if _, err := qWifiSyncLocked(st, r, now); err != nil {

@@ -812,7 +812,7 @@ func TestQDHCPRegression(t *testing.T) {
 		"bound to the quarantine alone": {withOurs + "interface=br-quarantine\n", true}, // what happened on 2026-11-14
 		"a range lost":                  {"dhcp-range=set:lan,192.0.2.100,192.0.2.249,255.255.255.0,12h\n", true},
 		"lease time changed only":       {strings.ReplaceAll(qDnsmasqHealthy, "12h", "6h"), false},
-		"an interface excluded":         {qDnsmasqHealthy + "no-dhcp-interface=br-home\n", true},
+		"a WAN coming up (exclusion)":   {qDnsmasqHealthy + "no-dhcp-interface=pppoe-wan\n", false},
 		"a listen address added":        {qDnsmasqHealthy + "listen-address=192.0.2.1\n", true},
 		"interface-name is not binding": {qDnsmasqHealthy + "interface-name=router.lan,lan\n", false},
 	} {
@@ -832,6 +832,9 @@ func TestQDHCPRegression(t *testing.T) {
 	}
 	if got := qDHCPRegression(bound, qServing(qDnsmasqHealthy+"interface=br-quarantine\n"), own); got == "" {
 		t.Fatal("a bound instance losing its interface passed")
+	}
+	if got := qDHCPRegression(bound, qServing(qDnsmasqHealthy+"interface=br-home\ninterface=br-iot\n"), own); got != "" {
+		t.Fatalf("a bound instance gaining a listed network that came up: %q", got)
 	}
 	// Two instances: one already bound must not hide the other becoming bound.
 	two := qServing(qDnsmasqHealthy, "interface=br-guest\ndhcp-range=set:g,203.0.113.100,203.0.113.200,255.255.255.0,1h\n")
@@ -944,5 +947,49 @@ func TestQuarantineWifiEnableRestoresDHCPWhenItBreaks(t *testing.T) {
 	}
 	if loadQState().Wifi.Enabled {
 		t.Fatal("recorded as on")
+	}
+}
+
+func TestQApplyCleanRevertsItsOwnHalfAppliedChanges(t *testing.T) {
+	newQFake(t)
+	oPending, oRevert := qUCIPendingFn, qUCIRevertFn
+	t.Cleanup(func() { qUCIPendingFn, qUCIRevertFn = oPending, oRevert })
+	qUCIPendingFn = func(pkg string) (string, error) {
+		if pkg == "dhcp" {
+			return "dhcp.netgrip_quarantine='dhcp'", nil
+		}
+		return "", nil
+	}
+	var reverted []string
+	qUCIRevertFn = func(pkg string) error { reverted = append(reverted, pkg); return nil }
+	// An op that fails (an invalid key: refused before uci runs).
+	err := qApplyClean([]executor.Op{
+		{Kind: "uci_set", Args: []string{"dhcp.netgrip_quarantine", "dhcp"}},
+		{Kind: "uci_set", Args: []string{"wireless.bad key", "x"}},
+	})
+	if err == nil {
+		t.Skip("the executor accepted the op here; nothing to test")
+	}
+	if strings.Join(reverted, ",") != "dhcp" {
+		t.Fatalf("reverted %v, want the config with staged changes", reverted)
+	}
+}
+
+func TestQuarantineWifiLeftoversAreRetried(t *testing.T) {
+	f := newQFake(t)
+	f.enable(t, "internet", "home")
+	w := newQWifiFake(t, f)
+	if _, err := QuarantineWifiEnable("192.0.2.10", false); err != nil {
+		t.Fatal(err)
+	}
+	st := loadQState()
+	st.Wifi.Enabled, st.Wifi.Leftovers, st.Wifi.OffReason = false, true, "test"
+	_ = saveQState(st)
+	if p := ProbeQuarantine(); len(p.Wifi.Issues) == 0 {
+		t.Fatal("leftovers not reported")
+	}
+	qPoll(time.Now().Add(time.Hour))
+	if loadQState().Wifi.Leftovers || w.v.wireless["home2"].Option("network") != "home" {
+		t.Fatalf("leftovers not removed: %+v %+v", loadQState().Wifi, w.v.wireless["home2"].Options)
 	}
 }
