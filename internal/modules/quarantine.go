@@ -65,6 +65,8 @@ const (
 	qSummariesPerHour = 2
 	qMaxNotified      = 2000
 	qMissingToRevert  = 2
+	// qFullCheckEvery paces the poller's full router read and drift check.
+	qFullCheckEvery = 30 * time.Second
 )
 
 var (
@@ -72,6 +74,8 @@ var (
 	// qMissingPolls counts consecutive polls without the feature in the
 	// firewall; one bad read must not turn it off.
 	qMissingPolls int
+	// qLastFullCheck is when the poller last read the whole router.
+	qLastFullCheck time.Time
 	// The announcement budget (see qNotifyBudget).
 	qBudgetStart                  time.Time
 	qBudgetUsed, qBudgetSummaries int
@@ -344,13 +348,21 @@ func qDHCPDNSServers(uciDhcp string) []string {
 // qZonesFrom builds the zone list. A zone is an uplink when it masquerades
 // (IPv4 or IPv6) or when one of its networks holds a default route. Pure,
 // for tests.
+// qUplinkProtos6 adds the IPv6 uplink protocols to multi-WAN's wanProtos.
+var qUplinkProtos6 = map[string]bool{
+	"dhcpv6": true, "6in4": true, "6rd": true, "6to4": true, "dslite": true, "map": true,
+}
+
 func qZonesFrom(uciFirewall, uciDhcp string, protected []string, ifaces []ubus.InterfaceState) []QZone {
 	served := dhcpServedNetworks(uciDhcp)
 	extras := qZoneExtras(uciFirewall)
-	defRoute := map[string]bool{}
+	defRoute, uplinkProto := map[string]bool{}, map[string]bool{}
 	for _, i := range ifaces {
 		if i.HasDefaultRoute || i.HasDefaultRoute6 {
 			defRoute[i.Name] = true
+		}
+		if wanProtos[i.Proto] || qUplinkProtos6[i.Proto] {
+			uplinkProto[i.Name] = true
 		}
 	}
 	prot := map[string]bool{}
@@ -359,9 +371,14 @@ func qZonesFrom(uciFirewall, uciDhcp string, protected []string, ifaces []ubus.I
 	}
 	out := []QZone{}
 	for _, z := range parseFWZonesFrom(uciFirewall) {
-		q := QZone{Name: z.Name, Networks: z.Network, Wan: z.Masq || extras[z.Name].masq6, Protected: prot[z.Name]}
+		// An uplink zone carries a default route, or masquerades over an
+		// uplink protocol (one that is down right now has no route). A
+		// masquerading tunnel without a default route, such as a VPN
+		// server's zone, leads to its peers, not to the internet.
+		q := QZone{Name: z.Name, Networks: z.Network, Protected: prot[z.Name]}
+		masq := z.Masq || extras[z.Name].masq6
 		for _, n := range z.Network {
-			if defRoute[n] {
+			if defRoute[n] || (masq && uplinkProto[n]) {
 				q.Wan = true
 			}
 		}
@@ -983,7 +1000,7 @@ func QuarantineEnable(req QEnableRequest, requesterIP string) (QuarantineProbe, 
 			return probeQuarantineLocked(), fmt.Errorf("invalid MAC %q", a.MAC)
 		}
 		if _, ok := st.Approved[mac]; !ok {
-			st.Approved[mac] = QApproved{Name: qCleanName(a.Name), At: now, Via: "baseline"}
+			st.Approved[mac] = QApproved{Name: qDeviceName(mac, a.Name), At: now, Via: "baseline"}
 		}
 		delete(st.Pending, mac)
 	}
@@ -1164,6 +1181,16 @@ func QuarantineSetMode(mode string) (QuarantineProbe, error) {
 	return probeQuarantineLocked(), err
 }
 
+// qDeviceName is the name to keep for a device: the client list falls
+// back to the MAC when it knows no name, and that is not a name.
+func qDeviceName(mac, name string) string {
+	n := qCleanName(name)
+	if strings.EqualFold(n, mac) {
+		return ""
+	}
+	return n
+}
+
 func qCleanName(s string) string {
 	s = strings.Map(func(r rune) rune {
 		if r < 0x20 || r == 0x7f {
@@ -1195,7 +1222,7 @@ func QuarantineApprove(items []QApproveItem) (QuarantineProbe, error) {
 		if a.At == 0 {
 			a = QApproved{At: now, Via: "manual"}
 		}
-		if n := qCleanName(it.Name); n != "" {
+		if n := qDeviceName(mac, it.Name); n != "" {
 			a.Name = n
 		}
 		st.Approved[mac] = a
@@ -1403,32 +1430,26 @@ func qPoll(now time.Time) {
 	if !st.Enabled {
 		return
 	}
-	r, err := readQRouter()
-	if err != nil {
-		return // a failed read decides nothing
-	}
-	live := qLiveChainsPresent()
-	if len(r.sections) == 0 && !live {
-		// Reverted by the confirm window, or removed by hand: once the
-		// firewall has neither the sections nor the chains, the feature is
-		// off. Twice in a row, so one odd read does not turn it off.
-		qMissingPolls++
-		if qMissingPolls >= qMissingToRevert {
-			log.Printf("netgrip: the firewall no longer has the quarantine (reverted or removed); recording it as off")
-			st.Enabled = false
-			st.Pause = QPause{}
-			_ = saveQState(st)
-			removeQFiles()
-			qMissingPolls = 0
+	// Each poll reads the live "seen" set (one nft call). The full check
+	// (firewall and DHCP config, interfaces, chains, drift: about a dozen
+	// commands) runs every qFullCheckEvery, and at once when the set cannot
+	// be read (the firewall lost the feature) or a device was just approved.
+	seen, seenErr := qSeenFn()
+	full := seenErr != nil || now.Sub(qLastFullCheck) >= qFullCheckEvery
+	var r qRouter
+	live := false
+	if full {
+		var ok bool
+		if r, live, ok = qFullCheckLocked(st, now); !ok {
+			return
 		}
-		return
 	}
-	qMissingPolls = 0
+
 	// urgent: decisions that change who gets through, written at once.
 	// routine: bookkeeping, kept in memory and written at most once per
 	// qFlushEvery.
 	urgent := false
-	if strings.Join(r.actual, ",") != strings.Join(st.Zones, ",") && len(r.actual) > 0 {
+	if full && len(r.actual) > 0 && strings.Join(r.actual, ",") != strings.Join(st.Zones, ",") {
 		st.Zones = append([]string(nil), r.actual...)
 		urgent = true
 	}
@@ -1438,7 +1459,7 @@ func qPoll(now time.Time) {
 	}
 
 	routine := false
-	if seen, err := qSeenFn(); err == nil {
+	if seenErr == nil {
 		u, rt := qRecordSeen(st, seen, now)
 		urgent = urgent || u
 		routine = routine || rt
@@ -1453,11 +1474,50 @@ func qPoll(now time.Time) {
 		saveQStateLazy(st)
 	}
 	flushQState(now)
-	if live && qLiveDrifted(st, r, now) {
+
+	if urgent && !full {
+		// A device approved during a learning pause gets through now, not
+		// at the next full check.
+		var ok bool
+		if r, live, ok = qFullCheckLocked(st, now); !ok {
+			return
+		}
+		full = true
+	}
+	if full && live && qLiveDrifted(st, r, now) {
 		if err := qSyncLocked(st, r); err != nil {
 			log.Printf("netgrip: quarantine sync: %v", err)
 		}
 	}
+}
+
+// qFullCheckLocked reads the router and notices a firewall that no longer
+// has the feature. ok is false when the poll should stop here: the read
+// failed (which decides nothing) or the feature is missing.
+func qFullCheckLocked(st *qState, now time.Time) (r qRouter, live, ok bool) {
+	r, err := readQRouter()
+	if err != nil {
+		return r, false, false
+	}
+	qLastFullCheck = now
+	live = qLiveChainsPresent()
+	if len(r.sections) == 0 && !live {
+		// Reverted by the confirm window, or removed by hand: once the
+		// firewall has neither the sections nor the chains, the feature is
+		// off. Twice in a row, so one odd read does not turn it off.
+		qMissingPolls++
+		if qMissingPolls >= qMissingToRevert {
+			log.Printf("netgrip: the firewall no longer has the quarantine (reverted or removed); recording it as off")
+			st.Enabled = false
+			st.Pause = QPause{}
+			_ = saveQState(st)
+			removeQFiles()
+			qMissingPolls = 0
+		}
+		return r, false, false
+	}
+	qMissingPolls = 0
+	return r, live, true
 }
 
 // qRecordSeen folds the live "seen" set into the state: it approves new

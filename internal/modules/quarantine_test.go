@@ -52,8 +52,8 @@ dhcp.transit.interface='transit'
 `
 
 var qTestIfaces = []ubus.InterfaceState{
-	{Name: "uplink", Device: "eth9", L3Device: "pppoe-uplink", HasDefaultRoute: true},
-	{Name: "uplink6", Device: "/dev/cdc-wdm9"}, // a modem path is not a netdev
+	{Name: "uplink", Proto: "pppoe", Device: "eth9", L3Device: "pppoe-uplink", HasDefaultRoute: true},
+	{Name: "uplink6", Proto: "qmi", Device: "/dev/cdc-wdm9"}, // a modem path is not a netdev
 	{Name: "home", Device: "br-home"},
 	{Name: "transit", Device: "eth8", HasDefaultRoute6: true},
 }
@@ -64,6 +64,43 @@ func qZoneMap(zones []QZone) map[string]QZone {
 		out[z.Name] = z
 	}
 	return out
+}
+
+func TestQZonesFromMasqTunnelIsNotAnUplink(t *testing.T) {
+	fw := `firewall.@zone[0]=zone
+firewall.@zone[0].name='peers'
+firewall.@zone[0].network='rw'
+firewall.@zone[0].masq='1'
+firewall.@zone[1]=zone
+firewall.@zone[1].name='backup'
+firewall.@zone[1].network='lte'
+firewall.@zone[1].masq='1'
+firewall.@zone[2]=zone
+firewall.@zone[2].name='vpnout'
+firewall.@zone[2].network='tun'
+firewall.@zone[2].masq='1'
+`
+	ifaces := []ubus.InterfaceState{
+		{Name: "rw", Proto: "wireguard", Device: "wg9", Up: true},       // a VPN server: routes to its peers only
+		{Name: "lte", Proto: "qmi", Device: "/dev/cdc-wdm9", Up: false}, // a backup uplink, down right now
+		{Name: "tun", Proto: "wireguard", Device: "wg8", Up: true, HasDefaultRoute: true},
+	}
+	got := qZoneMap(qZonesFrom(fw, "", nil, ifaces))
+	if got["peers"].Wan {
+		t.Fatalf("a masquerading VPN server zone was taken for an uplink: %+v", got["peers"])
+	}
+	if !got["backup"].Wan {
+		t.Fatalf("a masquerading modem uplink that is down was not taken for an uplink: %+v", got["backup"])
+	}
+	if !got["vpnout"].Wan {
+		t.Fatalf("a full-tunnel VPN client was not taken for an uplink: %+v", got["vpnout"])
+	}
+	devs, _ := qWanDevicesFrom(qZonesFrom(fw, "", nil, ifaces), nil, ifaces)
+	for _, d := range devs {
+		if d == "wg9" {
+			t.Fatalf("the VPN server's device is in the uplink set: %v", devs)
+		}
+	}
 }
 
 func TestQZonesFromFindsUplinksWithoutNames(t *testing.T) {
@@ -81,8 +118,11 @@ func TestQZonesFromFindsUplinksWithoutNames(t *testing.T) {
 		t.Fatalf("protected flags: %+v", got)
 	}
 	masq6 := qTestFirewall + "firewall.@zone[3].masq6='1'\n"
-	if !qZoneMap(qZonesFrom(masq6, "", nil, nil))["vpn"].Wan {
-		t.Fatal("masq6 must mark an uplink")
+	if !qZoneMap(qZonesFrom(masq6, "", nil, []ubus.InterfaceState{{Name: "tunnel", Proto: "dhcpv6"}}))["vpn"].Wan {
+		t.Fatal("masq6 over an uplink protocol must mark an uplink")
+	}
+	if qZoneMap(qZonesFrom(masq6, "", nil, []ubus.InterfaceState{{Name: "tunnel", Proto: "wireguard"}}))["vpn"].Wan {
+		t.Fatal("masq6 over a tunnel without a default route is not an uplink")
 	}
 }
 
@@ -333,13 +373,13 @@ func newQFake(t *testing.T) *qFake {
 	oldDir, oldState := quarantineDir, qStatePath
 	quarantineDir = filepath.Join(dir, "q")
 	qStatePath = filepath.Join(dir, "quarantine.json")
-	oldMissing, oldFlush := qMissingPolls, qLastFlush
+	oldMissing, oldFlush, oldFull := qMissingPolls, qLastFlush, qLastFullCheck
 	oldBudget, oldUsed, oldSum := qBudgetStart, qBudgetUsed, qBudgetSummaries
-	qMissingPolls, qLastFlush = 0, time.Time{}
+	qMissingPolls, qLastFlush, qLastFullCheck = 0, time.Time{}, time.Time{}
 	qBudgetStart, qBudgetUsed, qBudgetSummaries = time.Time{}, 0, 0
 	t.Cleanup(func() {
 		quarantineDir, qStatePath = oldDir, oldState
-		qMissingPolls, qLastFlush = oldMissing, oldFlush
+		qMissingPolls, qLastFlush, qLastFullCheck = oldMissing, oldFlush, oldFull
 		qBudgetStart, qBudgetUsed, qBudgetSummaries = oldBudget, oldUsed, oldSum
 	})
 
@@ -419,7 +459,13 @@ func newQFake(t *testing.T) *qFake {
 	qIdentities = func() qIdent {
 		return qIdent{arp: map[string]string{"02:00:00:00:00:99": "192.0.2.99"}, leases: map[string]ubus.Lease{}, meta: map[string]ClientMeta{}}
 	}
-	qSeenFn = func() ([]qElem, error) { return f.seen, nil }
+	qSeenFn = func() ([]qElem, error) {
+		// The set lives in the same included table as the chains.
+		if !f.live {
+			return nil, errors.New("no such set")
+		}
+		return f.seen, nil
+	}
 	qNotifyFn = func(_, _, plain string, _ bool) { f.mu.Lock(); f.notified = append(f.notified, plain); f.mu.Unlock() }
 	listClientsFn = func(string) []Client { return nil }
 	qChannelsFn = func() bool { return false }
@@ -888,6 +934,48 @@ func TestQPollNoticesARevertOnlyWhenSure(t *testing.T) {
 	qPoll(time.Now())
 	if loadQState().Enabled {
 		t.Fatal("still recorded as enabled after the feature left the firewall")
+	}
+}
+
+func TestQApproveDropsAMACUsedAsName(t *testing.T) {
+	newQFake(t)
+	if qDeviceName("02:00:00:00:00:51", "02:00:00:00:00:51") != "" || qDeviceName("02:00:00:00:00:51", "02:00:00:00:00:51 ") != "" {
+		t.Fatal("a MAC stand-in was kept as a name")
+	}
+	if qDeviceName("02:00:00:00:00:5a", "02:00:00:00:00:5A") != "" || qDeviceName("02:00:00:00:00:51", "Kitchen plug") != "Kitchen plug" {
+		t.Fatal("an upper-case MAC was kept, or a real name dropped")
+	}
+}
+
+func TestQPollFullCheckIsPaced(t *testing.T) {
+	f := newQFake(t)
+	f.enable(t, "internet", "home")
+	reads := 0
+	show := uciShowFn
+	uciShowFn = func(pkg string) (string, error) {
+		if pkg == "firewall" {
+			reads++
+		}
+		return show(pkg)
+	}
+	now := time.Now()
+	for i := 0; i < 12; i++ { // one minute of polls
+		qPoll(now.Add(time.Duration(i) * qPollInterval))
+	}
+	if reads != 2 {
+		t.Fatalf("%d full router reads in a minute, want 2", reads)
+	}
+	// A learning-pause approval does not wait for the next full check.
+	if _, err := QuarantinePause(30, "learn"); err != nil {
+		t.Fatal(err)
+	}
+	reads = 0
+	f.seen = []qElem{{Val: "02:00:00:00:00:78"}}
+	qPoll(now.Add(61 * time.Second))
+	f.seen = []qElem{{Val: "02:00:00:00:00:79"}}
+	qPoll(now.Add(63 * time.Second))
+	if reads != 2 {
+		t.Fatalf("%d full reads for two learned devices, want one each", reads)
 	}
 }
 
