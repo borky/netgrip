@@ -1608,6 +1608,7 @@ func qPoll(now time.Time) {
 	if !st.Enabled {
 		return
 	}
+	qRunDueRestartsLocked(now)
 	// Each poll reads the live "seen" set (one nft call). The full check
 	// (firewall and DHCP config, interfaces, chains, drift: about a dozen
 	// commands) runs every qFullCheckEvery, and at once when the set cannot
