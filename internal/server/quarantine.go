@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"log"
 	"net"
 	"net/http"
@@ -33,6 +34,9 @@ func (s *Server) registerQuarantineRoutes() {
 
 // quarantineKeepCheck is a seam so confirm tests do not touch nft.
 var quarantineKeepCheck = modules.QuarantineKeepCheck
+
+// quarantinePendingCheck is a seam for the pending-changes refusal.
+var quarantinePendingCheck = modules.QuarantinePendingCheck
 
 // requesterIP is the panel user's address, IPv4 or IPv6.
 func requesterIP(r *http.Request) string {
@@ -79,17 +83,25 @@ func (s *Server) runRiskyFirewall(w http.ResponseWriter, apply func() (modules.Q
 func (s *Server) runRisky(w http.ResponseWriter, required, optional []string, apply func() (modules.QuarantineProbe, error)) {
 	s.riskyMu.Lock()
 	defer s.riskyMu.Unlock()
+	// Before any snapshot: a snapshot (uci export) carries uncommitted
+	// changes, and restoring it after a failure would commit them.
+	if err := quarantinePendingCheck(append(append([]string{}, required...), optional...)); err != nil {
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
 	snapshots, err := snapshotForConfirm(required, optional)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	probe, err := apply()
-	if err != nil {
+	var refused *modules.QPendingError
+	if err != nil && !errors.As(err, &refused) {
 		// The module undoes what it can; restoring the snapshot as well
-		// covers a failed undo (the firewall back to before the change).
+		// covers a failed undo (the configs back to before the change).
+		// A refusal changed nothing, so there is nothing to restore.
 		if rerr := revertFn(snapshots); rerr != nil {
-			log.Printf("netgrip: quarantine: restoring the firewall after a failed change: %v", rerr)
+			log.Printf("netgrip: quarantine: restoring the configs after a failed change: %v", rerr)
 		}
 		probe = modules.ProbeQuarantine()
 	}

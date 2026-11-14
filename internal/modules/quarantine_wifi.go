@@ -69,6 +69,9 @@ type QWifiState struct {
 	RouterIP string `json:"router_ip,omitempty"` // the quarantine network's router address
 	// OffReason says why the layer turned itself off, for the panel.
 	OffReason string `json:"off_reason,omitempty"`
+	// Leftovers: the layer is off but removing it failed; the poller
+	// retries until it is gone.
+	Leftovers bool `json:"leftovers,omitempty"`
 }
 
 // QWifiSSID describes one of the router's SSIDs for the panel.
@@ -794,7 +797,7 @@ var qNetdevsFn = func() []string {
 	return out
 }
 
-var applyQWifiOps = func(ops []executor.Op) error { return executor.Apply(ops, nil) }
+var applyQWifiOps = qApplyClean
 
 // qBSSFn maps wifi-iface sections to their running interface and clients.
 var qBSSFn = func() map[string]ubus.WirelessInterface {
@@ -940,12 +943,8 @@ func qWifiApplyLocked(v qWifiView, p qWifiPlan) error {
 		if c.n == 0 {
 			continue
 		}
-		pending, err := qUCIPendingFn(c.pkg)
-		if err != nil {
-			return fmt.Errorf("cannot check the %s config for pending changes, nothing changed: %w", c.pkg, err)
-		}
-		if pending != "" {
-			return fmt.Errorf("the %s config has uncommitted changes made outside NetGrip (%s); save or revert them first (LuCI: Unsaved changes, or uci revert %s), nothing changed", c.pkg, qFirstLine(pending), c.pkg)
+		if err := QuarantinePendingCheck([]string{c.pkg}); err != nil {
+			return err
 		}
 	}
 	// DHCP is what every other network depends on: record what dnsmasq
@@ -1050,10 +1049,75 @@ var (
 	qDHCPRecheckDelay = 5 * time.Second
 )
 
-// qUCIPendingFn lists a config's uncommitted changes ("" when none).
+// qUCIPendingFn lists a config's uncommitted changes ("" when none, also
+// when the config does not exist: nothing can be pending in it).
 var qUCIPendingFn = func(pkg string) (string, error) {
+	if _, err := os.Stat("/etc/config/" + pkg); errors.Is(err, os.ErrNotExist) {
+		return "", nil
+	}
 	out, err := exec.Command("uci", "changes", pkg).Output()
 	return strings.TrimSpace(string(out)), err
+}
+
+// QPendingError is a refusal to touch a config that holds uncommitted
+// changes: committing it would publish them. Nothing was changed.
+type QPendingError struct{ Pkg, First string }
+
+func (e *QPendingError) Error() string {
+	return fmt.Sprintf("the %s config has uncommitted changes that NetGrip did not make (%s); nothing was changed. See them with `uci changes %s`, discard them with `uci revert %s` (or commit them if they are yours)", e.Pkg, e.First, e.Pkg, e.Pkg)
+}
+
+// QuarantinePendingCheck refuses when any of the configs holds uncommitted
+// changes. The server runs it before it snapshots for the confirm window:
+// a snapshot (uci export) includes pending changes, and restoring it would
+// commit them.
+func QuarantinePendingCheck(pkgs []string) error {
+	for _, pkg := range pkgs {
+		pending, err := qUCIPendingFn(pkg)
+		if err != nil {
+			return fmt.Errorf("cannot check the %s config for pending changes, nothing changed: %w", pkg, err)
+		}
+		if pending != "" {
+			return &QPendingError{Pkg: pkg, First: qFirstLine(pending)}
+		}
+	}
+	return nil
+}
+
+// qUCIRevertFn discards a config's uncommitted changes.
+var qUCIRevertFn = func(pkg string) error {
+	if out, err := exec.Command("uci", "revert", pkg).CombinedOutput(); err != nil {
+		return fmt.Errorf("%w (%s)", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// qApplyClean runs a batch of ops. If one fails midway, the changes it had
+// staged but not committed are reverted: they are NetGrip's own (the
+// configs were checked clean before), and left behind they would block
+// every later change, turning the quarantine off included.
+func qApplyClean(ops []executor.Op) error {
+	err := executor.Apply(ops, nil)
+	if err == nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	for _, op := range ops {
+		if !strings.HasPrefix(op.Kind, "uci_") || len(op.Args) == 0 {
+			continue
+		}
+		pkg, _, _ := strings.Cut(op.Args[0], ".")
+		if seen[pkg] {
+			continue
+		}
+		seen[pkg] = true
+		if pending, perr := qUCIPendingFn(pkg); perr == nil && pending != "" {
+			if rerr := qUCIRevertFn(pkg); rerr != nil {
+				log.Printf("netgrip: quarantine: reverting the half-applied %s changes: %v", pkg, rerr)
+			}
+		}
+	}
+	return err
 }
 
 func qFirstLine(s string) string {
@@ -1120,7 +1184,11 @@ func parseDnsmasqServing(confs map[string]string) qDnsmasqServing {
 				if len(addrs) > 0 {
 					in.ranges[strings.Join(addrs, "-")] = true
 				}
-			case "interface", "listen-address", "except-interface", "no-dhcp-interface":
+			case "interface", "listen-address":
+				// What narrows where an instance answers. Exclusions
+				// (no-dhcp-interface, except-interface) are left out: the
+				// init adds one whenever an ignored network such as a WAN
+				// comes up, and a lost network shows as a lost range.
 				in.restrict[line] = true
 			}
 		}
@@ -1184,10 +1252,10 @@ func qDHCPRegression(before, after qDnsmasqServing, own qOwnDHCP) string {
 			if b.restrict[l] {
 				continue
 			}
-			key, val, _ := strings.Cut(l, "=")
-			// A bound instance may gain the quarantine network; one that
-			// answered everywhere must not become bound, not even to it.
-			if key == "interface" && bound && own.isOwnIface(val) {
+			// An instance bound to interfaces may gain more (ours, or a
+			// listed network whose device just came up); one that answered
+			// everywhere must not become bound, not even to ours.
+			if bound {
 				continue
 			}
 			return "dnsmasq gained the restriction " + l
@@ -1352,10 +1420,11 @@ func qWifiTeardownLocked(st *qState) error {
 	if err != nil {
 		return err
 	}
-	if err := qWifiApplyLocked(v, qWifiPlan{}); err != nil {
+	if err := qWifiApplyLocked(v, qWifiPlan{routerIP: st.Wifi.RouterIP}); err != nil {
 		return err
 	}
 	st.Wifi.Enabled = false
+	st.Wifi.Leftovers = false
 	return nil
 }
 
@@ -1403,7 +1472,7 @@ func qWifiSyncLocked(st *qState, r qRouter, now time.Time) (QWifiProbe, error) {
 		// the configs back, or someone removed it by hand. Record it as
 		// off and clear what is left, rather than rebuild it.
 		log.Printf("netgrip: quarantine: no Wi-Fi network is on the quarantine network any more; recording the Wi-Fi layer as off")
-		if err := qWifiApplyLocked(v, qWifiPlan{}); err != nil {
+		if err := qWifiApplyLocked(v, qWifiPlan{routerIP: st.Wifi.RouterIP}); err != nil {
 			return wp, err
 		}
 		st.Wifi.Enabled = false
@@ -1440,9 +1509,12 @@ func qWifiSyncLocked(st *qState, r qRouter, now time.Time) (QWifiProbe, error) {
 			// Never retry something that cost other networks their DHCP:
 			// the layer goes off, with the reason, until the user acts.
 			log.Printf("netgrip: quarantine: %v; turning the Wi-Fi layer off", err)
+			st.Wifi.Leftovers = true
 			if v2, rerr := readQWifiView(); rerr == nil {
-				if terr := qWifiApplyLocked(v2, qWifiPlan{}); terr != nil {
-					log.Printf("netgrip: quarantine: removing the Wi-Fi layer: %v", terr)
+				if terr := qWifiApplyLocked(v2, qWifiPlan{routerIP: st.Wifi.RouterIP}); terr != nil {
+					log.Printf("netgrip: quarantine: removing the Wi-Fi layer: %v (retried every check)", terr)
+				} else {
+					st.Wifi.Leftovers = false
 				}
 			}
 			st.Wifi.Enabled = false
@@ -1458,6 +1530,21 @@ func qWifiSyncLocked(st *qState, r qRouter, now time.Time) (QWifiProbe, error) {
 	}
 	wp.Quarantined = qWifiHealLocked(st, v, p, now)
 	return wp, nil
+}
+
+// qWifiRemoveLeftoversLocked retries removing a layer that turned itself
+// off but could not be removed then.
+func qWifiRemoveLeftoversLocked(st *qState) {
+	if st.Wifi.Enabled || !st.Wifi.Leftovers {
+		return
+	}
+	if err := qWifiTeardownLocked(st); err != nil {
+		log.Printf("netgrip: quarantine: removing the rest of the Wi-Fi layer: %v", err)
+		st.Wifi.Leftovers = true
+		return
+	}
+	log.Printf("netgrip: quarantine: the rest of the Wi-Fi layer was removed")
+	_ = saveQState(st)
 }
 
 // qWifiMarked reports whether any SSID carries the layer's marker.
@@ -1511,6 +1598,9 @@ func qWifiProbeLocked(st *qState, r qRouter) QWifiProbe {
 	wp := QWifiProbe{Enabled: st.Wifi.Enabled, SSIDs: []QWifiSSID{}, Issues: []string{}}
 	if !st.Wifi.Enabled {
 		wp.OffReason = st.Wifi.OffReason
+		if st.Wifi.Leftovers {
+			wp.Issues = append(wp.Issues, "the Wi-Fi layer is off but parts of it are still on the router; NetGrip keeps trying to remove them")
+		}
 	}
 	v, err := readQWifiView()
 	if err != nil {
