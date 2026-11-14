@@ -122,23 +122,69 @@ network.lte.proto='qmi'
 
 func TestQStickyWanKeepsAReconnectingLink(t *testing.T) {
 	qWanStickyMu.Lock()
-	old := qWanSticky
-	qWanSticky = map[string]map[string]bool{}
+	old, oldNets := qWanSticky, qWanNets
+	qWanSticky, qWanNets = map[string]time.Time{}, map[string]time.Time{}
 	qWanStickyMu.Unlock()
-	t.Cleanup(func() { qWanStickyMu.Lock(); qWanSticky = old; qWanStickyMu.Unlock() })
-	zones := []QZone{{Name: "up", Networks: []string{"uplink"}, Wan: true}, {Name: "home", Networks: []string{"home"}}}
+	t.Cleanup(func() { qWanStickyMu.Lock(); qWanSticky, qWanNets = old, oldNets; qWanStickyMu.Unlock() })
+	now := time.Now()
+	zones := []QZone{{Name: "up", Networks: []string{"uplink"}, Wan: true}, {Name: "home", Networks: []string{"home", "guest"}}}
 	up := []ubus.InterfaceState{{Name: "uplink", Device: "eth9", L3Device: "pppoe-uplink"}, {Name: "home", Device: "br-home"}}
-	if got := qStickyWan(zones, up, []string{"eth9", "pppoe-uplink"}); strings.Join(got, ",") != "eth9,pppoe-uplink" {
+	if got := qStickyWan(zones, up, []string{"eth9", "pppoe-uplink"}, now); strings.Join(got, ",") != "eth9,pppoe-uplink" {
 		t.Fatalf("up: %v", got)
 	}
 	down := []ubus.InterfaceState{{Name: "uplink", Device: "eth9"}, {Name: "home", Device: "br-home"}}
-	if got := qStickyWan(zones, down, []string{"eth9"}); strings.Join(got, ",") != "eth9,pppoe-uplink" {
+	if got := qStickyWan(zones, down, []string{"eth9"}, now.Add(time.Minute)); strings.Join(got, ",") != "eth9,pppoe-uplink" {
 		t.Fatalf("the PPPoE device left the set during a reconnect: %v", got)
 	}
-	// A network that stops being an uplink takes its devices with it.
+	// A zone that is an uplink by its default route alone is not one
+	// while it reconnects: its devices stay for the grace time.
 	zones[0].Wan = false
-	if got := qStickyWan(zones, down, nil); len(got) != 0 {
-		t.Fatalf("devices of a former uplink kept: %v", got)
+	if got := qStickyWan(zones, down, nil, now.Add(2*time.Minute)); strings.Join(got, ",") != "eth9,pppoe-uplink" {
+		t.Fatalf("devices dropped during a brief loss of the default route: %v", got)
+	}
+	// ...and leave once it has passed.
+	if got := qStickyWan(zones, down[1:], nil, now.Add(time.Minute+qWanGrace+time.Second)); len(got) != 0 {
+		t.Fatalf("devices kept past the grace time: %v", got)
+	}
+	// A device an internal network takes over leaves at once.
+	zones[0].Wan = true
+	qStickyWan(zones, up, []string{"eth9", "pppoe-uplink"}, now)
+	moved := []ubus.InterfaceState{{Name: "uplink", Device: "eth7"}, {Name: "guest", Device: "eth9"}}
+	if got := qStickyWan(zones, moved, []string{"eth7"}, now.Add(time.Second)); strings.Join(got, ",") != "eth7,pppoe-uplink" {
+		t.Fatalf("a device now used by an internal network kept in the uplink set: %v", got)
+	}
+}
+
+func TestQVPNServerNetworksClientForms(t *testing.T) {
+	netw := `network.split=interface
+network.split.proto='wireguard'
+network.@wireguard_split[0]=wireguard_split
+network.@wireguard_split[0].allowed_ips='0.0.0.0/5' '8.0.0.0/7' '11.0.0.0/8' '10.8.0.1/32' '2000::/3'
+network.onestr=interface
+network.onestr.proto='wireguard'
+network.p1=wireguard_onestr
+network.p1.allowed_ips='0.0.0.0/0, ::/0'
+network.spelled=interface
+network.spelled.proto='wireguard'
+network.p2=wireguard_spelled
+network.p2.allowed_ips='0::0/0'
+network.srv=interface
+network.srv.proto='wireguard'
+network.srv.listen_port='51820'
+network.p3=wireguard_srv
+network.p3.allowed_ips='10.99.0.2/32' '192.168.50.0/24'
+network.p4=wireguard_srv
+network.p4.allowed_ips='0.0.0.0/0'
+network.p4.disabled='1'
+network.p5=wireguard_srv
+network.p5.allowed_ips='10.0.0.0/8'
+`
+	got := qVPNServerNetworks(netw)
+	if got["split"] || got["onestr"] || got["spelled"] {
+		t.Fatalf("a client tunnel was taken for a server: %v", got)
+	}
+	if !got["srv"] {
+		t.Fatalf("a server with a disabled full-tunnel peer and a private site peer was taken for a client: %v", got)
 	}
 }
 
@@ -414,8 +460,8 @@ func newQFake(t *testing.T) *qFake {
 	qStatePath = filepath.Join(dir, "quarantine.json")
 	oldMissing, oldFlush, oldFull, oldForce := qMissingPolls, qLastFlush, qLastFullCheck, qForceFull
 	qWanStickyMu.Lock()
-	oldSticky := qWanSticky
-	qWanSticky = map[string]map[string]bool{}
+	oldSticky, oldNets := qWanSticky, qWanNets
+	qWanSticky, qWanNets = map[string]time.Time{}, map[string]time.Time{}
 	qWanStickyMu.Unlock()
 	oldBudget, oldUsed, oldSum := qBudgetStart, qBudgetUsed, qBudgetSummaries
 	qMissingPolls, qLastFlush, qLastFullCheck, qForceFull = 0, time.Time{}, time.Time{}, false
@@ -424,7 +470,7 @@ func newQFake(t *testing.T) *qFake {
 		quarantineDir, qStatePath = oldDir, oldState
 		qMissingPolls, qLastFlush, qLastFullCheck, qForceFull = oldMissing, oldFlush, oldFull, oldForce
 		qWanStickyMu.Lock()
-		qWanSticky = oldSticky
+		qWanSticky, qWanNets = oldSticky, oldNets
 		qWanStickyMu.Unlock()
 		qBudgetStart, qBudgetUsed, qBudgetSummaries = oldBudget, oldUsed, oldSum
 	})
@@ -1021,6 +1067,35 @@ func TestQPollRetriesAFailedFullCheckNextPoll(t *testing.T) {
 	qPoll(now.Add(qFullCheckEvery + qPollInterval))
 	if reads != 2 {
 		t.Fatalf("a failed full check was retried after %d reads, want on the next poll", reads)
+	}
+}
+
+func TestQPollPersistentSyncFailureKeepsThePace(t *testing.T) {
+	f := newQFake(t)
+	f.enable(t, "internet", "home")
+	qLiveDrifted = func(*qState, qRouter, time.Time) bool { return true }
+	nft := nftRunFn
+	nftRunFn = func(stdin string, args ...string) ([]byte, error) {
+		if len(args) > 0 && args[0] == "-c" {
+			return nil, errors.New("rules refused")
+		}
+		return nft(stdin, args...)
+	}
+	reads := 0
+	show := uciShowFn
+	uciShowFn = func(pkg string) (string, error) {
+		if pkg == "firewall" {
+			reads++
+		}
+		return show(pkg)
+	}
+	now := time.Now()
+	for i := 0; i < 12; i++ { // one minute
+		qPoll(now.Add(time.Duration(i) * qPollInterval))
+	}
+	// The first check, one retry, and the next 30 s check.
+	if reads > 3 {
+		t.Fatalf("%d full checks in a minute of a failing sync", reads)
 	}
 }
 

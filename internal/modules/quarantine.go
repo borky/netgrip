@@ -33,6 +33,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/exec"
 	"regexp"
@@ -78,6 +79,7 @@ var (
 	qLastFullCheck time.Time
 	// qForceFull asks the next poll for a full check (a failed one).
 	qForceFull bool
+	qFullFails int
 	// The announcement budget (see qNotifyBudget).
 	qBudgetStart                  time.Time
 	qBudgetUsed, qBudgetSummaries int
@@ -351,10 +353,12 @@ func qDHCPDNSServers(uciDhcp string) []string {
 // (IPv4 or IPv6) or when one of its networks holds a default route. Pure,
 // for tests.
 // qVPNServerNetworks lists the WireGuard networks that serve peers rather
-// than reach the internet: no peer is allowed a default route (0/0, ::/0
-// or its two halves). Pure, for tests.
+// than reach the internet: no enabled peer is allowed a wide public range.
+// A client tunnel allows 0/0, its two halves, or the "everything but
+// private ranges" list (0.0.0.0/5, 8.0.0.0/7, ..., 2000::/3); a server's
+// peers get host or site prefixes. Pure, for tests.
 func qVPNServerNetworks(uciNetwork string) map[string]bool {
-	proto, typ, allowed := map[string]string{}, map[string]string{}, map[string][]string{}
+	proto, typ, allowed, disabled := map[string]string{}, map[string]string{}, map[string][]string{}, map[string]bool{}
 	for _, line := range strings.Split(uciNetwork, "\n") {
 		key, val, ok := strings.Cut(strings.TrimSpace(line), "=")
 		if !ok {
@@ -367,9 +371,12 @@ func qVPNServerNetworks(uciNetwork string) map[string]bool {
 			typ[sec] = strings.Trim(val, "'")
 		case opt == "proto":
 			proto[sec] = strings.Trim(val, "'")
+		case opt == "disabled":
+			disabled[sec] = strings.Trim(val, "'") == "1"
 		case opt == "allowed_ips":
+			// A list ('a' 'b') or one string with several values.
 			for _, m := range reUCIValue.FindAllStringSubmatch(val, -1) {
-				allowed[sec] = append(allowed[sec], m[1])
+				allowed[sec] = append(allowed[sec], strings.FieldsFunc(m[1], func(r rune) bool { return r == ' ' || r == ',' || r == '\t' })...)
 			}
 		}
 	}
@@ -381,17 +388,31 @@ func qVPNServerNetworks(uciNetwork string) map[string]bool {
 	}
 	for sec, t := range typ {
 		iface, ok := strings.CutPrefix(t, "wireguard_")
-		if !ok {
+		if !ok || disabled[sec] {
 			continue
 		}
 		for _, a := range allowed[sec] {
-			switch strings.TrimSpace(a) {
-			case "0.0.0.0/0", "::/0", "0.0.0.0/1", "128.0.0.0/1", "::/1", "8000::/1":
+			if qWidePublicPrefix(a) {
 				delete(out, iface)
 			}
 		}
 	}
 	return out
+}
+
+// qWidePublicPrefix reports a prefix a client tunnel routes the internet
+// through: an IPv4 prefix of /8 or wider, or an IPv6 one of /16 or wider,
+// that is not entirely private.
+func qWidePublicPrefix(s string) bool {
+	_, n, err := net.ParseCIDR(strings.TrimSpace(s))
+	if err != nil {
+		return false
+	}
+	ones, bits := n.Mask.Size()
+	if bits == 32 {
+		return ones <= 8 && !n.IP.IsPrivate() && !n.IP.IsLoopback()
+	}
+	return ones <= 16 && !n.IP.IsPrivate() && !n.IP.IsLinkLocalUnicast() && !n.IP.IsMulticast()
 }
 
 var reUCIValue = regexp.MustCompile(`'([^']*)'`)
@@ -509,22 +530,26 @@ func readQRouter() (qRouter, error) {
 	r := qRouter{firewall: fw, sections: qIncludeSections(fw), actual: qActualZones(fw)}
 	r.zones = qZonesFrom(fw, dhcp, r.actual, ifaces, qVPNServerNetworks(netw))
 	r.wan, r.wanPatterns = qWanDevicesFrom(r.zones, qZoneExtras(fw), ifaces)
-	r.wan = qStickyWan(r.zones, ifaces, r.wan)
+	r.wan = qStickyWan(r.zones, ifaces, r.wan, time.Now())
 	r.dns = qDHCPDNSServers(dhcp)
 	return r, nil
 }
 
 // Uplink devices exist only while their link is up (a PPPoE session's
-// interface goes away on every reconnect). qStickyWan keeps every device an
-// uplink network has had in this run, so a sync during a reconnect or a
-// failover does not take it out of the set and cut quarantined devices off
-// the internet until the next full check.
+// interface goes away on every reconnect, and a zone that is an uplink by
+// its default route alone stops being one meanwhile). qStickyWan keeps an
+// uplink device in the set for qWanGrace after it was last seen, so a
+// sync during a reconnect or a failover does not cut quarantined devices
+// off the internet. A device an internal network uses now leaves at once.
+const qWanGrace = 10 * time.Minute
+
 var (
 	qWanStickyMu sync.Mutex
-	qWanSticky   = map[string]map[string]bool{} // network -> devices
+	qWanSticky   = map[string]time.Time{} // device -> last seen as an uplink device
+	qWanNets     = map[string]time.Time{} // network -> last seen as an uplink
 )
 
-func qStickyWan(zones []QZone, ifaces []ubus.InterfaceState, devs []string) []string {
+func qStickyWan(zones []QZone, ifaces []ubus.InterfaceState, devs []string, now time.Time) []string {
 	qWanStickyMu.Lock()
 	defer qWanStickyMu.Unlock()
 	uplink := map[string]bool{}
@@ -535,32 +560,35 @@ func qStickyWan(zones []QZone, ifaces []ubus.InterfaceState, devs []string) []st
 			}
 		}
 	}
-	for n := range qWanSticky {
-		if !uplink[n] {
-			delete(qWanSticky, n) // no longer an uplink network
+	for n := range uplink {
+		qWanNets[n] = now
+	}
+	for n, seen := range qWanNets {
+		if now.Sub(seen) > qWanGrace {
+			delete(qWanNets, n)
 		}
 	}
+	internal := map[string]bool{}
 	for _, i := range ifaces {
-		if !uplink[i.Name] {
+		if _, recent := qWanNets[i.Name]; recent {
 			continue
 		}
 		for _, d := range []string{i.L3Device, i.Device} {
-			if d == "" || strings.HasPrefix(d, "/") {
-				continue
-			}
-			if qWanSticky[i.Name] == nil {
-				qWanSticky[i.Name] = map[string]bool{}
-			}
-			if len(qWanSticky[i.Name]) < 8 {
-				qWanSticky[i.Name][d] = true
+			if d != "" {
+				internal[d] = true
 			}
 		}
 	}
+	for _, d := range devs {
+		qWanSticky[d] = now
+	}
 	out := append([]string(nil), devs...)
-	for _, ds := range qWanSticky {
-		for d := range ds {
-			out = append(out, d)
+	for d, seen := range qWanSticky {
+		if internal[d] || now.Sub(seen) > qWanGrace {
+			delete(qWanSticky, d)
+			continue
 		}
+		out = append(out, d)
 	}
 	return sortedIfnames(out)
 }
@@ -1602,9 +1630,21 @@ func qPoll(now time.Time) {
 	if full && live && qLiveDrifted(st, r, now) {
 		if err := qSyncLocked(st, r); err != nil {
 			log.Printf("netgrip: quarantine sync: %v", err)
-			qForceFull = true // retry on the next poll
+			qFullFailedLocked(now)
+			return
 		}
 	}
+	if full {
+		qFullFails = 0
+	}
+}
+
+// qFullFailedLocked retries a failed full check on the next poll once;
+// a failure that persists falls back to the normal pace (and log rate).
+func qFullFailedLocked(now time.Time) {
+	qFullFails++
+	qLastFullCheck = now
+	qForceFull = qFullFails == 1
 }
 
 // qFullCheckLocked reads the router and notices a firewall that no longer
@@ -1613,7 +1653,7 @@ func qPoll(now time.Time) {
 func qFullCheckLocked(st *qState, now time.Time) (r qRouter, live, ok bool) {
 	r, err := readQRouter()
 	if err != nil {
-		qForceFull = true // retry on the next poll
+		qFullFailedLocked(now)
 		return r, false, false
 	}
 	qLastFullCheck, qForceFull = now, false
