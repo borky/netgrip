@@ -2,6 +2,7 @@ package modules
 
 import (
 	"encoding/binary"
+	"fmt"
 	"net"
 	"sort"
 	"strings"
@@ -437,12 +438,14 @@ func newQWifiFake(t *testing.T, f *qFake) *qWifiFake {
 	qNetdevsFn = func() []string { return []string{"br-home", "eth9"} }
 	oRun, oSnap, oRestore := qDnsmasqRuntimeFn, qSnapshotFn, qRestoreFn
 	t.Cleanup(func() { qDnsmasqRuntimeFn, qSnapshotFn, qRestoreFn = oRun, oSnap, oRestore })
-	qDnsmasqRuntimeFn = func() qDnsmasqServing { return parseDnsmasqServing(qDnsmasqHealthy, true) }
+	qDnsmasqRuntimeFn = func() qDnsmasqServing { return qServing(qDnsmasqHealthy) }
 	qSnapshotFn = func(string) (string, error) { return "", nil }
 	qRestoreFn = func(string, string) error { return nil }
-	oWait := qDnsmasqWaitFn
+	oWait, oPending, oRecheck := qDnsmasqWaitFn, qUCIPendingFn, qDHCPRecheckDelay
 	qDnsmasqWaitFn = func(time.Time) {}
-	t.Cleanup(func() { qDnsmasqWaitFn = oWait })
+	qUCIPendingFn = func(string) (string, error) { return "", nil }
+	qDHCPRecheckDelay = 0
+	t.Cleanup(func() { qDnsmasqWaitFn, qUCIPendingFn, qDHCPRecheckDelay = oWait, oPending, oRecheck })
 	qRoutesFn = func() []string { return []string{"192.0.2.0/24"} }
 	return w
 }
@@ -789,8 +792,16 @@ dhcp-range=set:lan,192.0.2.100,192.0.2.249,255.255.255.0,12h
 dhcp-range=set:guests,198.51.100.100,198.51.100.249,255.255.255.0,12h
 `
 
+func qServing(confs ...string) qDnsmasqServing {
+	m := map[string]string{}
+	for i, c := range confs {
+		m[fmt.Sprintf("dnsmasq.conf.cfg%d", i)] = c
+	}
+	return parseDnsmasqServing(m)
+}
+
 func TestQDHCPRegression(t *testing.T) {
-	before := parseDnsmasqServing(qDnsmasqHealthy, true)
+	before := qServing(qDnsmasqHealthy)
 	own := qOwnDHCP{bridge: "br-quarantine", routerIP: "192.168.254.1"}
 	withOurs := qDnsmasqHealthy + "dhcp-range=set:netgrip_quarantine,192.168.254.100,192.168.254.249,255.255.255.0,1h\n"
 	for name, c := range map[string]struct {
@@ -801,24 +812,104 @@ func TestQDHCPRegression(t *testing.T) {
 		"bound to the quarantine alone": {withOurs + "interface=br-quarantine\n", true}, // what happened on 2026-11-14
 		"a range lost":                  {"dhcp-range=set:lan,192.0.2.100,192.0.2.249,255.255.255.0,12h\n", true},
 		"lease time changed only":       {strings.ReplaceAll(qDnsmasqHealthy, "12h", "6h"), false},
+		"an interface excluded":         {qDnsmasqHealthy + "no-dhcp-interface=br-home\n", true},
+		"a listen address added":        {qDnsmasqHealthy + "listen-address=192.0.2.1\n", true},
+		"interface-name is not binding": {qDnsmasqHealthy + "interface-name=router.lan,lan\n", false},
 	} {
-		got := qDHCPRegression(before, parseDnsmasqServing(c.after, true), own)
+		got := qDHCPRegression(before, qServing(c.after), own)
 		if (got != "") != c.bad {
 			t.Errorf("%s: %q", name, got)
 		}
 	}
-	// Turning the layer off removes our own range and binding: fine.
-	on := parseDnsmasqServing(withOurs, true)
-	if got := qDHCPRegression(on, before, own); got != "" {
+	// Turning the layer off removes our own range: fine.
+	if got := qDHCPRegression(qServing(withOurs), before, own); got != "" {
 		t.Fatalf("our own range going away was taken for a regression: %q", got)
 	}
-	// An instance bound to its interfaces may gain ours, not lose its own.
-	bound := parseDnsmasqServing(qDnsmasqHealthy+"interface=br-home\n", true)
-	if got := qDHCPRegression(bound, parseDnsmasqServing(qDnsmasqHealthy+"interface=br-home\ninterface=br-quarantine\n", true), own); got != "" {
+	// A bound instance may gain ours, not lose its own.
+	bound := qServing(qDnsmasqHealthy + "interface=br-home\n")
+	if got := qDHCPRegression(bound, qServing(qDnsmasqHealthy+"interface=br-home\ninterface=br-quarantine\n"), own); got != "" {
 		t.Fatalf("adding ours to a bound instance: %q", got)
 	}
-	if got := qDHCPRegression(bound, parseDnsmasqServing(qDnsmasqHealthy+"interface=br-quarantine\n", true), own); got == "" {
+	if got := qDHCPRegression(bound, qServing(qDnsmasqHealthy+"interface=br-quarantine\n"), own); got == "" {
 		t.Fatal("a bound instance losing its interface passed")
+	}
+	// Two instances: one already bound must not hide the other becoming bound.
+	two := qServing(qDnsmasqHealthy, "interface=br-guest\ndhcp-range=set:g,203.0.113.100,203.0.113.200,255.255.255.0,1h\n")
+	if got := qDHCPRegression(two, qServing(qDnsmasqHealthy+"interface=br-quarantine\n", "interface=br-guest\ndhcp-range=set:g,203.0.113.100,203.0.113.200,255.255.255.0,1h\n"), own); got == "" {
+		t.Fatal("an unbound instance became bound and passed because another one is bound")
+	}
+}
+
+func TestParseUCIValuesEmptyListIsNoValues(t *testing.T) {
+	if got := parseUCIValues(""); len(got) != 0 {
+		t.Fatalf("an empty list read as %q", got)
+	}
+	if got := parseUCIValues("''"); len(got) != 1 || got[0] != "" {
+		t.Fatalf("an empty string value read as %q", got)
+	}
+	// The 2026-11-14 shape: uci show prints an emptied list as `key=`.
+	v := parseUCIShow("dhcp.@dnsmasq[0]=dnsmasq\ndhcp.@dnsmasq[0].interface=\n", "dhcp")
+	if len(v["@dnsmasq[0]"].Options["interface"]) != 0 {
+		t.Fatalf("an empty interface list: %q", v["@dnsmasq[0]"].Options["interface"])
+	}
+}
+
+func TestQWifiEmptyDnsmasqListIsNotBound(t *testing.T) {
+	v := qWifiTestView()
+	v.dhcp["@dnsmasq[0]"] = uciSection{Type: "dnsmasq", Options: map[string][]string{"interface": {""}}}
+	p := qTestPlan(v, []string{"02:00:00:00:00:0a"})
+	p.ownNetwork = "home"
+	for _, op := range qWifiOpsFor(v, p).dhcp {
+		if strings.Contains(op.Args[0], "@dnsmasq") {
+			t.Fatalf("an unbound dnsmasq was bound: %+v", op)
+		}
+	}
+}
+
+func TestQuarantineWifiRefusesForeignPendingChanges(t *testing.T) {
+	f := newQFake(t)
+	f.enable(t, "internet", "home")
+	w := newQWifiFake(t, f)
+	qUCIPendingFn = func(pkg string) (string, error) {
+		if pkg == "dhcp" {
+			return "dhcp.cfg01411c.interface='x'", nil
+		}
+		return "", nil
+	}
+	_, err := QuarantineWifiEnable("192.0.2.10", false)
+	if err == nil || !strings.Contains(err.Error(), "uncommitted changes") {
+		t.Fatalf("went ahead over someone else's pending changes: %v", err)
+	}
+	if len(w.ops) != 0 {
+		t.Fatalf("changed something: %v", w.ops)
+	}
+}
+
+func TestQuarantineWifiPollerTurnsOffOnDHCPLoss(t *testing.T) {
+	f := newQFake(t)
+	f.enable(t, "internet", "home")
+	w := newQWifiFake(t, f)
+	if _, err := QuarantineWifiEnable("192.0.2.10", false); err != nil {
+		t.Fatal(err)
+	}
+	// Approving makes the next sync touch the station entries only; force a
+	// DHCP change by moving the resolver, and make dnsmasq lose a range.
+	w.v.dhcp["home"].Options["dhcp_option"] = []string{"6,192.0.2.54"}
+	calls := 0
+	qDnsmasqRuntimeFn = func() qDnsmasqServing {
+		calls++
+		if calls == 1 {
+			return qServing(qDnsmasqHealthy)
+		}
+		return qServing("dhcp-range=set:lan,192.0.2.100,192.0.2.249,255.255.255.0,12h\n")
+	}
+	qPoll(time.Now().Add(time.Hour))
+	st := loadQState()
+	if st.Wifi.Enabled || !strings.Contains(st.Wifi.OffReason, "DHCP") {
+		t.Fatalf("after a DHCP loss in the poller: %+v", st.Wifi)
+	}
+	if w.v.wireless["home2"].Option("network") != "home" {
+		t.Fatal("the SSID was not given its own network back")
 	}
 }
 
@@ -832,10 +923,10 @@ func TestQuarantineWifiEnableRestoresDHCPWhenItBreaks(t *testing.T) {
 	qDnsmasqRuntimeFn = func() qDnsmasqServing {
 		calls++
 		if calls == 1 {
-			return parseDnsmasqServing(qDnsmasqHealthy, true)
+			return qServing(qDnsmasqHealthy)
 		}
 		// Whatever the cause, dnsmasq ends up serving the quarantine alone.
-		return parseDnsmasqServing("interface=br-quarantine\ndhcp-range=set:q,192.168.254.100,192.168.254.249,255.255.255.0,1h\n", true)
+		return qServing(qDnsmasqHealthy + "interface=br-quarantine\n")
 	}
 	qSnapshotFn = func(c string) (string, error) { return "snapshot-of-" + c, nil }
 	restored := ""
