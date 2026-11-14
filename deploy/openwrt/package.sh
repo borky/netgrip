@@ -162,6 +162,8 @@ cat > "$PKG_DIR/CONTROL/prerm" << 'PRERM'
 # section the feature created goes (netgrip_quarantine*, and the first
 # release's netgrip_q_* includes).
 qchanged=
+qwifi=
+qdhcp=
 # -X: unnamed SSIDs get their real section names
 for s in $(uci -q -X show wireless | sed -n 's/^wireless\.\([A-Za-z0-9_]*\)\.netgrip_quarantine_network=.*/\1/p'); do
 	n=$(uci -q get "wireless.$s.netgrip_quarantine_network")

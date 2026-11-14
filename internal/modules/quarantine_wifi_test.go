@@ -701,3 +701,76 @@ func qCopySections(m map[string]uciSection) map[string]uciSection {
 	}
 	return out
 }
+
+func TestQWirelessShowWithoutWifiConfig(t *testing.T) {
+	old := qWirelessConfig
+	qWirelessConfig = t.TempDir() + "/wireless"
+	t.Cleanup(func() { qWirelessConfig = old })
+	out, err := qWirelessShowFn()
+	if err != nil || out != "" {
+		t.Fatalf("a router without Wi-Fi: %q, %v", out, err)
+	}
+}
+
+func TestQWifiDnsmasqOnlyTheServingInstance(t *testing.T) {
+	v := qWifiTestView()
+	v.dhcp["main"] = uciSection{Type: "dnsmasq", Options: map[string][]string{"interface": {"home"}}}
+	v.dhcp["guestdns"] = uciSection{Type: "dnsmasq", Options: map[string][]string{"interface": {"guests"}}}
+	v.dhcp["home"].Options["instance"] = []string{"main"}
+	p := qTestPlan(v, []string{"02:00:00:00:00:0a"})
+	p.ownNetwork = "home"
+	o := qWifiOpsFor(v, p)
+	qApplyOps(t, &v, append(append(append(o.network, o.dhcp...), o.firewall...), o.wireless...))
+	if strings.Join(v.dhcp["main"].Options["interface"], ",") != "home,"+qNet || strings.Join(v.dhcp["guestdns"].Options["interface"], ",") != "guests" {
+		t.Fatalf("instances: main %v, guest %v", v.dhcp["main"].Options["interface"], v.dhcp["guestdns"].Options["interface"])
+	}
+	if v.dhcp[qNet].Option("instance") != "main" {
+		t.Fatalf("the quarantine range is not tied to the serving instance: %+v", v.dhcp[qNet].Options)
+	}
+}
+
+func TestQuarantineZonesLeavingNoSSIDTurnTheLayerOffWithAReason(t *testing.T) {
+	f := newQFake(t)
+	f.enable(t, "internet", "home")
+	w := newQWifiFake(t, f)
+	if _, err := QuarantineWifiEnable("192.0.2.10", false); err != nil {
+		t.Fatal(err)
+	}
+	p, err := QuarantineSetZones([]string{"vpn"}, "192.0.2.10", false) // no SSID there
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Wifi.Enabled || p.Wifi.OffReason == "" {
+		t.Fatalf("probe after the zone change: %+v", p.Wifi)
+	}
+	if w.v.wireless["home2"].Option("network") != "home" {
+		t.Fatalf("SSID not restored: %+v", w.v.wireless["home2"].Options)
+	}
+	if strings.Join(qActualZones(mustShowPkg(t, "firewall")), ",") != "vpn" {
+		t.Fatalf("hooks: %v", qActualZones(mustShowPkg(t, "firewall")))
+	}
+	// Turning it on again clears the reason.
+	if _, err := QuarantineSetZones([]string{"home"}, "192.0.2.10", false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := QuarantineWifiEnable("192.0.2.10", false); err != nil {
+		t.Fatal(err)
+	}
+	if loadQState().Wifi.OffReason != "" {
+		t.Fatal("the old reason survived turning the layer on")
+	}
+}
+
+func TestQuarantineEnableAgainKeepsAWorkingWifiLayer(t *testing.T) {
+	f := newQFake(t)
+	f.enable(t, "internet", "home")
+	w := newQWifiFake(t, f)
+	if _, err := QuarantineWifiEnable("192.0.2.10", false); err != nil {
+		t.Fatal(err)
+	}
+	w.ops = nil
+	f.enable(t, "internet", "home") // a repeated request
+	if w.v.wireless["home2"].Option("network") != qNet {
+		t.Fatal("a repeated enable tore down a working Wi-Fi layer")
+	}
+}

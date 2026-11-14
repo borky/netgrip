@@ -1831,6 +1831,8 @@ export interface QWifiSSID {
 
 export interface QWifiProbe {
   enabled: boolean;
+  /** Why the layer turned itself off, when it did. */
+  off_reason?: string;
   subnet?: string;
   ssids: QWifiSSID[];
   /** Devices heard on the quarantine network lately. */

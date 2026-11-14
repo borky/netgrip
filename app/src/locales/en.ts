@@ -951,6 +951,7 @@ export default {
     wifiOffTitle: "Turn off the Wi-Fi layer?",
     wifiOffBody: "The Wi-Fi networks get their usual network back and restart once. The rest of the quarantine stays on.",
     wifiOnOk: "Wi-Fi layer on",
+    wifiTurnedOff: "The Wi-Fi layer turned itself off: {{reason}}.",
     wifiOffOk: "Wi-Fi layer off",
     via: { baseline: "From setup", manual: "Approved", pause: "During pause", panel: "This panel" },
     revoke: "Revoke",

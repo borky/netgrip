@@ -951,6 +951,7 @@ export default {
     wifiOffTitle: "¿Desactivar la capa Wi-Fi?",
     wifiOffBody: "Las redes Wi-Fi recuperan su red de siempre y se reinician una vez. El resto de la cuarentena sigue activa.",
     wifiOnOk: "Capa Wi-Fi activada",
+    wifiTurnedOff: "La capa Wi-Fi se desactivó sola: {{reason}}.",
     wifiOffOk: "Capa Wi-Fi desactivada",
     via: { baseline: "Desde la configuración", manual: "Aprobado", pause: "Durante la pausa", panel: "Este panel" },
     revoke: "Retirar",

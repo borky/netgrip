@@ -66,6 +66,8 @@ const (
 type QWifiState struct {
 	Enabled  bool   `json:"enabled"`
 	RouterIP string `json:"router_ip,omitempty"` // the quarantine network's router address
+	// OffReason says why the layer turned itself off, for the panel.
+	OffReason string `json:"off_reason,omitempty"`
 }
 
 // QWifiSSID describes one of the router's SSIDs for the panel.
@@ -82,6 +84,7 @@ type QWifiSSID struct {
 // QWifiProbe is the layer's state for the panel.
 type QWifiProbe struct {
 	Enabled     bool        `json:"enabled"`
+	OffReason   string      `json:"off_reason,omitempty"`
 	Subnet      string      `json:"subnet,omitempty"`
 	SSIDs       []QWifiSSID `json:"ssids"`
 	Quarantined int         `json:"quarantined"` // devices seen on the quarantine network lately
@@ -96,10 +99,19 @@ type qWifiView struct {
 	firewall map[string]uciSection
 }
 
+// qWirelessConfig is the Wi-Fi config file; a var so tests can point it
+// at a missing one.
+var qWirelessConfig = "/etc/config/wireless"
+
 // qWirelessShowFn reads the Wi-Fi config with `uci -X`: an unnamed
 // wifi-iface (added by LuCI) gets the real section name netifd and the
 // executor use, not an @wifi-iface[N] index.
 var qWirelessShowFn = func() (string, error) {
+	// A router without Wi-Fi has no wireless config at all: no SSIDs,
+	// not an error (or phase 1 could not be turned on or off there).
+	if _, err := os.Stat(qWirelessConfig); errors.Is(err, os.ErrNotExist) {
+		return "", nil
+	}
 	out, err := exec.Command("uci", "-X", "show", "wireless").Output()
 	if err != nil {
 		return "", err
@@ -377,6 +389,39 @@ func qDNSFor(dhcp map[string]uciSection, network string) []string {
 	return nil
 }
 
+// qDHCPInstance is the dnsmasq instance a network's dhcp section names.
+func qDHCPInstance(dhcp map[string]uciSection, network string) string {
+	for _, name := range sortedSections(dhcp, "dhcp") {
+		if dhcp[name].Option("interface") == network {
+			return dhcp[name].Option("instance")
+		}
+	}
+	return ""
+}
+
+// qDnsmasqFor is the dnsmasq section that serves a network: the instance
+// its dhcp section names, else the one whose interface list holds it,
+// else the only one there is. "" when it cannot be told.
+func qDnsmasqFor(dhcp map[string]uciSection, network string) string {
+	if inst := qDHCPInstance(dhcp, network); inst != "" {
+		if s, ok := dhcp[inst]; ok && s.Type == "dnsmasq" {
+			return inst
+		}
+	}
+	all := sortedSections(dhcp, "dnsmasq")
+	for _, name := range all {
+		for _, i := range dhcp[name].Options["interface"] {
+			if i == network {
+				return name
+			}
+		}
+	}
+	if len(all) == 1 {
+		return all[0]
+	}
+	return ""
+}
+
 // qResolverIPs are the IPv4 resolvers in DHCP option values.
 func qResolverIPs(opts []string) []string {
 	var out []string
@@ -393,13 +438,14 @@ func qResolverIPs(opts []string) []string {
 
 // qWifiPlan is what the layer should look like.
 type qWifiPlan struct {
-	enabled  bool
-	routerIP string
-	bridge   string
-	ssids    []QWifiSSID // covered ones get the layer
-	approved []string
-	uplinks  []string // uplink zone names
-	dns      []string // dhcp_option values for the quarantine network
+	enabled    bool
+	ownNetwork string // the first covered SSID's own network: DNS and dnsmasq instance come from it
+	routerIP   string
+	bridge     string
+	ssids      []QWifiSSID // covered ones get the layer
+	approved   []string
+	uplinks    []string // uplink zone names
+	dns        []string // dhcp_option values for the quarantine network
 }
 
 type qOps struct {
@@ -557,20 +603,21 @@ func qWifiOpsFor(v qWifiView, p qWifiPlan) qOps {
 		}
 	}
 
-	// A dnsmasq bound to a list of interfaces must also serve this one.
+	// A dnsmasq bound to a list of interfaces must also serve this one:
+	// the instance that serves the SSID's own network, and only that one
+	// (two instances serving one range would hand out the same address).
+	serving := qDnsmasqFor(v.dhcp, p.ownNetwork)
 	for _, name := range sortedSections(v.dhcp, "dnsmasq") {
 		ifs := v.dhcp[name].Options["interface"]
-		if len(ifs) == 0 {
-			continue
-		}
 		has := false
 		for _, i := range ifs {
 			has = has || i == qNet
 		}
 		key := "dhcp." + name + ".interface"
-		if p.enabled && !has {
+		want := p.enabled && name == serving && len(ifs) > 0
+		if want && !has {
 			o.dhcp = append(o.dhcp, executor.Op{Kind: "uci_add_list", Args: []string{key, qNet}})
-		} else if !p.enabled && has {
+		} else if !want && has {
 			o.dhcp = append(o.dhcp, executor.Op{Kind: "uci_del_list", Args: []string{key, qNet}})
 		}
 	}
@@ -597,6 +644,9 @@ func qWifiOpsFor(v qWifiView, p qWifiPlan) qOps {
 	dhcpOpts := map[string][]string{
 		"interface": {qNet}, "start": {"100"}, "limit": {"150"}, "leasetime": {"1h"},
 		"dhcpv4": {"server"}, // read when odhcpd serves DHCPv4; dnsmasq ignores it
+	}
+	if inst := qDHCPInstance(v.dhcp, p.ownNetwork); inst != "" {
+		dhcpOpts["instance"] = []string{inst}
 	}
 	if len(p.dns) > 0 {
 		dhcpOpts["dhcp_option"] = p.dns
@@ -821,6 +871,7 @@ func qWifiPlanLocked(st *qState, r qRouter, v qWifiView) (qWifiPlan, error) {
 	}
 	for _, s := range p.ssids {
 		if s.Covered {
+			p.ownNetwork = s.Network
 			p.dns = qDNSFor(v.dhcp, s.Network)
 			break
 		}
@@ -881,7 +932,8 @@ func qWifiApplyLocked(v qWifiView, p qWifiPlan) error {
 	// stations whose entry changed must reconnect, once hostapd has
 	// re-read its station files (wifi reload returns before that).
 	if len(o.moved) > 0 {
-		time.Sleep(qKickDelay)
+		type kick struct{ ifname, mac string }
+		var kicks []kick
 		bss := qBSSFn()
 		for section, macs := range o.moved {
 			if anyRadio(o.radios, v.wireless[section]) {
@@ -897,10 +949,16 @@ func qWifiApplyLocked(v qWifiView, p qWifiPlan) error {
 			}
 			for _, m := range macs {
 				if connected[m] {
-					if err := qKickFn(b.Ifname, m); err != nil {
-						log.Printf("netgrip: quarantine: reconnecting %s: %v", m, err)
-					}
+					kicks = append(kicks, kick{b.Ifname, m})
 				}
+			}
+		}
+		if len(kicks) > 0 {
+			time.Sleep(qKickDelay)
+		}
+		for _, k := range kicks {
+			if err := qKickFn(k.ifname, k.mac); err != nil {
+				log.Printf("netgrip: quarantine: reconnecting %s: %v", k.mac, err)
 			}
 		}
 	}
@@ -1011,6 +1069,7 @@ func QuarantineWifiEnable(requesterIP string, allowUnknown bool) (QuarantineProb
 	}
 	prev := st.Wifi
 	st.Wifi.Enabled = true
+	st.Wifi.OffReason = ""
 	p, err := qWifiPlanLocked(st, r, v)
 	if err != nil {
 		return probeQuarantineLocked(), err
@@ -1109,6 +1168,7 @@ func qWifiSyncLocked(st *qState, r qRouter, now time.Time) (QWifiProbe, error) {
 			return wp, err
 		}
 		st.Wifi.Enabled = false
+		st.Wifi.OffReason = "no Wi-Fi network was on the quarantine network any more (the change was not confirmed in time, was undone by hand, or the networks no longer qualify)"
 		if err := saveQState(st); err != nil {
 			return wp, err
 		}
@@ -1167,12 +1227,33 @@ func qWifiFollowZonesLocked(st *qState) error {
 	if err != nil {
 		return err
 	}
+	covered := false
+	for _, s := range p.ssids {
+		covered = covered || s.Covered
+	}
+	if !covered {
+		// The new zones leave the layer nothing to hold: off now, with
+		// the reason, rather than on the next poll without one.
+		if err := qWifiApplyLocked(v, qWifiPlan{}); err != nil {
+			return err
+		}
+		st.Wifi.Enabled = false
+		st.Wifi.OffReason = "no Wi-Fi network of this router is in a protected zone any more"
+		fw, err := uciShowFn("firewall")
+		if err != nil {
+			return err
+		}
+		return applyQIncludes(qIncludeOps(qIncludeSections(fw), qHookZones(st)))
+	}
 	return qWifiApplyLocked(v, p)
 }
 
 // qWifiProbeLocked describes the layer without changing anything.
 func qWifiProbeLocked(st *qState, r qRouter) QWifiProbe {
 	wp := QWifiProbe{Enabled: st.Wifi.Enabled, SSIDs: []QWifiSSID{}, Issues: []string{}}
+	if !st.Wifi.Enabled {
+		wp.OffReason = st.Wifi.OffReason
+	}
 	v, err := readQWifiView()
 	if err != nil {
 		wp.Issues = append(wp.Issues, err.Error())

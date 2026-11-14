@@ -272,6 +272,7 @@ function WifiLayerCard({ probe, busy, onToggle }: { probe: QuarantineProbe; busy
       action={w.enabled ? <Pill tone="ok" live>{t("quarantine.wifiOn")}</Pill> : <Pill>{t("quarantine.wifiOff")}</Pill>}>
       <div className="space-y-3">
         <p className="text-small text-muted">{t("quarantine.wifiHelp")}</p>
+        {!w.enabled && w.off_reason && <Banner tone="warn">{t("quarantine.wifiTurnedOff", { reason: w.off_reason })}</Banner>}
         {w.issues.map((i) => <Banner key={i} tone="warn">{i}</Banner>)}
         {w.enabled && (
           <div className="flex flex-wrap gap-x-4 gap-y-1 text-small">
