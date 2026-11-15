@@ -156,3 +156,44 @@ func TestDetectUnifiNeverMovesAutomatically(t *testing.T) {
 		t.Fatalf("messages: %q", f.messages())
 	}
 }
+
+// The report comes from the last save, not from parsing the state on each
+// push; with nothing saved yet it is read once from the state on disk, and
+// an ended pause is not reported.
+func TestQuarantineReportSnapshot(t *testing.T) {
+	newQDetectFake(t, false)
+	// A report from another state file (an earlier start) is not used.
+	qReportSnap.Store(&qReport{info: &probe.QuarantineInfo{Enabled: true}, path: "/elsewhere"})
+	if info := quarantineReportInfo(); info == nil || len(info.Devices) != 1 {
+		t.Fatalf("not read from this state: %+v", info)
+	}
+	if r := qReportSnap.Load(); r == nil || r.path != qStatePath {
+		t.Fatal("the report read from disk was not kept")
+	}
+
+	// Once published, a push does not parse the state: changing only the
+	// cached JSON (as no real save does) is not seen.
+	qCacheMu.Lock()
+	qCacheRaw = []byte(`{"enabled":false}`)
+	qCacheMu.Unlock()
+	if info := quarantineReportInfo(); info == nil || !info.Enabled {
+		t.Fatalf("the state was parsed again: %+v", info)
+	}
+
+	// A save publishes the new state; an ended pause is dropped by the
+	// reader without changing the published report.
+	qMu.Lock()
+	st := loadQState()
+	st.Enabled = true
+	st.Pause = QPause{Until: time.Now().Add(-time.Minute).Unix(), Kind: "off"}
+	if err := saveQState(st); err != nil {
+		t.Fatal(err)
+	}
+	qMu.Unlock()
+	if info := quarantineReportInfo(); info == nil || info.PauseKind != "" || info.PauseUntil != 0 {
+		t.Fatalf("an ended pause was reported: %+v", info)
+	}
+	if r := qReportSnap.Load(); r.info.PauseKind != "off" {
+		t.Fatal("the published report was changed")
+	}
+}

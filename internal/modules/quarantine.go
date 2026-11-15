@@ -249,6 +249,7 @@ func saveQState(st *qState) error {
 	}
 	qCacheRaw, qCachePath, qDirty, qLastFlush = raw, qStatePath, false, time.Now()
 	qRadiusRefresh(st)
+	qReportRefresh(st)
 	return nil
 }
 
@@ -262,6 +263,7 @@ func saveQStateLazy(st *qState) {
 	qCacheRaw, qCachePath, qDirty = raw, qStatePath, true
 	qCacheMu.Unlock()
 	qRadiusRefresh(st)
+	qReportRefresh(st)
 }
 
 // flushQState writes lazily saved state once qFlushEvery has passed since

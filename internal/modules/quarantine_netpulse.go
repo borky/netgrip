@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gnacho/netpulse/agent/probe"
@@ -131,11 +132,53 @@ func qPlainCode(s string, max int, model bool) string {
 	return b.String()
 }
 
+// qReport is the report built from one saved state (see qReportRefresh).
+type qReport struct {
+	info *probe.QuarantineInfo // nil: the quarantine was never set up
+	path string                // the state file it was built from
+}
+
+// qReportSnap is the latest report: rebuilt from the state in memory each
+// time it is saved, so a push only reads a pointer instead of parsing the
+// state file.
+var qReportSnap atomic.Pointer[qReport]
+
+// qReportRefresh publishes the report for the state just saved (under qMu).
+func qReportRefresh(st *qState) {
+	qReportSnap.Store(&qReport{info: qReportFrom(st), path: qStatePath})
+}
+
 // quarantineReportInfo is the state the agent sends with each full push.
-// It reads the saved state's copy in memory, never waiting for the
-// quarantine's lock. nil when the quarantine was never set up.
+// It never waits for the quarantine's lock and, once the state has been
+// saved or read since the start, never parses it. nil when the quarantine
+// was never set up.
 func quarantineReportInfo() *probe.QuarantineInfo {
-	st := loadQState()
+	r := qReportSnap.Load()
+	if r == nil || r.path != qStatePath {
+		// Nothing saved since the start: build it once from the state on
+		// disk, unless a save published a newer one meanwhile.
+		fresh := &qReport{info: qReportFrom(loadQState()), path: qStatePath}
+		if !qReportSnap.CompareAndSwap(r, fresh) {
+			if r = qReportSnap.Load(); r == nil || r.path != qStatePath {
+				r = fresh
+			}
+		} else {
+			r = fresh
+		}
+	}
+	if r.info == nil || r.info.PauseUntil == 0 || r.info.PauseUntil > time.Now().Unix() {
+		return r.info
+	}
+	// The pause ended since the last save: not reported. A copy, so the
+	// published report stays as it was built.
+	out := *r.info
+	out.PauseUntil, out.PauseKind = 0, ""
+	return &out
+}
+
+// qReportFrom builds the report from a state. Pure apart from reading the
+// state; the pause is kept with its end, and the reader drops it once over.
+func qReportFrom(st *qState) *probe.QuarantineInfo {
 	if !st.Enabled {
 		if len(st.Approved) == 0 && len(st.Pending) == 0 {
 			return nil // never used: nothing to report, nothing to clear
@@ -143,7 +186,7 @@ func quarantineReportInfo() *probe.QuarantineInfo {
 		return &probe.QuarantineInfo{Enabled: false}
 	}
 	info := &probe.QuarantineInfo{Enabled: true, Devices: make([]probe.QuarantineDevice, 0, len(st.Approved)+len(st.Pending))}
-	if st.Pause.active(time.Now()) {
+	if st.Pause.Until > 0 && (st.Pause.Kind == "off" || st.Pause.Kind == "learn") {
 		info.PauseUntil, info.PauseKind = st.Pause.Until, st.Pause.Kind
 	}
 	report := map[string]string{}
