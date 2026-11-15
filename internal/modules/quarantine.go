@@ -117,6 +117,13 @@ type QPause struct {
 
 func (p QPause) active(now time.Time) bool { return p.Until > now.Unix() }
 
+// QPair is one side of a recorded Wi-Fi 7 pair.
+type QPair struct {
+	Partner string `json:"partner"`
+	// Seen: when either address was last approved or waiting.
+	Seen int64 `json:"seen"`
+}
+
 type qState struct {
 	Enabled  bool                 `json:"enabled"`
 	Mode     string               `json:"mode"`
@@ -127,6 +134,11 @@ type qState struct {
 	// Notified remembers when each MAC was announced, so forgetting a
 	// pending entry or pruning it does not announce it again.
 	Notified map[string]int64 `json:"notified,omitempty"`
+	// Pairs: the two addresses of one Wi-Fi 7 device, both ways, recorded
+	// once both were approved. When both wait again (after a revoke) they
+	// show as one device however far apart they started waiting. Kept
+	// while either is approved or waiting, then for qNotifiedTTL.
+	Pairs map[string]QPair `json:"pairs,omitempty"`
 	// Wifi is the Wi-Fi layer (phase 2).
 	Wifi QWifiState `json:"wifi"`
 	// Radius is the UniFi layer (phase 3).
@@ -170,6 +182,9 @@ func loadQState() *qState {
 	}
 	if st.Notified == nil {
 		st.Notified = map[string]int64{}
+	}
+	if st.Pairs == nil {
+		st.Pairs = map[string]QPair{}
 	}
 	if st.Mode != "nothing" {
 		st.Mode = "internet"
@@ -746,8 +761,9 @@ type QDevice struct {
 // point asks about both while the device joins).
 const qTwinWindow = 10 * time.Second
 
-// qMarkTwins sets Twin on waiting devices that pair up mutually.
-func qMarkTwins(pending []QDevice) {
+// qMarkTwins sets Twin on waiting devices that pair up mutually: seen
+// together, or recorded as a pair when both were approved.
+func qMarkTwins(pending []QDevice, known map[string]string) {
 	set := map[string]bool{}
 	idx := map[string]int{}
 	for i, d := range pending {
@@ -772,7 +788,8 @@ func qMarkTwins(pending []QDevice) {
 		if gap < 0 {
 			gap = -gap
 		}
-		if d.FirstSeen == 0 || o.FirstSeen == 0 || gap > int64(qTwinWindow/time.Second) {
+		together := d.FirstSeen != 0 && o.FirstSeen != 0 && gap <= int64(qTwinWindow/time.Second)
+		if !together && known[d.MAC] != t {
 			continue
 		}
 		pending[i].Twin = t
@@ -902,7 +919,7 @@ func probeQuarantineLocked() QuarantineProbe {
 		}
 		return p.Pending[i].MAC < p.Pending[j].MAC // stable between refreshes
 	})
-	qMarkTwins(p.Pending)
+	qMarkTwins(p.Pending, qPairsOf(st))
 	if st.Enabled {
 		if !p.Active {
 			p.Issues = append(p.Issues, "enabled, but the firewall is not running the quarantine rules")
@@ -1484,8 +1501,35 @@ func QuarantineApprove(items []QApproveItem) (QuarantineProbe, error) {
 		st.Approved[mac] = a
 		delete(st.Pending, mac)
 	}
+	for _, it := range items {
+		qRecordPair(st, strings.ToLower(strings.TrimSpace(it.MAC)))
+	}
 	err := qChangeLocked(st)
 	return probeQuarantineLocked(), err
+}
+
+// qRecordPair remembers mac and its approved Wi-Fi 7 partner (private,
+// one apart in the last byte, the only such approved address) as a pair.
+func qRecordPair(st *qState, mac string) {
+	if !qLocalMAC(mac) {
+		return
+	}
+	approved := qApprovedSet(st)
+	p := qMLOPartner(mac, approved)
+	if p == "" || !qLocalMAC(p) || qMLOPartner(p, approved) != mac {
+		return
+	}
+	now := time.Now().Unix()
+	st.Pairs[mac], st.Pairs[p] = QPair{Partner: p, Seen: now}, QPair{Partner: mac, Seen: now}
+}
+
+// qPairsOf is the partner map the twin check uses.
+func qPairsOf(st *qState) map[string]string {
+	out := map[string]string{}
+	for m, p := range st.Pairs {
+		out[m] = p.Partner
+	}
+	return out
 }
 
 // QuarantineRevoke withdraws trust. Refused for the panel user's own
@@ -1925,6 +1969,7 @@ func qRecordSeenFrom(st *qState, seen []qElem, now time.Time, dataPlane, mayLear
 		if _, told := st.Notified[mac]; dataPlane && !waiting && !told && !excluded[mac] {
 			if x := qMLOFromRadius(mac, now, st); x != "" {
 				st.Approved[mac] = QApproved{At: now.Unix(), Via: "mlo", Name: st.Approved[x].Name}
+				qRecordPair(st, mac)
 				urgent = true
 				paired = append(paired, mac+" ("+firstNonEmpty(st.Approved[x].Name, x)+")")
 				continue
@@ -2016,6 +2061,27 @@ func qPrunePending(st *qState, now time.Time) bool {
 	for mac, at := range st.Notified {
 		if now.Unix()-at > int64(qNotifiedTTL/time.Second) {
 			delete(st.Notified, mac)
+			changed = true
+		}
+	}
+	present := func(m string) bool {
+		_, a := st.Approved[m]
+		_, p := st.Pending[m]
+		return a || p
+	}
+	for a, rec := range st.Pairs {
+		switch {
+		case st.Pairs[rec.Partner].Partner != a:
+			delete(st.Pairs, a) // half a pair
+			changed = true
+		case present(a) || present(rec.Partner):
+			if now.Unix()-rec.Seen > 3600 { // refreshed hourly, not on every poll
+				rec.Seen = now.Unix()
+				st.Pairs[a] = rec
+				changed = true
+			}
+		case now.Unix()-rec.Seen > int64(qNotifiedTTL/time.Second):
+			delete(st.Pairs, a)
 			changed = true
 		}
 	}
