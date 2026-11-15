@@ -1791,6 +1791,8 @@ export interface QDevice {
   via?: "baseline" | "manual" | "pause" | "panel" | "mlo";
   /** An approved MAC one apart in the last octet: probably the same Wi-Fi 7 device. */
   pair_of?: string;
+  /** Another waiting address of the same device (Wi-Fi 7), seen together. */
+  twin?: string;
 }
 
 export interface QPause {

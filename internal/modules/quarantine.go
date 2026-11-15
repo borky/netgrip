@@ -735,6 +735,54 @@ type QDevice struct {
 	At        int64  `json:"at,omitempty"`
 	Via       string `json:"via,omitempty"`
 	PairOf    string `json:"pair_of,omitempty"`
+	// Twin: another waiting MAC that differs from this one only by one in
+	// the last octet and was first seen within qTwinWindow of it: probably
+	// the same Wi-Fi 7 device's other address. Set on both, only when
+	// unambiguous; the panel shows them as one device.
+	Twin string `json:"twin,omitempty"`
+}
+
+// qTwinWindow: two addresses of one device show up together (the access
+// point asks about both while the device joins).
+const qTwinWindow = 10 * time.Second
+
+// qMarkTwins sets Twin on waiting devices that pair up mutually.
+func qMarkTwins(pending []QDevice) {
+	set := map[string]bool{}
+	idx := map[string]int{}
+	for i, d := range pending {
+		set[d.MAC] = true
+		idx[d.MAC] = i
+	}
+	for i, d := range pending {
+		// Only private (locally administered) addresses: factory MACs one
+		// apart are as likely two devices from one box set up together.
+		if !qLocalMAC(d.MAC) {
+			continue
+		}
+		t := qMLOPartner(d.MAC, set)
+		if !qLocalMAC(t) {
+			continue
+		}
+		if t == "" || qMLOPartner(t, set) != d.MAC {
+			continue
+		}
+		o := pending[idx[t]]
+		gap := d.FirstSeen - o.FirstSeen
+		if gap < 0 {
+			gap = -gap
+		}
+		if d.FirstSeen == 0 || o.FirstSeen == 0 || gap > int64(qTwinWindow/time.Second) {
+			continue
+		}
+		pending[i].Twin = t
+	}
+}
+
+// qLocalMAC reports a locally administered (randomized) address.
+func qLocalMAC(mac string) bool {
+	hw, err := net.ParseMAC(mac)
+	return err == nil && len(hw) == 6 && hw[0]&0x02 != 0
 }
 
 // QuarantineProbe is the API view. Enabled is the intent; Active and the
@@ -848,7 +896,13 @@ func probeQuarantineLocked() QuarantineProbe {
 		p.Pending = append(p.Pending, d)
 	}
 	sort.Slice(p.Approved, func(i, j int) bool { return p.Approved[i].MAC < p.Approved[j].MAC })
-	sort.Slice(p.Pending, func(i, j int) bool { return p.Pending[i].LastSeen > p.Pending[j].LastSeen })
+	sort.Slice(p.Pending, func(i, j int) bool {
+		if p.Pending[i].LastSeen != p.Pending[j].LastSeen {
+			return p.Pending[i].LastSeen > p.Pending[j].LastSeen
+		}
+		return p.Pending[i].MAC < p.Pending[j].MAC // stable between refreshes
+	})
+	qMarkTwins(p.Pending)
 	if st.Enabled {
 		if !p.Active {
 			p.Issues = append(p.Issues, "enabled, but the firewall is not running the quarantine rules")
