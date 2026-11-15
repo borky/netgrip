@@ -83,6 +83,8 @@ const (
 	qSigPlaces   = "places"   // active on several networks at once
 	qSigRadio    = "radio"    // Wi-Fi capabilities (router SSIDs)
 	qSigRoam     = "roam"     // alternating between two access points
+	qSigURadio   = "uradio"   // Wi-Fi in use on a UniFi access point (via NetPulse)
+	qSigMedium   = "medium"   // wired or Wi-Fi, as UniFi sees it (via NetPulse)
 	qLeasedMark  = "leased"   // profile only: the device has used DHCP
 )
 
@@ -152,7 +154,7 @@ type QDetectProbe struct {
 	Profiles   int           `json:"profiles"`
 	Suspects   []QSuspectRow `json:"suspects"`
 	// Sources: what this router can see ("fingerprints", "leases",
-	// "neighbours", "stations", "radius").
+	// "neighbours", "stations", "radius", "unifi").
 	Sources []string `json:"sources"`
 }
 
@@ -176,8 +178,11 @@ type qObs struct {
 	uptimeOK bool
 	radio    map[string]string // mac -> "band:flags"
 	radioOK  bool
-	roam     map[string][]qRoamHit
-	sources  []string
+	// unifi: what NetPulse's UniFi controller says, per MAC (when its
+	// last answer is recent).
+	unifi   map[string]qUnifiObs
+	roam    map[string][]qRoamHit
+	sources []string
 }
 
 type qFP struct {
@@ -517,6 +522,10 @@ func qObserve(now time.Time) qObs {
 		o.roam = qRoamSnapshot(now)
 		o.sources = append(o.sources, "radius")
 	}
+	if u, ok := qStationsSnapshot(now); ok {
+		o.unifi = u
+		o.sources = append(o.sources, "unifi")
+	}
 	return o
 }
 
@@ -577,16 +586,33 @@ func qObserved(mac string, p *QProfile, o qObs) map[string][]string {
 	if v := qRoamFlipping(o.roam[mac]); v != "" {
 		add(qSigRoam, v)
 	}
+	if u, ok := o.unifi[mac]; ok {
+		add(qSigMedium, u.medium)
+		add(qSigURadio, u.radio)
+	}
 	return out
 }
 
+// qBanded: kinds whose values are compared per context, the part before
+// the first ':' (the band, or the access point model and band): a context
+// never seen before is learned, not reported, and keeps more history.
+func qBanded(kind string) bool { return kind == qSigRadio || kind == qSigURadio }
+
+func qContext(v string) string { return strings.SplitN(v, ":", 2)[0] }
+
+// qBandedMax bounds a per-context kind's values over all its contexts
+// (qProfileHistory per context).
+const qBandedMax = 32
+
 func qKnown(p *QProfile, kind, v string) bool {
-	if kind == qSigRadio {
-		// Capabilities are compared per band (VHT only exists on 5 GHz).
-		band := strings.SplitN(v, ":", 2)[0]
+	if qBanded(kind) {
+		// Capabilities are compared per band (VHT only exists on 5 GHz),
+		// and on UniFi per access point model too (an older one offers
+		// an older standard).
+		band := qContext(v)
 		seen := false
 		for _, x := range p.Values[kind] {
-			if strings.SplitN(x, ":", 2)[0] == band {
+			if qContext(x) == band {
 				seen = true
 				if x == v {
 					return true
@@ -604,10 +630,26 @@ func qKnown(p *QProfile, kind, v string) bool {
 }
 
 func qLearnValue(p *QProfile, kind, v string) bool {
-	if qKnown(p, kind, v) && (kind != qSigRadio || qHas(p.Values[kind], v)) {
+	if qKnown(p, kind, v) && (!qBanded(kind) || qHas(p.Values[kind], v)) {
 		return false
 	}
 	list := []string{v}
+	if qBanded(kind) {
+		// qProfileHistory per context, so a context seen often does not
+		// push out the others.
+		per := map[string]int{qContext(v): 1}
+		for _, x := range p.Values[kind] {
+			if x != v && per[qContext(x)] < qProfileHistory && len(list) < qBandedMax {
+				per[qContext(x)]++
+				list = append(list, x)
+			}
+		}
+		if p.Values == nil {
+			p.Values = map[string][]string{}
+		}
+		p.Values[kind] = list
+		return true
+	}
 	for _, x := range p.Values[kind] {
 		if x != v && len(list) < qProfileHistory {
 			list = append(list, x)
@@ -630,12 +672,32 @@ func qHas(list []string, v string) bool {
 }
 
 // qSource groups kinds that come from one observation: the DHCP
-// fingerprint and vendor class are one request (an OS update changes both).
+// fingerprint and vendor class are one request (an OS update changes both),
+// and what NetPulse relays from UniFi is one source however many things it
+// says (it must not make an alert, or the automatic move, on its own).
 func qSource(kind string) string {
-	if kind == qSigVendor {
+	switch kind {
+	case qSigVendor:
 		return qSigDHCP
+	case qSigMedium:
+		return qSigURadio
 	}
 	return kind
+}
+
+// qOwnSignals: the signals this router saw itself, without what NetPulse
+// relays from UniFi. Only these count towards the automatic move: UniFi's
+// view changes with the same association events as the access points'
+// RADIUS requests ("roam"), so one physical event could look like two
+// sources.
+func qOwnSignals(sigs []QSignal) []QSignal {
+	var out []QSignal
+	for _, s := range sigs {
+		if qSource(s.Kind) != qSigURadio {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // qActive: the signals that count (not dismissed).
@@ -823,7 +885,7 @@ func qDetectLocked(st *qState, now time.Time) (urgent, routine bool) {
 					continue
 				}
 				if qKnown(p, kind, v) {
-					if kind == qSigRadio && !qHas(p.Values[kind], v) && qLearnValue(p, kind, v) {
+					if qBanded(kind) && !qHas(p.Values[kind], v) && qLearnValue(p, kind, v) {
 						routine = true // a new band
 					}
 					continue
@@ -928,6 +990,8 @@ func qDetectLocked(st *qState, now time.Time) (urgent, routine bool) {
 				m.skipped = why
 			case qKinds(s.Signals) < 2:
 				m.skipped = "one kind of evidence is not enough to move a device automatically (an update can change it)"
+			case qKinds(qOwnSignals(s.Signals)) < 2:
+				m.skipped = "evidence relayed from UniFi does not move a device automatically"
 			default:
 				delete(st.Approved, mac)
 				delete(st.Notified, mac)
@@ -987,7 +1051,7 @@ func qProtected(st *qState) func(mac string) string {
 func qWas(p *QProfile, kind, v string) []string {
 	var out []string
 	for _, x := range p.Values[kind] {
-		if kind == qSigRadio && strings.SplitN(x, ":", 2)[0] != strings.SplitN(v, ":", 2)[0] {
+		if qBanded(kind) && qContext(x) != qContext(v) {
 			continue
 		}
 		out = append(out, x)
@@ -1011,6 +1075,8 @@ var qSignalText = map[string]string{
 	qSigPlaces:   "active on several networks at once",
 	qSigRadio:    "Wi-Fi capabilities",
 	qSigRoam:     "alternating between access points",
+	qSigURadio:   "Wi-Fi on UniFi",
+	qSigMedium:   "connection on UniFi",
 }
 
 func qSignalLine(s QSignal) string {

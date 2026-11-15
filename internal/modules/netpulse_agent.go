@@ -549,8 +549,13 @@ func applyNetPulseAgent(p netpulsePaths) {
 		// the access points' backup (the runtime sends it only to a pinned
 		// HTTPS server).
 		QuarantineRadius: quarantineRadiusBackupInfo,
-		OnUpgrade:        netPulseUpgradeTrigger,
-		OnConfigBackup:   netPulseConfigBackupTrigger,
+		// Each device's quarantine state for the server's device list, and
+		// the server's UniFi view of them back for the copied-MAC
+		// detection (both only with a pinned HTTPS server).
+		Quarantine:           quarantineReportInfo,
+		OnQuarantineStations: QuarantineNoteStations,
+		OnUpgrade:            netPulseUpgradeTrigger,
+		OnConfigBackup:       netPulseConfigBackupTrigger,
 	}
 
 	ctx, cancel := context.WithCancel(base)

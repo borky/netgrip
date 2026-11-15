@@ -970,6 +970,8 @@ export default {
       places: "Activo en varias redes a la vez",
       radio: "Capacidades Wi-Fi",
       roam: "Alterna entre puntos de acceso",
+      uradio: "Wi-Fi en UniFi",
+      medium: "Conexión en UniFi (cable o Wi-Fi)",
     },
     source2: {
       fingerprints: "huellas DHCP",
@@ -977,6 +979,7 @@ export default {
       neighbours: "direcciones activas",
       stations: "el Wi-Fi de este router",
       radius: "peticiones de los puntos de acceso",
+      unifi: "UniFi a través de NetPulse",
     },
     approvedTitle: "Dispositivos aprobados ({{count}})",
     you: "Este dispositivo",
