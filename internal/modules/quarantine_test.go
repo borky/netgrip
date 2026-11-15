@@ -1347,11 +1347,63 @@ func TestQMarkTwins(t *testing.T) {
 		{MAC: "00:11:22:00:00:10", FirstSeen: 1000},
 		{MAC: "00:11:22:00:00:11", FirstSeen: 1000}, // factory addresses: two devices
 	}
-	qMarkTwins(p)
-	want := map[string]string{"02:00:00:00:00:a0": "02:00:00:00:00:a1", "02:00:00:00:00:a1": "02:00:00:00:00:a0"}
+	// b0/b1 started waiting far apart but were approved together before.
+	qMarkTwins(p, map[string]string{"02:00:00:00:00:b0": "02:00:00:00:00:b1", "02:00:00:00:00:b1": "02:00:00:00:00:b0"})
+	want := map[string]string{"02:00:00:00:00:a0": "02:00:00:00:00:a1", "02:00:00:00:00:a1": "02:00:00:00:00:a0",
+		"02:00:00:00:00:b0": "02:00:00:00:00:b1", "02:00:00:00:00:b1": "02:00:00:00:00:b0"}
 	for _, d := range p {
 		if d.Twin != want[d.MAC] {
 			t.Errorf("%s twin %q, want %q", d.MAC, d.Twin, want[d.MAC])
 		}
+	}
+}
+
+// The two addresses of a Wi-Fi 7 phone, approved one after the other, then
+// revoked one after the other: when both wait again, far apart in time,
+// they still show as one device (a cleanup between revoke and the next
+// join must not lose the pair).
+func TestQuarantineRememberedPairShowsAsOneDevice(t *testing.T) {
+	newQFake(t)
+	if _, err := QuarantineEnable(QEnableRequest{Mode: "internet", Zones: []string{"home"}, Approve: []QApproveItem{{MAC: "02:00:00:00:00:20"}}}, "192.0.2.10"); err != nil {
+		t.Fatal(err)
+	}
+	a, b := "06:00:00:00:00:f8", "06:00:00:00:00:f9"
+	for _, m := range []string{a, b} {
+		if _, err := QuarantineApprove([]QApproveItem{{MAC: m}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if st := loadQState(); st.Pairs[a].Partner != b || st.Pairs[b].Partner != a {
+		t.Fatalf("pair not recorded: %+v", st.Pairs)
+	}
+	for _, m := range []string{a, b} {
+		if _, err := QuarantineRevoke(m, "192.0.2.10", false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st := loadQState()
+	now := time.Now()
+	if qPrunePending(st, now); st.Pairs[a].Partner != b {
+		t.Fatal("a cleanup between revoke and the next join dropped the pair")
+	}
+	st.Pending[a] = QPending{FirstSeen: now.Unix(), LastSeen: now.Unix()}
+	st.Pending[b] = QPending{FirstSeen: now.Unix() + 17, LastSeen: now.Unix() + 17}
+	if err := saveQState(st); err != nil {
+		t.Fatal(err)
+	}
+	twins := map[string]string{}
+	for _, d := range ProbeQuarantine().Pending {
+		twins[d.MAC] = d.Twin
+	}
+	if twins[a] != b || twins[b] != a {
+		t.Fatalf("waiting pair not grouped: %v", twins)
+	}
+	// A week with neither approved nor waiting: forgotten.
+	st = loadQState()
+	delete(st.Pending, a)
+	delete(st.Pending, b)
+	qPrunePending(st, now.Add(qNotifiedTTL+time.Hour))
+	if len(st.Pairs) != 0 {
+		t.Fatalf("stale pair kept: %+v", st.Pairs)
 	}
 }
