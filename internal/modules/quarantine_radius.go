@@ -236,7 +236,7 @@ type qRadiusView struct {
 
 var qRadiusSnap atomic.Pointer[qRadiusView]
 
-// qRadiusLearning counts learn verdicts given since the last refresh, so a
+// qRadiusLearning counts learn verdicts not yet recorded (queued), so a
 // burst cannot pass qMaxLearned before the state catches up.
 var qRadiusLearning atomic.Int64
 
@@ -277,15 +277,15 @@ func qRadiusRefresh(st *qState) {
 		v.secret = []byte(qRadiusSecretCache.plain)
 		qRadiusSecretCache.Unlock()
 	}
-	qRadiusLearning.Store(0)
 	qRadiusSnap.Store(v)
 }
 
 type qRadiusVerdict struct {
-	accept bool
-	learn  bool   // approve it (a learning pause)
-	record bool   // record it as waiting for approval
-	why    string // for the log and the panel
+	accept  bool
+	learn   bool   // approve it (a learning pause)
+	record  bool   // record it as waiting for approval
+	noLearn bool   // refused by the pause's rules: recording must not learn it
+	why     string // for the log and the panel
 }
 
 // qRadiusDecide answers for one MAC. Pure.
@@ -301,10 +301,10 @@ func qRadiusDecide(v *qRadiusView, mac string, now time.Time) qRadiusVerdict {
 		// Like the router layer: devices that were already waiting are not
 		// learned, and no more than qMaxLearned per pause.
 		if v.waiting[mac] {
-			return qRadiusVerdict{record: true, why: "was waiting before the pause"}
+			return qRadiusVerdict{record: true, noLearn: true, why: "was waiting before the pause"}
 		}
 		if v.learned+int(qRadiusLearning.Load()) >= qMaxLearned {
-			return qRadiusVerdict{record: true, why: "the pause has let in its maximum"}
+			return qRadiusVerdict{record: true, noLearn: true, why: "the pause has let in its maximum"}
 		}
 		return qRadiusVerdict{accept: true, learn: true, why: "learning pause"}
 	case v.pause.active(now) && v.pause.Kind == "off":
@@ -343,19 +343,23 @@ func qMLOPartner(mac string, approved map[string]bool) string {
 
 // QRadiusStats is the panel's health view.
 type QRadiusStats struct {
-	Listening   bool     `json:"listening"`
-	Error       string   `json:"error,omitempty"`
-	LastRequest int64    `json:"last_request,omitempty"`
-	Accepted    int64    `json:"accepted"`
-	Rejected    int64    `json:"rejected"`
-	BadAuth     int64    `json:"bad_auth"`
-	Clients     []string `json:"clients"` // access point addresses seen
-	SSIDs       []string `json:"ssids"`   // SSIDs seen in requests
+	Listening   bool   `json:"listening"`
+	Error       string `json:"error,omitempty"`
+	LastRequest int64  `json:"last_request,omitempty"`
+	Accepted    int64  `json:"accepted"`
+	Rejected    int64  `json:"rejected"`
+	BadAuth     int64  `json:"bad_auth"`
+	// Credential logins (EAP, CHAP) refused: the access point is set up for
+	// something other than MAC authentication.
+	Credential int64    `json:"credential"`
+	Clients    []string `json:"clients"` // access point addresses seen
+	SSIDs      []string `json:"ssids"`   // SSIDs seen in requests
 }
 
 type qRadiusEvent struct {
 	mac, ssid string
 	learn     bool
+	noLearn   bool
 	accepted  bool
 	at        time.Time
 }
@@ -416,10 +420,14 @@ func qRadiusHandle(b []byte, from string, now time.Time) []byte {
 	// MAC authentication only: a request carrying a credential (an EAP or
 	// CHAP login, e.g. the same profile used for WPA-Enterprise) is not
 	// this server's to answer, and accepting it would skip the check.
-	if _, n := p.attr(radAttrEAPMessage); n > 0 {
-		return buildRadiusResponse(radiusAccessReject, p, v.secret, proxy)
-	}
-	if _, n := p.attr(radAttrCHAPPassword); n > 0 {
+	_, eap := p.attr(radAttrEAPMessage)
+	_, chap := p.attr(radAttrCHAPPassword)
+	if eap > 0 || chap > 0 {
+		qRadiusMu.Lock()
+		qRadiusStats.Credential++
+		qRadiusStats.Rejected++
+		qRadiusStats.LastRequest = now.Unix()
+		qRadiusMu.Unlock()
 		return buildRadiusResponse(radiusAccessReject, p, v.secret, proxy)
 	}
 	calling, _ := p.attr(radAttrCallingStation)
@@ -473,8 +481,11 @@ func qRadiusHandle(b []byte, from string, now time.Time) []byte {
 
 	if verdict.learn || verdict.record {
 		select {
-		case qRadiusEvents <- qRadiusEvent{mac: mac, ssid: ssid, learn: verdict.learn, accepted: verdict.accept, at: now}:
+		case qRadiusEvents <- qRadiusEvent{mac: mac, ssid: ssid, learn: verdict.learn, noLearn: verdict.noLearn, accepted: verdict.accept, at: now}:
 		default: // a flood: the answers matter, the bookkeeping can drop
+			if verdict.learn {
+				qRadiusLearning.Add(-1)
+			}
 		}
 	}
 	return resp
@@ -497,7 +508,10 @@ func qRadiusRecord(e qRadiusEvent) {
 	if !st.Enabled {
 		return
 	}
-	urgent, routine := qRecordSeenFrom(st, []qElem{{Val: e.mac}}, e.at, false)
+	if e.learn {
+		defer qRadiusLearning.Add(-1) // recorded: the state counts it now
+	}
+	urgent, routine := qRecordSeenFrom(st, []qElem{{Val: e.mac}}, e.at, false, !e.noLearn)
 	if p, ok := st.Pending[e.mac]; ok {
 		if partner := qMLOPartner(e.mac, qApprovedSet(st)); partner != "" && p.PairOf != partner {
 			p.PairOf = partner

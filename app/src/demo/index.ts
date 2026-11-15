@@ -176,7 +176,7 @@ const demoQ: { state: QuarantineProbe; you: string } = {
     wan: ["eth1"], approved: [], pending: [], pause: {}, issues: [],
     radius: {
       enabled: false, zones: [], port: 1812, addresses: [],
-      stats: { listening: false, accepted: 0, rejected: 0, bad_auth: 0, clients: [], ssids: [] },
+      stats: { listening: false, accepted: 0, rejected: 0, bad_auth: 0, credential: 0, clients: [], ssids: [] },
     },
     wifi: {
       enabled: false, quarantined: 0, issues: [],
