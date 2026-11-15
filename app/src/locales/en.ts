@@ -997,6 +997,8 @@ export default {
     approvedShowing: "Showing {{shown}} of {{total}}",
     showMore: "Show more",
     revoke: "Revoke",
+    revokePair: "Also revoke {{mac}}, the other Wi-Fi 7 address of this device (access points may let it join with either)",
+    pairWith: "Wi-Fi 7 pair with {{mac}}",
     revokeTitle: "Revoke {{name}}?",
     revokeBody: "New connections from this device will be restricted. Connections already open stay up until they end.",
     revokeYouUnknown: "The router cannot tell which device you are using: if this is the one carrying your connection, you will lose access to the panel.",

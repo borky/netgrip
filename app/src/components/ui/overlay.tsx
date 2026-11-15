@@ -109,7 +109,7 @@ export function Drawer({ open, onClose, title, children }: {
 }
 
 /** ConfirmDialog §6.17: destructivas con consecuencia explicada. */
-export function ConfirmDialog({ open, onClose, onConfirm, title, consequence, confirmLabel, busy = false }: {
+export function ConfirmDialog({ open, onClose, onConfirm, title, consequence, confirmLabel, busy = false, children }: {
   open: boolean;
   onClose: () => void;
   onConfirm: () => void;
@@ -119,6 +119,8 @@ export function ConfirmDialog({ open, onClose, onConfirm, title, consequence, co
   /** verbo concreto: "Cambiar contraseña" */
   confirmLabel: string;
   busy?: boolean;
+  /** optional extra content under the consequence (an option to tick) */
+  children?: ReactNode;
 }) {
   const { t } = useTranslation();
   return (
@@ -128,6 +130,7 @@ export function ConfirmDialog({ open, onClose, onConfirm, title, consequence, co
         <div className="min-w-0">
           <h2 className="text-h2">{title}</h2>
           <p className="text-small text-muted mt-1">{consequence}</p>
+          {children}
         </div>
       </div>
       <div className="mt-5 flex justify-end gap-2">
