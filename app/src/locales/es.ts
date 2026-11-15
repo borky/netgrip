@@ -931,6 +931,7 @@ export default {
     forget: "Olvidar",
     namePlaceholder: "Nombre (opcional)",
     lastSeen: "Visto por última vez {{when}}",
+    wantsNetwork: "Red Wi-Fi: {{networks}}",
     approvedTitle: "Dispositivos aprobados ({{count}})",
     you: "Este dispositivo",
     radiusTitle: "Puntos de acceso (RADIUS)",

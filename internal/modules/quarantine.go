@@ -41,6 +41,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/gnacho/netgrip/internal/executor"
 	"github.com/gnacho/netgrip/internal/ubus"
@@ -103,6 +105,40 @@ type QPending struct {
 	// PairOf: an approved MAC this one differs from only by one in the last
 	// octet, probably the same Wi-Fi 7 device's other address.
 	PairOf string `json:"pair_of,omitempty"`
+	// Networks: the Wi-Fi networks (SSIDs) it tried to join, newest first:
+	// from an access point's RADIUS request, or the router SSID it is on.
+	Networks []string `json:"networks,omitempty"`
+}
+
+// qMaxNetworks bounds QPending.Networks.
+const qMaxNetworks = 4
+
+// qAddNetwork puts ssid first in list (moving it if present, dropping the
+// oldest past qMaxNetworks) and reports whether the list changed. The name
+// comes from the air or an access point: control characters are dropped
+// and it is cut to 64 bytes.
+func qAddNetwork(list []string, ssid string) ([]string, bool) {
+	// Control, format (bidi overrides, zero-width) and invalid characters
+	// would make the panel or a notice read differently.
+	ssid = strings.TrimSpace(strings.Map(func(r rune) rune {
+		if r == utf8.RuneError || unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+			return -1
+		}
+		return r
+	}, ssid))
+	if len(ssid) > 64 {
+		ssid = strings.ToValidUTF8(ssid[:64], "")
+	}
+	if ssid == "" || (len(list) > 0 && list[0] == ssid) {
+		return list, false
+	}
+	out := []string{ssid}
+	for _, n := range list {
+		if n != ssid && len(out) < qMaxNetworks {
+			out = append(out, n)
+		}
+	}
+	return out, true
 }
 
 // QPause is a time-limited pause. Kind "learn": still enforced, but new
@@ -755,6 +791,8 @@ type QDevice struct {
 	// the same Wi-Fi 7 device's other address. Set on both, only when
 	// unambiguous; the panel shows them as one device.
 	Twin string `json:"twin,omitempty"`
+	// Networks: see QPending.Networks.
+	Networks []string `json:"networks,omitempty"`
 }
 
 // qTwinWindow: two addresses of one device show up together (the access
@@ -910,6 +948,7 @@ func probeQuarantineLocked() QuarantineProbe {
 			d.Hostname = pe.Hostname
 		}
 		d.PairOf = pe.PairOf
+		d.Networks = append([]string(nil), pe.Networks...)
 		p.Pending = append(p.Pending, d)
 	}
 	sort.Slice(p.Approved, func(i, j int) bool { return p.Approved[i].MAC < p.Approved[j].MAC })
@@ -1772,6 +1811,9 @@ func qPoll(now time.Time) {
 
 	routine := false
 	if seenErr == nil {
+		if qNeedNetworks(st, seen, full) {
+			qTagRouterNetworks(seen, qClientSSIDsFn())
+		}
 		u, rt := qRecordSeen(st, seen, now)
 		urgent = urgent || u
 		routine = routine || rt
@@ -1927,6 +1969,29 @@ func qFullCheckLocked(st *qState, now time.Time) (r qRouter, live, ok bool) {
 // devices during a learning pause and records and announces the rest.
 // urgent: a device was approved (written at once); routine: only the
 // pending list or the announcements changed.
+// qNeedNetworks: look up which router SSID the seen devices are on. On a
+// full check while any device waits (it may move between networks), and on
+// any poll that sees a device for the first time, so its notice names the
+// network.
+func qNeedNetworks(st *qState, seen []qElem, full bool) bool {
+	if len(seen) == 0 {
+		return false
+	}
+	if full {
+		return true
+	}
+	for _, e := range seen {
+		m := strings.ToLower(e.Val)
+		_, waiting := st.Pending[m]
+		_, told := st.Notified[m]
+		_, approved := st.Approved[m] // still in the set for a while after approval
+		if !waiting && !told && !approved {
+			return true
+		}
+	}
+	return false
+}
+
 func qRecordSeen(st *qState, seen []qElem, now time.Time) (urgent, routine bool) {
 	return qRecordSeenFrom(st, seen, now, true, true)
 }
@@ -2007,11 +2072,16 @@ func qRecordSeenFrom(st *qState, seen []qElem, now time.Time, dataPlane, mayLear
 			p.Hostname = d.Hostname
 			routine = true
 		}
+		if nets, changed := qAddNetwork(p.Networks, e.Net); changed {
+			p.Networks = nets
+			routine = true
+		}
 		st.Pending[mac] = p
 		if _, done := st.Notified[mac]; !done && !quiet {
 			st.Notified[mac] = now.Unix()
 			routine = true
 			d.IP, d.Hostname = p.IP, p.Hostname
+			d.Networks = append([]string(nil), p.Networks...)
 			announce = append(announce, d)
 		}
 	}
@@ -2173,9 +2243,13 @@ func qNotifyPendingBatch(devs []QDevice, channels func() bool, notify func(strin
 		if d.IP != "" {
 			extra = " · " + d.IP
 		}
+		network := ""
+		if len(d.Networks) > 0 {
+			network = "\nNetwork: " + strings.Join(d.Networks, ", ")
+		}
 		notify("NetGrip",
-			fmt.Sprintf("🔒 <b>NetGrip</b>\nNew device quarantined: <b>%s</b>\nMAC: %s%s\nApprove it on the panel's Quarantine page.", htmlEsc(label), d.MAC, htmlEsc(extra)),
-			fmt.Sprintf("🔒 NetGrip\nNew device quarantined: %s\nMAC: %s%s\nApprove it on the panel's Quarantine page.", label, d.MAC, extra),
+			fmt.Sprintf("🔒 <b>NetGrip</b>\nNew device quarantined: <b>%s</b>\nMAC: %s%s%s\nApprove it on the panel's Quarantine page.", htmlEsc(label), d.MAC, htmlEsc(extra), htmlEsc(network)),
+			fmt.Sprintf("🔒 NetGrip\nNew device quarantined: %s\nMAC: %s%s%s\nApprove it on the panel's Quarantine page.", label, d.MAC, extra, network),
 			false)
 	}
 }

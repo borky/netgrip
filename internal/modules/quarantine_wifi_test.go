@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gnacho/netgrip/internal/executor"
 	"github.com/gnacho/netgrip/internal/ubus"
@@ -1351,4 +1352,93 @@ func TestQuarantineWifiRevocationRestartSurvivesAFailedApply(t *testing.T) {
 		t.Fatal("a revocation whose apply failed after the commit has no restart scheduled")
 	}
 	_ = w
+}
+
+func TestQAddNetwork(t *testing.T) {
+	list, changed := qAddNetwork(nil, " Home\x07 ")
+	if !changed || len(list) != 1 || list[0] != "Home" {
+		t.Fatalf("first: %q %v", list, changed)
+	}
+	if _, changed := qAddNetwork(list, "Home"); changed {
+		t.Fatal("the same network again counted as a change")
+	}
+	if _, changed := qAddNetwork(list, ""); changed {
+		t.Fatal("an unknown network changed the list")
+	}
+	for _, n := range []string{"Guest", "IoT", "Office", "Guest"} {
+		list, _ = qAddNetwork(list, n)
+	}
+	if strings.Join(list, ",") != "Guest,Office,IoT,Home" {
+		t.Fatalf("newest first, no repeats, at most %d: %q", qMaxNetworks, list)
+	}
+	list, _ = qAddNetwork(list, "Lab")
+	if len(list) != qMaxNetworks || list[0] != "Lab" || list[len(list)-1] != "IoT" {
+		t.Fatalf("the oldest must drop: %q", list)
+	}
+	if n, _ := qAddNetwork(nil, "Ho\u202eme\u200b\u0085\xff"); n[0] != "Home" {
+		t.Fatalf("bidi, zero-width, C1 and invalid bytes must go: %q", n[0])
+	}
+	if long, _ := qAddNetwork(nil, strings.Repeat("é", 40)); len(long[0]) > 64 || !utf8.ValidString(long[0]) {
+		t.Fatalf("a long name must be cut to valid UTF-8: %q", long[0])
+	}
+}
+
+func TestQuarantineRecordsTheNetworkADeviceTriedToJoin(t *testing.T) {
+	f := newQFake(t)
+	f.enable(t, "internet", "home")
+	qChannelsFn = func() bool { return true }
+	oldSSIDs := qClientSSIDsFn
+	t.Cleanup(func() { qClientSSIDsFn = oldSSIDs })
+	lookups := 0
+	qClientSSIDsFn = func() map[string]string {
+		lookups++
+		return map[string]string{"02:00:00:00:00:99": "GuestNet", "02:00:00:00:00:77": "Other"}
+	}
+	// On the router's own Wi-Fi: the SSID it is connected to, looked up on
+	// the light poll that first sees it (a full check may be 30 s away), so
+	// the notice names it.
+	now := time.Now()
+	qLastFullCheck, qForceFull = now, false
+	f.seen = []qElem{{Val: "02:00:00:00:00:99", Expires: 3000}}
+	qPoll(now)
+	if lookups != 1 {
+		t.Fatalf("a new device's first poll looked up networks %d times", lookups)
+	}
+	// Already waiting: light polls do not look it up again.
+	qPoll(now.Add(5 * time.Second))
+	if lookups != 1 {
+		t.Fatalf("a light poll looked up a known device's network (%d)", lookups)
+	}
+	if n := loadQState().Pending["02:00:00:00:00:99"].Networks; strings.Join(n, ",") != "GuestNet" {
+		t.Fatalf("router SSID not recorded: %q", n)
+	}
+	qWaitFor(t, func() bool { return f.notifiedCount() >= 1 })
+	f.mu.Lock()
+	msg := f.notified[0]
+	f.mu.Unlock()
+	if !strings.Contains(msg, "Network: GuestNet") {
+		t.Fatalf("the notice does not name the network: %q", msg)
+	}
+	// Through an access point: the SSID in its RADIUS request, newest first.
+	qRadiusRecord(qRadiusEvent{mac: "02:00:00:00:00:99", ssid: "Home", at: time.Now()})
+	qRadiusRecord(qRadiusEvent{mac: "02:00:00:00:00:98", ssid: "Home", at: time.Now()})
+	got := map[string]string{}
+	for _, d := range ProbeQuarantine().Pending {
+		got[d.MAC] = strings.Join(d.Networks, ",")
+	}
+	if got["02:00:00:00:00:99"] != "Home,GuestNet" || got["02:00:00:00:00:98"] != "Home" {
+		t.Fatalf("panel networks: %v", got)
+	}
+	// Approved without ever waiting (never announced), but still in the
+	// seen set for a while: no lookups either.
+	if _, err := QuarantineApprove([]QApproveItem{{MAC: "02:00:00:00:00:55"}}); err != nil {
+		t.Fatal(err)
+	}
+	f.seen = []qElem{{Val: "02:00:00:00:00:55", Expires: 3000}}
+	qLastFullCheck, qForceFull = time.Now(), false
+	before := lookups
+	qPoll(time.Now())
+	if lookups != before {
+		t.Fatalf("a light poll looked up an approved device's network")
+	}
 }

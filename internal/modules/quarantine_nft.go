@@ -442,6 +442,9 @@ func qSetElements(set string) ([]string, error) {
 type qElem struct {
 	Val     string
 	Expires int64
+	// Net: the Wi-Fi network (SSID) the device is on or asked to join,
+	// when known; recorded on a waiting device.
+	Net string
 }
 
 func qSetElementsTimed(set string) ([]qElem, error) {

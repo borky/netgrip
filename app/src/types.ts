@@ -1793,6 +1793,7 @@ export interface QDevice {
   pair_of?: string;
   /** Another waiting address of the same device (Wi-Fi 7), seen together. */
   twin?: string;
+  networks?: string[];
 }
 
 export interface QPause {

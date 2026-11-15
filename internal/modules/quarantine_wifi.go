@@ -27,6 +27,7 @@ package modules
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -946,6 +947,66 @@ var qBSSFn = func() map[string]ubus.WirelessInterface {
 		}
 	}
 	return out
+}
+
+// qClientSSIDsFn maps each client of the router's own Wi-Fi (lowercase
+// MAC) to the SSID it is on: one wireless status call and the hostapd
+// client lists, nothing else (it runs under qMu).
+var qClientSSIDsFn = func() map[string]string {
+	out := map[string]string{}
+	raw, err := ubus.Call("network.wireless", "status")
+	if err != nil {
+		return out
+	}
+	var radios map[string]struct {
+		Interfaces []struct {
+			Ifname string `json:"ifname"`
+			Config struct {
+				SSID string `json:"ssid"`
+			} `json:"config"`
+		} `json:"interfaces"`
+	}
+	if json.Unmarshal(raw, &radios) != nil {
+		return out
+	}
+	ssid := map[string]string{}
+	for _, r := range radios {
+		for _, i := range r.Interfaces {
+			if i.Ifname != "" && i.Config.SSID != "" {
+				ssid["hostapd."+i.Ifname] = i.Config.SSID
+			}
+		}
+	}
+	clients, err := ubus.WirelessClients()
+	if err != nil {
+		return out
+	}
+	objs := make([]string, 0, len(clients))
+	for o := range clients {
+		objs = append(objs, o)
+	}
+	sort.Strings(objs) // one answer when a MAC shows up twice
+	for _, o := range objs {
+		if ssid[o] == "" {
+			continue
+		}
+		for _, c := range clients[o] {
+			if m := strings.ToLower(c.MAC); out[m] == "" {
+				out[m] = ssid[o]
+			}
+		}
+	}
+	return out
+}
+
+// qTagRouterNetworks sets Net on each seen device connected to one of the
+// router's own SSIDs (any of them: a protected SSID or the quarantine one).
+func qTagRouterNetworks(seen []qElem, on map[string]string) {
+	for i := range seen {
+		if n := on[strings.ToLower(seen[i].Val)]; n != "" {
+			seen[i].Net = n
+		}
+	}
 }
 
 // qKickFn disconnects one station so it reconnects (and gets its VLAN).
