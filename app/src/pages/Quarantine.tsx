@@ -9,6 +9,21 @@ import { fmtDate } from "../lib/format";
 
 type Mode = "internet" | "nothing";
 
+/**
+ * The other approved address of the same Wi-Fi 7 device: private (locally
+ * administered), one apart in the last byte, and the only such address
+ * (never a guess between two). Access points may ask about either one.
+ */
+function pairPartner(d: QDevice, list: QDevice[]): QDevice | undefined {
+  const local = (m: string) => (parseInt(m.slice(0, 2), 16) & 2) !== 0;
+  if (d.mac.length !== 17 || !local(d.mac)) return undefined;
+  const head = d.mac.slice(0, 15);
+  const last = parseInt(d.mac.slice(15), 16);
+  const found = list.filter((x) => x.mac !== d.mac && x.mac.length === 17 && local(x.mac) &&
+    x.mac.slice(0, 15) === head && Math.abs(parseInt(x.mac.slice(15), 16) - last) === 1);
+  return found.length === 1 ? found[0] : undefined;
+}
+
 /** A device's best label: the name given, the DHCP host name, the vendor. */
 function useLabel() {
   const { t } = useTranslation();
@@ -34,6 +49,7 @@ export function QuarantinePage() {
   const [zonesOpen, setZonesOpen] = useState(false);
   const [confirmOff, setConfirmOff] = useState(false);
   const [revoke, setRevoke] = useState<QDevice | null>(null);
+  const [revokePair, setRevokePair] = useState(true);
   const [wifiConfirm, setWifiConfirm] = useState<"on" | "off" | null>(null);
   const [names, setNames] = useState<Record<string, string>>({});
   const [pauseMinutes, setPauseMinutes] = useState("30");
@@ -58,6 +74,12 @@ export function QuarantinePage() {
 
   // Waiting addresses the router pairs up (one Wi-Fi 7 device seen with two
   // addresses at once) show as one row; both sides must name each other.
+  const revokePartner = useMemo(() => {
+    if (!revoke || !probe) return undefined;
+    const p = pairPartner(revoke, probe.approved);
+    return p && p.mac !== you ? p : undefined;
+  }, [revoke, probe, you]);
+
   const pendingRows = useMemo(() => {
     const list = probe?.pending ?? [];
     const byMac = new Map(list.map((d) => [d.mac, d]));
@@ -233,7 +255,8 @@ export function QuarantinePage() {
             )}
           </Card>
 
-          <ApprovedCard devices={probe.approved} you={you} busy={busy} label={label} onRevoke={setRevoke} />
+          <ApprovedCard devices={probe.approved} you={you} busy={busy} label={label}
+            onRevoke={(d) => { setRevokePair(true); setRevoke(d); }} />
         </>
       )}
 
@@ -256,7 +279,23 @@ export function QuarantinePage() {
         title={t("quarantine.revokeTitle", { name: revoke ? label(revoke) : "" })}
         consequence={you ? t("quarantine.revokeBody") : `${t("quarantine.revokeBody")} ${t("quarantine.revokeYouUnknown")}`}
         confirmLabel={t("quarantine.revoke")}
-        onConfirm={async () => { if (revoke) await run(() => api.quarantineRevoke(revoke.mac, !you), t("quarantine.revokedOk")); setRevoke(null); }} />
+        onConfirm={async () => {
+          if (revoke) {
+            const partner = revokePartner && revokePair ? revokePartner : undefined;
+            await run(async () => {
+              const r = await api.quarantineRevoke(revoke.mac, !you);
+              return partner ? api.quarantineRevoke(partner.mac, !you) : r;
+            }, t("quarantine.revokedOk"));
+          }
+          setRevoke(null);
+        }}>
+        {revokePartner && (
+          <label className="mt-3 flex items-start gap-2 text-small">
+            <input type="checkbox" className="mt-0.5" checked={revokePair} onChange={(e) => setRevokePair(e.target.checked)} />
+            <span>{t("quarantine.revokePair", { mac: revokePartner.mac })}</span>
+          </label>
+        )}
+      </ConfirmDialog>
       <ConfirmDialog open={wifiConfirm !== null} onClose={() => setWifiConfirm(null)} busy={busy}
         title={wifiConfirm === "on" ? t("quarantine.wifiOnTitle") : t("quarantine.wifiOffTitle")}
         consequence={wifiConfirm === "on"
@@ -646,6 +685,10 @@ function ApprovedCard({ devices, you, busy, label, onRevoke }: {
                   </div>
                   <div className="text-small text-muted mono">{d.mac}{d.ip ? ` · ${d.ip}` : ""}</div>
                   {d.at ? <div className="text-small text-muted">{t("quarantine.approvedAt", { when: fmtDate(d.at) })}</div> : null}
+                  {(() => {
+                    const p = pairPartner(d, devices);
+                    return p ? <div className="text-small text-accent">{t("quarantine.pairWith", { mac: p.mac })}</div> : null;
+                  })()}
                 </div>
                 <Button size="sm" variant="ghost" icon={UserX} disabled={busy || d.mac === you}
                   title={d.mac === you ? t("quarantine.cannotRevokeYou") : undefined}
