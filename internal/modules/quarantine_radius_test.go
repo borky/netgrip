@@ -410,3 +410,43 @@ func TestQMLONeverForAnnouncedOrChained(t *testing.T) {
 		t.Fatal("paired outside the window")
 	}
 }
+
+// L1: the learn cap holds across a refresh while events are still queued.
+func TestRadiusLearnCapHoldsWhileQueued(t *testing.T) {
+	qRadiusReset(t)
+	qRadiusLearning.Store(0)
+	t.Cleanup(func() { qRadiusLearning.Store(0) })
+	now := time.Now()
+	v := qRadiusTestView(true)
+	v.pause = QPause{Until: now.Add(time.Minute).Unix(), Kind: "learn"}
+	v.learned = qMaxLearned - 1
+	qRadiusSnap.Store(v)
+	req := qRadiusRequest(t, 1, "02-00-00-00-00-51", "x:Home", qTestRadiusSecret, true)
+	if code := qCheckResponse(t, qRadiusHandle(req, "192.0.2.20:1", now), req, qTestRadiusSecret); code != radiusAccessAccept {
+		t.Fatal("the last learnable device was refused")
+	}
+	// A refresh before that learn is recorded must not reopen the cap.
+	v2 := qRadiusTestView(true)
+	v2.pause, v2.learned = v.pause, qMaxLearned-1
+	qRadiusSnap.Store(v2)
+	req = qRadiusRequest(t, 2, "02-00-00-00-00-52", "x:Home", qTestRadiusSecret, true)
+	if code := qCheckResponse(t, qRadiusHandle(req, "192.0.2.20:1", now), req, qTestRadiusSecret); code != radiusAccessReject {
+		t.Fatal("past the cap while a learn was still queued")
+	}
+}
+
+// L4: a device RADIUS refused as already waiting is not learned when its
+// refusal is recorded.
+func TestRadiusRefusedWaitingDeviceIsNotLearnedOnRecord(t *testing.T) {
+	f := newQFake(t)
+	f.enable(t, "internet", "home")
+	qRadiusReset(t)
+	st := loadQState()
+	st.Notified["02:00:00:00:00:61"] = 1
+	st.Pause = QPause{Until: time.Now().Add(time.Minute).Unix(), Kind: "learn"}
+	_ = saveQState(st)
+	qRadiusRecord(qRadiusEvent{mac: "02:00:00:00:00:61", noLearn: true, at: time.Now()})
+	if _, ok := loadQState().Approved["02:00:00:00:00:61"]; ok {
+		t.Fatal("a refused waiting device was learned by its own record")
+	}
+}

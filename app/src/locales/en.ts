@@ -944,6 +944,7 @@ export default {
     radiusNotListening: "Not listening",
     radiusStats: "Requests: {{accepted}} accepted, {{rejected}} refused",
     radiusBadAuth: "{{count}} requests with a wrong secret were ignored: check the secret in the access point.",
+    radiusCredential: "{{count}} requests carried a login (WPA-Enterprise or similar) and were refused: this server only does MAC authentication. Check the access point uses it for RADIUS MAC Authentication only.",
     radiusLast: "Last request {{when}}",
     radiusNoRequest: "No request received yet: finish the setup on the access point.",
     radiusSeen: "Asking: {{clients}} · Networks: {{ssids}}",

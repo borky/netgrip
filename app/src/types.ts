@@ -1826,6 +1826,8 @@ export interface QRadiusStats {
   accepted: number;
   rejected: number;
   bad_auth: number;
+  /** Credential logins (EAP, CHAP) refused: the access point is set up for something else. */
+  credential: number;
   /** Access point addresses seen. */
   clients: string[];
   /** SSIDs seen in requests. */

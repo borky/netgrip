@@ -353,6 +353,7 @@ function RadiusCard({ probe, busy, run }: { probe: QuarantineProbe; busy: boolea
           <>
             {s.error && <Banner tone="danger">{s.error}</Banner>}
             {s.bad_auth > 0 && <Banner tone="warn">{t("quarantine.radiusBadAuth", { count: s.bad_auth })}</Banner>}
+            {s.credential > 0 && <Banner tone="warn">{t("quarantine.radiusCredential", { count: s.credential })}</Banner>}
             <div className="text-small space-y-1">
               {s.last_request
                 ? <div>{t("quarantine.radiusLast", { when: fmtDate(s.last_request) })} · {t("quarantine.radiusStats", { accepted: s.accepted, rejected: s.rejected })}</div>

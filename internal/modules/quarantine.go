@@ -1826,15 +1826,15 @@ func qFullCheckLocked(st *qState, now time.Time) (r qRouter, live, ok bool) {
 // urgent: a device was approved (written at once); routine: only the
 // pending list or the announcements changed.
 func qRecordSeen(st *qState, seen []qElem, now time.Time) (urgent, routine bool) {
-	return qRecordSeenFrom(st, seen, now, true)
+	return qRecordSeenFrom(st, seen, now, true, true)
 }
 
 // qRecordSeenFrom does qRecordSeen. dataPlane: the MACs were seen in
 // traffic, so a Wi-Fi 7 data address can be paired with a RADIUS address
 // just accepted. Never for a RADIUS request itself: a join attempt one
 // apart from an accepted device must still wait for approval.
-func qRecordSeenFrom(st *qState, seen []qElem, now time.Time, dataPlane bool) (urgent, routine bool) {
-	learning := st.Pause.active(now) && st.Pause.Kind == "learn"
+func qRecordSeenFrom(st *qState, seen []qElem, now time.Time, dataPlane, mayLearn bool) (urgent, routine bool) {
+	learning := mayLearn && st.Pause.active(now) && st.Pause.Kind == "learn"
 	// During a pause "off" nothing is refused: record, but announce only
 	// once enforcement is back (the poller then sees them again).
 	quiet := st.offRemaining(now) > 0
