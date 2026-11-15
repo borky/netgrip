@@ -466,6 +466,17 @@ type qOps struct {
 	// per-device SAE passwords only when the BSS starts (the data-file
 	// reload covers WPA2 only), so those radios need a restart.
 	saeRadios map[string]bool
+	// saeChanged: the WPA3 SSIDs (sections) whose station entries change;
+	// saeAdded: those among them where devices are only added (same key,
+	// nothing removed), with the added MACs. Only an added device that is
+	// connected to that SSID right now needs the restart at once: the
+	// others get their entry at the radio's next restart, which the heal
+	// pass makes happen when one of them joins.
+	saeChanged map[string]bool
+	saeAdded   map[string][]string
+	// pskRadios: radios with station changes on a WPA2 SSID (a reload
+	// re-reads those; a radio may carry both kinds).
+	pskRadios map[string]bool
 	moved     map[string][]string
 }
 
@@ -541,7 +552,8 @@ func deleteSections(ops *[]executor.Op, cur map[string]uciSection, pkg string, m
 // plan. With the plan off, every trace is removed and every SSID gets its
 // own network back. Pure, for tests.
 func qWifiOpsFor(v qWifiView, p qWifiPlan) qOps {
-	o := qOps{radios: map[string]bool{}, stationRadios: map[string]bool{}, saeRadios: map[string]bool{}, moved: map[string][]string{}}
+	o := qOps{radios: map[string]bool{}, stationRadios: map[string]bool{}, saeRadios: map[string]bool{},
+		saeChanged: map[string]bool{}, saeAdded: map[string][]string{}, pskRadios: map[string]bool{}, moved: map[string][]string{}}
 	covered := map[string]QWifiSSID{}
 	if p.enabled {
 		for _, s := range p.ssids {
@@ -616,6 +628,9 @@ func qWifiOpsFor(v qWifiView, p qWifiPlan) qOps {
 				markRadios(o.stationRadios, s)
 				if qSAE(s.Option("encryption")) {
 					markRadios(o.saeRadios, s)
+					o.saeChanged[name] = true
+				} else {
+					markRadios(o.pskRadios, s)
 				}
 				o.moved[name] = qMACDiff(old.Options["mac"], nil)
 			}
@@ -629,6 +644,13 @@ func qWifiOpsFor(v qWifiView, p qWifiPlan) qOps {
 			markRadios(o.stationRadios, s)
 			if qSAE(s.Option("encryption")) {
 				markRadios(o.saeRadios, s)
+				o.saeChanged[name] = true
+				old, exists := v.wireless[sta]
+				if added, ok := qOnlyAdded(old, exists, name, s.Option("key"), p.approved); ok {
+					o.saeAdded[name] = added
+				}
+			} else {
+				markRadios(o.pskRadios, s)
 			}
 			o.moved[name] = qMACDiff(v.wireless[sta].Options["mac"], p.approved)
 		}
@@ -676,6 +698,7 @@ func qWifiOpsFor(v qWifiView, p qWifiPlan) qOps {
 		delete(o.radios, "")
 		delete(o.stationRadios, "")
 		delete(o.saeRadios, "")
+		delete(o.pskRadios, "")
 		return o
 	}
 
@@ -746,6 +769,7 @@ func qWifiOpsFor(v qWifiView, p qWifiPlan) qOps {
 	delete(o.radios, "")
 	delete(o.stationRadios, "")
 	delete(o.saeRadios, "")
+	delete(o.pskRadios, "")
 	return o
 }
 
@@ -791,6 +815,68 @@ func qMACDiff(a, b []string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// qOnlyAdded reports whether the wanted station entry of SSID section
+// iface differs from the current one only by added devices (same type,
+// key, VLAN and SSID, no device removed), and which. A missing entry
+// counts as empty.
+func qOnlyAdded(old uciSection, exists bool, iface, key string, approved []string) ([]string, bool) {
+	if exists {
+		if old.Type != "wifi-station" || old.Option("key") != key || old.Option("vid") != qVlanID || old.Option("iface") != iface {
+			return nil, false
+		}
+	}
+	have := map[string]bool{}
+	for _, m := range old.Options["mac"] {
+		have[strings.ToLower(m)] = true
+	}
+	want := map[string]bool{}
+	var added []string
+	for _, m := range approved {
+		m = strings.ToLower(m)
+		want[m] = true
+		if !have[m] {
+			added = append(added, m)
+		}
+	}
+	for m := range have {
+		if !want[m] {
+			return nil, false // a removed device must lose its network now
+		}
+	}
+	sort.Strings(added)
+	return added, true
+}
+
+// qSAERestartNow reports whether radio must restart for this change: a
+// WPA3 SSID on it changed other than by added devices, or an added device
+// is connected to it now (it sits on the quarantine network until then).
+func qSAERestartNow(o qOps, v qWifiView, radio string, bss map[string]ubus.WirelessInterface) bool {
+	for section := range o.saeChanged {
+		s := v.wireless[section]
+		if !anyRadio(map[string]bool{radio: true}, s) {
+			continue
+		}
+		added, onlyAdded := o.saeAdded[section]
+		if !onlyAdded {
+			return true
+		}
+		b, ok := bss[section]
+		if !ok {
+			return true // who is connected is unknown: do not guess
+		}
+		want := map[string]bool{}
+		for _, m := range added {
+			want[m] = true
+		}
+		for _, c := range b.Clients {
+			if want[strings.ToLower(c.MAC)] {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // qUplinkZones are the zone names traffic to the internet leaves through.
@@ -845,9 +931,18 @@ var qBSSFn = func() map[string]ubus.WirelessInterface {
 	}
 	for _, r := range radios {
 		for _, i := range r.Interfaces {
-			if i.RFaceName != "" {
-				out[i.RFaceName] = i
+			if i.RFaceName == "" {
+				continue
 			}
+			// One section on several radios: its clients on all of them
+			// (who is connected decides restarts and heals); the first
+			// radio's interface is kept for kicks.
+			if prev, ok := out[i.RFaceName]; ok {
+				prev.Clients = append(append([]ubus.WirelessClient(nil), prev.Clients...), i.Clients...)
+				out[i.RFaceName] = prev
+				continue
+			}
+			out[i.RFaceName] = i
 		}
 	}
 	return out
@@ -964,6 +1059,21 @@ func qWifiApplyLocked(v qWifiView, p qWifiPlan) error {
 	for r := range o.stationRadios {
 		radios[r] = true
 	}
+	// WPA3 entries take effect when the BSS restarts. Devices approved
+	// while away from these SSIDs (on another access point, say) do not
+	// cost everyone here a reconnect: their entry waits for the radio's
+	// next restart, which qWifiHealLocked asks for when one of them joins
+	// and sends traffic on the quarantine network. Decided before the ops,
+	// from who is connected now.
+	restart := map[string]bool{}
+	if len(o.saeRadios) > 0 {
+		saeBSS := qBSSFn()
+		for r := range o.saeRadios {
+			if !o.radios[r] && qSAERestartNow(o, v, r, saeBSS) {
+				restart[r] = true
+			}
+		}
+	}
 	names := make([]string, 0, len(radios))
 	for r := range radios {
 		names = append(names, r)
@@ -977,11 +1087,14 @@ func qWifiApplyLocked(v qWifiView, p qWifiPlan) error {
 		kind := "wifi_reload"
 		if o.radios[r] {
 			kind = "wifi_bounce"
-		} else if o.saeRadios[r] {
-			// WPA3 entries need the scheduled restart; a reload first would
-			// only disconnect the devices and let them rejoin where they
-			// were, a few seconds before the restart moves them.
+		} else if restart[r] {
+			// WPA3 entries need the scheduled restart (it covers the
+			// radio's WPA2 SSIDs too); a reload first would only disconnect
+			// the devices and let them rejoin where they were, a few
+			// seconds before the restart moves them.
 			continue
+		} else if !o.pskRadios[r] {
+			continue // only deferred WPA3 entries: nothing to re-read now
 		}
 		ops = append(ops, executor.Op{Kind: kind, Args: []string{r}})
 	}
@@ -1015,9 +1128,30 @@ func qWifiApplyLocked(v qWifiView, p qWifiPlan) error {
 		}
 		dhcpSnap = snap
 	}
+	// Scheduled before the ops run: a step after the wireless commit can
+	// fail (a reload, another radio), and a committed revocation must never
+	// miss its restart (the next sync sees no difference and would not ask
+	// again). The restart runs from the poller, under the same lock, at
+	// least qRestartDebounce later; a failure before the commit costs at
+	// most one needless reconnect. One restart per radio, a little after
+	// the last change, so a burst of approvals costs a single reconnect.
+	for r := range o.saeRadios {
+		if restart[r] {
+			qScheduleRestart(r, qNowFn())
+		} else if !o.radios[r] {
+			log.Printf("netgrip: quarantine: %s: no newly approved device is connected to it; their WPA3 entries take effect at its next restart (done when one of them joins)", r)
+		}
+	}
 	started := time.Now()
 	if err := applyQWifiOps(ops); err != nil {
 		return err
+	}
+	// The radios just restarted need no restart still pending for them.
+	// (qRestarted is left alone: qWaitAttached checks these strictly, and
+	// marking them settling would hide a really stuck SSID for a minute.)
+	for r := range o.radios {
+		delete(qRestartDue, r)
+		delete(qRestartFirst, r)
 	}
 	if guard {
 		qDnsmasqWaitFn(started)
@@ -1045,14 +1179,6 @@ func qWifiApplyLocked(v qWifiView, p qWifiPlan) error {
 			return fmt.Errorf("the Wi-Fi network %s is not on the quarantine network after the change (its interface is in another bridge)", qSSIDNames(bad))
 		}
 	}
-	// WPA3 entries take effect when the BSS restarts: one restart per
-	// radio, a little after the last change, so a burst of approvals
-	// costs a single reconnect of that radio's devices.
-	for r := range o.saeRadios {
-		if !o.radios[r] {
-			qScheduleRestart(r, qNowFn())
-		}
-	}
 	// A restarted SSID reconnects everyone anyway; elsewhere only the
 	// stations whose entry changed must reconnect, once hostapd has
 	// re-read its station files (wifi reload returns before that).
@@ -1061,7 +1187,9 @@ func qWifiApplyLocked(v qWifiView, p qWifiPlan) error {
 		var kicks []kick
 		bss := qBSSFn()
 		for section, macs := range o.moved {
-			if anyRadio(o.radios, v.wireless[section]) || anyRadio(o.saeRadios, v.wireless[section]) {
+			// Restarting radios reconnect everyone; a WPA3 SSID keeps the
+			// entry hostapd started with, so a kick there changes nothing.
+			if anyRadio(o.radios, v.wireless[section]) || anyRadio(restart, v.wireless[section]) || qSAE(v.wireless[section].Option("encryption")) {
 				continue
 			}
 			b, ok := bss[section]
@@ -1502,7 +1630,10 @@ var qKicked = map[string]time.Time{}
 
 // qWifiHealLocked disconnects approved stations that sit on the quarantine
 // network (a password changed before their entry followed, or hostapd did
-// not apply the VLAN), at most once per qKickEvery each.
+// not apply the VLAN), at most once per qKickEvery each. On WPA3 it is also
+// what applies entries deferred for devices approved while away: a device
+// is caught once it is a client of the SSID and has sent a frame on the
+// quarantine bridge within qFDBRecentSec (a silent one waits until it does).
 func qWifiHealLocked(st *qState, v qWifiView, p qWifiPlan, now time.Time) int {
 	if !p.enabled {
 		return 0
@@ -1525,10 +1656,13 @@ func qWifiHealLocked(st *qState, v qWifiView, p qWifiPlan, now time.Time) int {
 			if _, approved := st.Approved[m]; !approved || !onQ[m] {
 				continue
 			}
-			if now.Sub(qKicked[m]) < qKickEvery {
+			// Per SSID: a device moved on one radio may come back on
+			// another radio's copy of the SSID, which needs its own fix.
+			kk := m + "|" + s.Section
+			if now.Sub(qKicked[kk]) < qKickEvery {
 				continue
 			}
-			qKicked[m] = now
+			qKicked[kk] = now
 			if qSAE(v.wireless[s.Section].Option("encryption")) {
 				// A kick alone keeps the entry hostapd started with.
 				log.Printf("netgrip: quarantine: %s is approved but on the quarantine network; restarting its radio", m)

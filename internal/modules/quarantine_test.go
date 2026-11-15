@@ -1323,3 +1323,26 @@ func qWaitFor(t *testing.T, cond func() bool) {
 		time.Sleep(5 * time.Millisecond)
 	}
 }
+
+func TestQMarkTwins(t *testing.T) {
+	p := []QDevice{
+		{MAC: "02:00:00:00:00:a0", FirstSeen: 1000},
+		{MAC: "02:00:00:00:00:a1", FirstSeen: 1003},
+		{MAC: "02:00:00:00:00:b0", FirstSeen: 1000},
+		{MAC: "02:00:00:00:00:b1", FirstSeen: 1100}, // too far apart
+		{MAC: "02:00:00:00:00:c4", FirstSeen: 1000}, // c4 has two neighbours: ambiguous
+		{MAC: "02:00:00:00:00:c5", FirstSeen: 1000},
+		{MAC: "02:00:00:00:00:c6", FirstSeen: 1000},
+		{MAC: "02:00:00:00:00:d0"},
+		{MAC: "02:00:00:00:00:d1"}, // first-seen unknown
+		{MAC: "00:11:22:00:00:10", FirstSeen: 1000},
+		{MAC: "00:11:22:00:00:11", FirstSeen: 1000}, // factory addresses: two devices
+	}
+	qMarkTwins(p)
+	want := map[string]string{"02:00:00:00:00:a0": "02:00:00:00:00:a1", "02:00:00:00:00:a1": "02:00:00:00:00:a0"}
+	for _, d := range p {
+		if d.Twin != want[d.MAC] {
+			t.Errorf("%s twin %q, want %q", d.MAC, d.Twin, want[d.MAC])
+		}
+	}
+}

@@ -2,6 +2,7 @@ package modules
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 	"sort"
@@ -1167,4 +1168,187 @@ func TestQWifiRestartingRadioIsNotReportedStuck(t *testing.T) {
 	if p := ProbeQuarantine(); len(p.Wifi.Issues) == 0 {
 		t.Fatal("a really stuck SSID was not reported")
 	}
+}
+
+// Approving a device that is not on the router's WPA3 SSID (it joined
+// through another access point) must not restart that radio: its entry
+// waits until it joins here, then one restart moves it. Removing a device
+// still restarts at once, and so does not knowing who is connected.
+func TestQuarantineWifiWPA3ApprovalOfAnAbsentDeviceWaitsForItToJoin(t *testing.T) {
+	f := newQFake(t)
+	f.enable(t, "internet", "home")
+	w := newQWifiFake(t, f)
+	if _, err := QuarantineWifiEnable("192.0.2.10", false); err != nil {
+		t.Fatal(err)
+	}
+	oldKicked, oldBSS := qKicked, qBSSFn
+	qKicked = map[string]time.Time{}
+	t.Cleanup(func() { qKicked, qBSSFn = oldKicked, oldBSS })
+	clear := func() { delete(qRestartDue, "radio9"); delete(qRestartFirst, "radio9") }
+	clear()
+	restarts := func() int {
+		n := 0
+		for _, batch := range w.ops {
+			for _, op := range batch {
+				if (op.Kind == "wifi_bounce" || op.Kind == "wifi_reload") && op.Args[0] == "radio9" {
+					n++
+				}
+			}
+		}
+		return n
+	}
+
+	w.ops = nil
+	if _, err := QuarantineApprove([]QApproveItem{{MAC: "02:00:00:00:00:77"}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := w.v.wireless[qStaPfx+"home2"].Options["mac"]; !strings.Contains(strings.Join(got, ","), "02:00:00:00:00:77") {
+		t.Fatalf("station entries after approve: %v", got)
+	}
+	if _, due := qRestartDue["radio9"]; due || restarts() != 0 {
+		t.Fatalf("approving an absent device restarted the radio (due %v, %d restarts)", qRestartDue, restarts())
+	}
+
+	// It joins the SSID and lands on the quarantine network: one restart.
+	base := time.Now().Add(time.Hour)
+	qBSSFn = func() map[string]ubus.WirelessInterface {
+		return map[string]ubus.WirelessInterface{"home2": {Ifname: "phy9-ap0", RFaceName: "home2", Clients: []ubus.WirelessClient{
+			{MAC: "02:00:00:00:00:10"}, {MAC: "02:00:00:00:00:77"},
+		}}}
+	}
+	qQuarantineFDBFn = func(string) map[string]bool { return map[string]bool{"02:00:00:00:00:77": true} }
+	w.ops = nil
+	qPoll(base)
+	qPoll(base.Add(qRestartDebounce + time.Second))
+	if restarts() != 1 {
+		t.Fatalf("%d restarts when the approved device joined, want one", restarts())
+	}
+	qQuarantineFDBFn = func(string) map[string]bool { return map[string]bool{} }
+
+	// Revoking a device that is not connected: at once (a revoked device
+	// must never get its old network back from a stale entry).
+	clear()
+	qBSSFn = func() map[string]ubus.WirelessInterface {
+		return map[string]ubus.WirelessInterface{"home2": {Ifname: "phy9-ap0", RFaceName: "home2", Clients: []ubus.WirelessClient{{MAC: "02:00:00:00:00:10"}}}}
+	}
+	if _, err := QuarantineRevoke("02:00:00:00:00:77", "192.0.2.10", false); err != nil {
+		t.Fatal(err)
+	}
+	if _, due := qRestartDue["radio9"]; !due {
+		t.Fatal("revoking an absent device did not schedule the restart")
+	}
+
+	// Unknown clients (ubus failed): restart, never guess.
+	clear()
+	qBSSFn = func() map[string]ubus.WirelessInterface { return map[string]ubus.WirelessInterface{} }
+	if _, err := QuarantineApprove([]QApproveItem{{MAC: "02:00:00:00:00:78"}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, due := qRestartDue["radio9"]; !due {
+		t.Fatal("an approval with unknown clients did not schedule the restart")
+	}
+	clear()
+}
+
+func TestQOnlyAdded(t *testing.T) {
+	old := uciSection{Type: "wifi-station", Options: map[string][]string{
+		"key": {"k"}, "vid": {qVlanID}, "iface": {"home2"}, "mac": {"02:00:00:00:00:01"},
+	}}
+	if a, ok := qOnlyAdded(old, true, "home2", "k", []string{"02:00:00:00:00:01", "02:00:00:00:00:02"}); !ok || strings.Join(a, ",") != "02:00:00:00:00:02" {
+		t.Fatalf("addition: %v %v", a, ok)
+	}
+	if _, ok := qOnlyAdded(old, true, "home2", "k", []string{"02:00:00:00:00:02"}); ok {
+		t.Fatal("a removal counted as an addition")
+	}
+	if _, ok := qOnlyAdded(old, true, "home2", "other", []string{"02:00:00:00:00:01", "02:00:00:00:00:02"}); ok {
+		t.Fatal("a password change counted as an addition")
+	}
+	if a, ok := qOnlyAdded(uciSection{}, false, "home2", "k", []string{"02:00:00:00:00:03"}); !ok || len(a) != 1 {
+		t.Fatalf("a new entry: %v %v", a, ok)
+	}
+}
+
+// A radio carrying a WPA3 and a WPA2 SSID: approving a device connected to
+// the WPA2 one (absent from the WPA3 one) must still re-read the WPA2
+// station file and reconnect that device, without restarting the radio.
+func TestQuarantineWifiMixedRadioAppliesWPA2ApprovalWithoutRestart(t *testing.T) {
+	f := newQFake(t)
+	f.enable(t, "internet", "home")
+	w := newQWifiFake(t, f)
+	w.v.wireless["home5"].Options["device"] = []string{"radio9"}
+	if _, err := QuarantineWifiEnable("192.0.2.10", false); err != nil {
+		t.Fatal(err)
+	}
+	delete(qRestartDue, "radio9")
+	delete(qRestartFirst, "radio9")
+	t.Cleanup(func() { delete(qRestartDue, "radio9"); delete(qRestartFirst, "radio9") })
+	oldBSS, oldDelay := qBSSFn, qKickDelay
+	t.Cleanup(func() { qBSSFn, qKickDelay = oldBSS, oldDelay })
+	qKickDelay = 0
+	qBSSFn = func() map[string]ubus.WirelessInterface {
+		return map[string]ubus.WirelessInterface{
+			"home2": {Ifname: "phy9-ap0", RFaceName: "home2", Clients: []ubus.WirelessClient{{MAC: "02:00:00:00:00:10"}}},
+			"home5": {Ifname: "phy9-ap1", RFaceName: "home5", Clients: []ubus.WirelessClient{{MAC: "02:00:00:00:00:55"}}},
+		}
+	}
+	w.ops, w.kicked = nil, nil
+	if _, err := QuarantineApprove([]QApproveItem{{MAC: "02:00:00:00:00:55"}}); err != nil {
+		t.Fatal(err)
+	}
+	reloads, bounces := 0, 0
+	for _, batch := range w.ops {
+		for _, op := range batch {
+			if op.Args != nil && len(op.Args) > 0 && op.Args[0] == "radio9" {
+				switch op.Kind {
+				case "wifi_reload":
+					reloads++
+				case "wifi_bounce":
+					bounces++
+				}
+			}
+		}
+	}
+	if reloads != 1 || bounces != 0 {
+		t.Fatalf("%d reloads, %d restarts of the mixed radio: want one reload", reloads, bounces)
+	}
+	if _, due := qRestartDue["radio9"]; due {
+		t.Fatal("a restart was scheduled though no added device is on the WPA3 SSID")
+	}
+	if strings.Join(w.kicked, ",") != "phy9-ap1 02:00:00:00:00:55" {
+		t.Fatalf("kicked %v: want the device on the WPA2 SSID reconnected", w.kicked)
+	}
+}
+
+// A revocation whose apply fails after the wireless commit (a reload of
+// something else, say) must still have its WPA3 restart scheduled: the next
+// sync sees no difference and would never ask again.
+func TestQuarantineWifiRevocationRestartSurvivesAFailedApply(t *testing.T) {
+	f := newQFake(t)
+	f.enable(t, "internet", "home")
+	w := newQWifiFake(t, f)
+	if _, err := QuarantineWifiEnable("192.0.2.10", false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := QuarantineApprove([]QApproveItem{{MAC: "02:00:00:00:00:77"}}); err != nil {
+		t.Fatal(err)
+	}
+	delete(qRestartDue, "radio9")
+	delete(qRestartFirst, "radio9")
+	t.Cleanup(func() { delete(qRestartDue, "radio9"); delete(qRestartFirst, "radio9") })
+	inner := applyQWifiOps
+	applyQWifiOps = func(ops []executor.Op) error {
+		for _, op := range ops {
+			if op.Kind == "uci_commit" && op.Args[0] == "wireless" {
+				_ = inner(ops)
+				return errors.New("dummy: a later step failed")
+			}
+		}
+		return inner(ops)
+	}
+	t.Cleanup(func() { applyQWifiOps = inner })
+	_, _ = QuarantineRevoke("02:00:00:00:00:77", "192.0.2.10", false)
+	if _, due := qRestartDue["radio9"]; !due {
+		t.Fatal("a revocation whose apply failed after the commit has no restart scheduled")
+	}
+	_ = w
 }

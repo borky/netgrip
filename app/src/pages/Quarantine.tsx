@@ -56,6 +56,26 @@ export function QuarantinePage() {
     return () => clearInterval(id);
   }, [load]);
 
+  // Waiting addresses the router pairs up (one Wi-Fi 7 device seen with two
+  // addresses at once) show as one row; both sides must name each other.
+  const pendingRows = useMemo(() => {
+    const list = probe?.pending ?? [];
+    const byMac = new Map(list.map((d) => [d.mac, d]));
+    const shown = new Set<string>();
+    const rows: { d: QDevice; twin?: QDevice }[] = [];
+    for (const d of list) {
+      if (shown.has(d.mac)) continue;
+      const o = d.twin ? byMac.get(d.twin) : undefined;
+      const twin = o && o.twin === d.mac && !shown.has(o.mac) ? o : undefined;
+      shown.add(d.mac);
+      if (twin) shown.add(twin.mac);
+      // The lower address leads, so the row (and a name being typed in it)
+      // stays put when the two swap places between refreshes.
+      rows.push(twin && twin.mac < d.mac ? { d: twin, twin: d } : { d, twin });
+    }
+    return rows;
+  }, [probe]);
+
   const run = useCallback(async (fn: () => Promise<QResult>, okText?: string) => {
     setBusy(true);
     try {
@@ -176,15 +196,17 @@ export function QuarantinePage() {
               <p className="text-small text-muted">{t("quarantine.pendingEmpty")}</p>
             ) : (
               <ul className="divide-y divide-border">
-                {probe.pending.map((d) => (
+                {pendingRows.map(({ d, twin }) => (
                   <li key={d.mac} className="py-3 flex flex-wrap items-center gap-3">
                     <div className="min-w-0 flex-1">
-                      <div className="font-medium truncate">{label(d)}</div>
+                      <div className="font-medium truncate">{label(twin && !d.name && !d.hostname ? twin : d)}</div>
                       <div className="text-small text-muted mono">{d.mac}{d.ip ? ` · ${d.ip}` : ""}</div>
+                      {twin ? <div className="text-small text-muted mono">{twin.mac}{twin.ip ? ` · ${twin.ip}` : ""}</div> : null}
+                      {twin ? <div className="text-small text-accent">{t("quarantine.twinHint")}</div> : null}
                       {d.last_seen ? <div className="text-small text-muted">{t("quarantine.lastSeen", { when: fmtDate(d.last_seen) })}</div> : null}
-                      {d.pair_of ? (
+                      {d.pair_of || twin?.pair_of ? (
                         <div className="text-small text-accent">
-                          {t("quarantine.pairOf", { name: (() => { const a = probe.approved.find((x) => x.mac === d.pair_of); return a ? label(a) : d.pair_of; })() })}
+                          {t("quarantine.pairOf", { name: (() => { const pm = d.pair_of || twin?.pair_of; const a = probe.approved.find((x) => x.mac === pm); return a ? label(a) : pm; })() })}
                         </div>
                       ) : null}
                     </div>
@@ -193,11 +215,16 @@ export function QuarantinePage() {
                         onChange={(e) => setNames((n) => ({ ...n, [d.mac]: e.target.value }))} />
                     </div>
                     <Button size="sm" icon={Check} disabled={busy}
-                      onClick={() => run(() => api.quarantineApprove([{ mac: d.mac, name: names[d.mac] }]), t("quarantine.approvedOk"))}>
-                      {t("quarantine.approve")}
+                      onClick={() => run(() => api.quarantineApprove([d, ...(twin ? [twin] : [])].map((x) => ({ mac: x.mac, name: names[d.mac] }))), t("quarantine.approvedOk"))}>
+                      {twin ? t("quarantine.approveBoth") : t("quarantine.approve")}
                     </Button>
                     <Button size="sm" variant="ghost" icon={Trash2} disabled={busy} aria-label={t("quarantine.forget")}
-                      onClick={() => run(() => api.quarantineForget(d.mac))}>
+                      onClick={() => run(async () => {
+                        // Both are tried; the first failure is reported.
+                        const [a, b] = await Promise.allSettled([d, ...(twin ? [twin] : [])].map((x) => api.quarantineForget(x.mac)));
+                        for (const r of [a, b]) if (r && r.status === "rejected") throw r.reason;
+                        return b?.status === "fulfilled" ? b.value : a.status === "fulfilled" ? a.value : {};
+                      })}>
                       {t("quarantine.forget")}
                     </Button>
                   </li>
@@ -278,6 +305,7 @@ function WifiLayerCard({ probe, busy, onToggle }: { probe: QuarantineProbe; busy
       action={w.enabled ? <Pill tone="ok" live>{t("quarantine.wifiOn")}</Pill> : <Pill>{t("quarantine.wifiOff")}</Pill>}>
       <div className="space-y-3">
         <p className="text-small text-muted">{t("quarantine.wifiHelp")}</p>
+        {w.enabled && <p className="text-small text-muted">{t("quarantine.wifiJoinNote")}</p>}
         {!w.enabled && w.off_reason && <Banner tone="warn">{t("quarantine.wifiTurnedOff", { reason: w.off_reason })}</Banner>}
         {w.issues.map((i) => <Banner key={i} tone="warn">{i}</Banner>)}
         {w.enabled && (
