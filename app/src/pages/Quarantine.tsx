@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { Check, Lock, Pause, Play, Radio, ShieldCheck, ShieldOff, Trash2, UserCheck, UserX, Wifi } from "lucide-react";
+import { Check, Lock, Pause, Play, Radio, Search, ShieldCheck, ShieldOff, Trash2, UserCheck, UserX, Wifi } from "lucide-react";
 import { api } from "../api";
 import type { QCandidate, QDevice, QResult, QuarantineProbe } from "../types";
 import { Banner, Button, Card, ConfirmDialog, EmptyState, Input, Modal, Pill, SegmentedControl, SkeletonRows, useToast } from "../components/ui";
@@ -233,27 +233,7 @@ export function QuarantinePage() {
             )}
           </Card>
 
-          <Card title={t("quarantine.approvedTitle", { count: probe.approved.length })} icon={UserCheck}>
-            <ul className="divide-y divide-border">
-              {probe.approved.map((d) => (
-                <li key={d.mac} className="py-3 flex flex-wrap items-center gap-3">
-                  <div className="min-w-0 flex-1">
-                    <div className="font-medium truncate flex items-center gap-2">
-                      {label(d)}
-                      {d.mac === you && <Pill tone="accent">{t("quarantine.you")}</Pill>}
-                      {d.via && <Pill tone="muted">{t(`quarantine.via.${d.via}`)}</Pill>}
-                    </div>
-                    <div className="text-small text-muted mono">{d.mac}{d.ip ? ` · ${d.ip}` : ""}</div>
-                  </div>
-                  <Button size="sm" variant="ghost" icon={UserX} disabled={busy || d.mac === you}
-                    title={d.mac === you ? t("quarantine.cannotRevokeYou") : undefined}
-                    onClick={() => setRevoke(d)}>
-                    {t("quarantine.revoke")}
-                  </Button>
-                </li>
-              ))}
-            </ul>
-          </Card>
+          <ApprovedCard devices={probe.approved} you={you} busy={busy} label={label} onRevoke={setRevoke} />
         </>
       )}
 
@@ -566,5 +546,123 @@ function EnableWizard({ probe, you, busy, onClose, onEnable }: {
         <Banner tone="info">{t("quarantine.confirmNote")}</Banner>
       </div>
     </Modal>
+  );
+}
+
+/** Where an approval came from, grouped for the filter: "panel" (the device
+ * the panel was used from) counts as approved by you. */
+type Source = "all" | "baseline" | "manual" | "pause" | "mlo";
+const SOURCES: Source[] = ["all", "baseline", "manual", "pause", "mlo"];
+const sourceOf = (via?: string): Source =>
+  via === "baseline" || via === "pause" || via === "mlo" ? via : "manual";
+const PAGE = 25;
+
+/** Lowercase hex digits only, so "AA-BB", "aa:bb" and "aabb" all match. */
+const hexOnly = (s: string) => s.toLowerCase().replace(/[^0-9a-f]/g, "");
+
+/**
+ * The approved devices: a search over every name, address and IP, a filter
+ * by where each approval came from (with counts), two sort orders, and
+ * paging, so a long list stays easy to scan.
+ */
+function ApprovedCard({ devices, you, busy, label, onRevoke }: {
+  devices: QDevice[];
+  you: string;
+  busy: boolean;
+  label: (d: QDevice) => string;
+  onRevoke: (d: QDevice) => void;
+}) {
+  const { t } = useTranslation();
+  const [query, setQuery] = useState("");
+  const [source, setSource] = useState<Source>("all");
+  const [sort, setSort] = useState<"name" | "recent">("name");
+  const [shown, setShown] = useState(PAGE);
+
+  const counts = useMemo(() => {
+    const c: Record<Source, number> = { all: devices.length, baseline: 0, manual: 0, pause: 0, mlo: 0 };
+    for (const d of devices) c[sourceOf(d.via)]++;
+    return c;
+  }, [devices]);
+
+  const list = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    const qHex = hexOnly(q);
+    const out = devices.filter((d) => {
+      if (source !== "all" && sourceOf(d.via) !== source) return false;
+      if (!q) return true;
+      const text = [label(d), d.name, d.hostname, d.vendor, d.ip, d.mac].filter(Boolean).join(" ").toLowerCase();
+      // A MAC typed with any separators (or none) still matches.
+      return text.includes(q) || (qHex.length >= 4 && hexOnly(d.mac).includes(qHex));
+    });
+    out.sort((a, b) => {
+      if (sort === "recent" && (b.at ?? 0) !== (a.at ?? 0)) return (b.at ?? 0) - (a.at ?? 0);
+      return label(a).localeCompare(label(b)) || a.mac.localeCompare(b.mac);
+    });
+    return out;
+  }, [devices, query, source, sort, label]);
+
+  // A new search or filter starts from the top of the list.
+  useEffect(() => setShown(PAGE), [query, source, sort]);
+
+  return (
+    <Card title={t("quarantine.approvedTitle", { count: devices.length })} icon={UserCheck}>
+      <div className="space-y-3">
+        {devices.length > 0 && (
+          <>
+            <div className="flex flex-wrap items-center gap-2">
+              <div className="min-w-[12rem] flex-1">
+                <Input icon={Search} type="search" value={query} onChange={(e) => setQuery(e.target.value)}
+                  placeholder={t("quarantine.approvedSearch")} aria-label={t("quarantine.approvedSearch")} />
+              </div>
+              <SegmentedControl<"name" | "recent">
+                ariaLabel={t("quarantine.approvedSort")}
+                size="sm"
+                options={[{ value: "name", label: t("quarantine.sortName") }, { value: "recent", label: t("quarantine.sortRecent") }]}
+                value={sort}
+                onChange={setSort}
+              />
+            </div>
+            <div className="flex flex-wrap gap-2" role="group" aria-label={t("quarantine.approvedFilter")}>
+              {SOURCES.filter((s) => s === "all" || counts[s] > 0).map((s) => (
+                <Button key={s} size="sm" variant={source === s ? "primary" : "secondary"} aria-pressed={source === s}
+                  onClick={() => setSource(s)}>
+                  {t(`quarantine.source.${s}`)} ({counts[s]})
+                </Button>
+              ))}
+            </div>
+          </>
+        )}
+        {list.length === 0 ? (
+          <p className="text-small text-muted">{devices.length === 0 ? t("quarantine.approvedEmpty") : t("quarantine.approvedNoMatch")}</p>
+        ) : (
+          <ul className="divide-y divide-border">
+            {list.slice(0, shown).map((d) => (
+              <li key={d.mac} className="py-3 flex flex-wrap items-center gap-3">
+                <div className="min-w-0 flex-1">
+                  <div className="font-medium truncate flex items-center gap-2">
+                    {label(d)}
+                    {d.mac === you && <Pill tone="accent">{t("quarantine.you")}</Pill>}
+                    {d.via && <Pill tone="muted">{t(`quarantine.via.${d.via}`, { defaultValue: d.via })}</Pill>}
+                  </div>
+                  <div className="text-small text-muted mono">{d.mac}{d.ip ? ` · ${d.ip}` : ""}</div>
+                  {d.at ? <div className="text-small text-muted">{t("quarantine.approvedAt", { when: fmtDate(d.at) })}</div> : null}
+                </div>
+                <Button size="sm" variant="ghost" icon={UserX} disabled={busy || d.mac === you}
+                  title={d.mac === you ? t("quarantine.cannotRevokeYou") : undefined}
+                  onClick={() => onRevoke(d)}>
+                  {t("quarantine.revoke")}
+                </Button>
+              </li>
+            ))}
+          </ul>
+        )}
+        {list.length > shown && (
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-small text-muted">{t("quarantine.approvedShowing", { shown, total: list.length })}</span>
+            <Button size="sm" variant="secondary" onClick={() => setShown((n) => n + PAGE)}>{t("quarantine.showMore")}</Button>
+          </div>
+        )}
+      </div>
+    </Card>
   );
 }
