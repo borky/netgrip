@@ -645,6 +645,8 @@ func (s *Server) requireAuth(next http.HandlerFunc) http.HandlerFunc {
 		if legacyName {
 			s.reissueUnderCurrentName(w, c.Value)
 		}
+		// The device in use is never moved back to quarantine automatically.
+		modules.QuarantineNoteViewer(requesterIP(r))
 		next(w, r)
 	}
 }

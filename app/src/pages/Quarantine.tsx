@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { Check, Lock, Pause, Play, Radio, Search, ShieldCheck, ShieldOff, Trash2, UserCheck, UserX, Wifi } from "lucide-react";
+import { Check, Fingerprint, Lock, Pause, Play, Radio, Search, ShieldCheck, ShieldOff, Trash2, UserCheck, UserX, Wifi } from "lucide-react";
 import { api } from "../api";
-import type { QCandidate, QDevice, QResult, QuarantineProbe } from "../types";
-import { Banner, Button, Card, ConfirmDialog, EmptyState, Input, Modal, Pill, SegmentedControl, SkeletonRows, useToast } from "../components/ui";
+import type { QCandidate, QDevice, QResult, QSignal, QuarantineProbe } from "../types";
+import { Banner, Button, Card, ConfirmDialog, EmptyState, Input, Modal, Pill, SegmentedControl, SkeletonRows, Toggle, useToast } from "../components/ui";
 import { RollbackConfirmModal, useRollbackConfirm } from "../components/rollback";
 import { fmtDate } from "../lib/format";
 
@@ -207,6 +207,9 @@ export function QuarantinePage() {
             )}
           </Card>
 
+          <DetectCard probe={probe} busy={busy} run={run} label={label}
+            onRevoke={(mac) => { const d = probe.approved.find((x) => x.mac === mac); if (d) { setRevokePair(true); setRevoke(d); } }} />
+
           <Card title={t("quarantine.pendingTitle", { count: probe.pending.length })} icon={Lock}
             action={probe.pending.length > 1 && (
               <Button size="sm" variant="secondary" disabled={busy}
@@ -313,6 +316,107 @@ export function QuarantinePage() {
         }} />
       <RollbackConfirmModal pending={rc.pending} seconds={rc.seconds} onKeep={rc.keep} onRevert={rc.revert} />
     </div>
+  );
+}
+
+/** One piece of copied-MAC evidence, as a line. */
+function SignalLine({ s }: { s: QSignal }) {
+  const { t } = useTranslation();
+  const name = t(`quarantine.signal.${s.kind}`, { defaultValue: s.kind });
+  return (
+    <li className="text-small">
+      <span className={s.strong ? "font-medium text-danger" : "font-medium"}>{name}</span>: <span className="mono break-all">{s.now}</span>
+      {s.was && s.was.length > 0 && <span className="text-muted"> · {t("quarantine.signalKnown", { values: s.was.join(" | ") })}</span>}
+    </li>
+  );
+}
+
+/** Copied-MAC detection (phase 5): its switch, the optional automatic
+ * move back to quarantine, and the reports. */
+function DetectCard({ probe, busy, run, label, onRevoke }: {
+  probe: QuarantineProbe;
+  busy: boolean;
+  run: (fn: () => Promise<QResult>, ok?: string) => Promise<boolean>;
+  label: (d: QDevice) => string;
+  onRevoke: (mac: string) => void;
+}) {
+  const { t } = useTranslation();
+  const d = probe.detect;
+  const [confirmAuto, setConfirmAuto] = useState(false);
+  const [confirmOff, setConfirmOff] = useState(false);
+  const alerts = d.suspects.filter((s) => s.level === "alert" && !s.action).length;
+  return (
+    <Card title={t("quarantine.detectTitle")} icon={Fingerprint}
+      action={<div className="flex items-center gap-2">
+        {alerts > 0 && <Pill tone="danger">{t("quarantine.detectAlerts", { count: alerts })}</Pill>}
+        <Toggle checked={d.enabled} busy={busy} label={t("quarantine.detectTitle")}
+          onChange={(v) => { if (v) run(() => api.quarantineDetect(true, false), t("quarantine.detectOnOk")); else setConfirmOff(true); }} />
+      </div>}>
+      <div className="space-y-3">
+        <p className="text-small text-muted">{t("quarantine.detectHelp")}</p>
+        {d.enabled && (
+          <>
+            <p className="text-small">
+              {d.learning > 0 && d.learn_until
+                ? t("quarantine.detectLearning", { count: d.learning, total: d.profiles, when: fmtDate(d.learn_until) })
+                : t("quarantine.detectWatching", { count: d.profiles })}
+            </p>
+            {d.sources.length > 0 && !d.sources.includes("fingerprints") && <Banner tone="warn">{t("quarantine.detectNoFingerprints")}</Banner>}
+            {d.sources.length > 0 && (
+              <p className="text-small text-muted">{t("quarantine.detectSources", { sources: d.sources.map((s) => t(`quarantine.source2.${s}`, { defaultValue: s })).join(", ") })}</p>
+            )}
+            <label className="flex items-start gap-2 text-small">
+              <input type="checkbox" className="mt-0.5" checked={d.auto} disabled={busy}
+                onChange={(e) => { if (e.target.checked) setConfirmAuto(true); else run(() => api.quarantineDetect(true, false), t("quarantine.saved")); }} />
+              <span>
+                <span className="font-medium">{t("quarantine.detectAuto")}</span>
+                <span className="block text-muted">{t("quarantine.detectAutoHelp")}</span>
+              </span>
+            </label>
+            {d.suspects.length === 0 ? (
+              <p className="text-small text-muted">{t("quarantine.detectNone")}</p>
+            ) : (
+              <ul className="divide-y divide-border">
+                {d.suspects.map((s) => (
+                  <li key={s.mac} className="py-3 space-y-2">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="font-medium">{label(s)}</span>
+                      {s.action === "quarantined"
+                        ? <Pill tone="accent">{t("quarantine.detectMoved")}</Pill>
+                        : s.level === "alert" ? <Pill tone="danger">{t("quarantine.detectAlert")}</Pill> : <Pill tone="warn">{t("quarantine.detectNotice")}</Pill>}
+                      <span className="text-small text-muted mono">{s.mac}{s.ip ? ` · ${s.ip}` : ""}</span>
+                    </div>
+                    <ul className="space-y-0.5">{s.signals.map((g, i) => <SignalLine key={`${g.kind}-${i}`} s={g} />)}</ul>
+                    <div className="text-small text-muted">
+                      {s.action === "quarantined" && s.action_at
+                        ? t("quarantine.detectMovedAt", { when: fmtDate(s.action_at) })
+                        : t("quarantine.detectSeen", { first: fmtDate(s.first), last: fmtDate(s.last) })}
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      {!s.action && (
+                        <>
+                          <Button size="sm" icon={Check} disabled={busy}
+                            onClick={() => run(() => api.quarantineSuspect(s.mac, "same"), t("quarantine.detectSameOk"))}>{t("quarantine.detectSame")}</Button>
+                          <Button size="sm" variant="secondary" icon={UserX} disabled={busy} onClick={() => onRevoke(s.mac)}>{t("quarantine.detectMove")}</Button>
+                        </>
+                      )}
+                      <Button size="sm" variant="ghost" icon={Trash2} disabled={busy}
+                        onClick={() => run(() => api.quarantineSuspect(s.mac, "dismiss"))}>{t("quarantine.detectDismiss")}</Button>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </>
+        )}
+      </div>
+      <ConfirmDialog open={confirmAuto} onClose={() => setConfirmAuto(false)} busy={busy}
+        title={t("quarantine.detectAutoTitle")} consequence={t("quarantine.detectAutoBody")} confirmLabel={t("quarantine.detectAutoOn")}
+        onConfirm={async () => { await run(() => api.quarantineDetect(true, true), t("quarantine.saved")); setConfirmAuto(false); }} />
+      <ConfirmDialog open={confirmOff} onClose={() => setConfirmOff(false)} busy={busy}
+        title={t("quarantine.detectOffTitle")} consequence={t("quarantine.detectOffBody")} confirmLabel={t("quarantine.detectOff")}
+        onConfirm={async () => { await run(() => api.quarantineDetect(false, false), t("quarantine.detectOffOk")); setConfirmOff(false); }} />
+    </Card>
   );
 }
 

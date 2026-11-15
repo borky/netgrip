@@ -118,17 +118,7 @@ const qMaxNetworks = 4
 // comes from the air or an access point: control characters are dropped
 // and it is cut to 64 bytes.
 func qAddNetwork(list []string, ssid string) ([]string, bool) {
-	// Control, format (bidi overrides, zero-width) and invalid characters
-	// would make the panel or a notice read differently.
-	ssid = strings.TrimSpace(strings.Map(func(r rune) rune {
-		if r == utf8.RuneError || unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
-			return -1
-		}
-		return r
-	}, ssid))
-	if len(ssid) > 64 {
-		ssid = strings.ToValidUTF8(ssid[:64], "")
-	}
+	ssid = qCleanText(ssid, 64)
 	if ssid == "" || (len(list) > 0 && list[0] == ssid) {
 		return list, false
 	}
@@ -139,6 +129,23 @@ func qAddNetwork(list []string, ssid string) ([]string, bool) {
 		}
 	}
 	return out, true
+}
+
+// qCleanText readies text that came from a device or an access point for
+// the panel and the notices: control, format (bidi overrides, zero-width)
+// and invalid characters, which would make them read differently, are
+// dropped, and it is cut to max bytes of valid UTF-8.
+func qCleanText(s string, max int) string {
+	s = strings.TrimSpace(strings.Map(func(r rune) rune {
+		if r == utf8.RuneError || unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+			return -1
+		}
+		return r
+	}, s))
+	if len(s) > max {
+		s = strings.TrimSpace(strings.ToValidUTF8(s[:max], ""))
+	}
+	return s
 }
 
 // QPause is a time-limited pause. Kind "learn": still enforced, but new
@@ -179,6 +186,8 @@ type qState struct {
 	Wifi QWifiState `json:"wifi"`
 	// Radius is the UniFi layer (phase 3).
 	Radius QRadiusState `json:"radius"`
+	// Detect is the copied-MAC detection (phase 5).
+	Detect QDetect `json:"detect"`
 }
 
 // The state is kept in memory as its JSON (a fresh copy per load, so a
@@ -856,6 +865,7 @@ type QuarantineProbe struct {
 	Issues     []string     `json:"issues"`
 	Wifi       QWifiProbe   `json:"wifi"`
 	Radius     QRadiusProbe `json:"radius"`
+	Detect     QDetectProbe `json:"detect"`
 }
 
 // QRadiusProbe is the RADIUS layer for the panel.
@@ -902,7 +912,8 @@ func probeQuarantineLocked() QuarantineProbe {
 		Applicable: ok, Reason: why, Enabled: st.Enabled, Mode: st.Mode,
 		Zones: []QZone{}, Wan: []string{}, Approved: []QDevice{}, Pending: []QDevice{},
 		Pause: st.Pause, Issues: []string{},
-		Wifi: QWifiProbe{SSIDs: []QWifiSSID{}, Issues: []string{}},
+		Detect: QDetectProbe{Suspects: []QSuspectRow{}, Sources: []string{}},
+		Wifi:   QWifiProbe{SSIDs: []QWifiSSID{}, Issues: []string{}},
 		Radius: QRadiusProbe{Enabled: st.Radius.Enabled, Zones: append([]string{}, st.Radius.Zones...), Port: qRadiusPort,
 			Addresses: []string{}, Stats: QuarantineRadiusStats()},
 	}
@@ -959,6 +970,7 @@ func probeQuarantineLocked() QuarantineProbe {
 		return p.Pending[i].MAC < p.Pending[j].MAC // stable between refreshes
 	})
 	qMarkTwins(p.Pending, qPairsOf(st))
+	p.Detect = qDetectProbeLocked(st, ident, time.Now())
 	if st.Enabled {
 		if !p.Active {
 			p.Issues = append(p.Issues, "enabled, but the firewall is not running the quarantine rules")
@@ -1349,6 +1361,7 @@ func qDisableLocked(st *qState) error {
 	}
 	st.Enabled = false
 	st.Pause = QPause{}
+	st.Detect = QDetect{} // with nothing approved it has nothing to watch
 	_ = saveQState(st)
 	removeQFiles()
 	return nil
@@ -1821,7 +1834,17 @@ func qPoll(now time.Time) {
 	if qPrunePending(st, now) {
 		routine = true
 	}
+	moved := false
+	if full {
+		u, rt := qDetectLocked(st, now)
+		moved = u
+		urgent = urgent || u
+		routine = routine || rt
+	}
 	switch {
+	case moved:
+		// Saved and applied below (qChangeLocked), one flash write.
+		saveQStateLazy(st)
 	case urgent:
 		if err := saveQState(st); err != nil {
 			// Keep memory in step with what goes live, or the next full
@@ -1834,6 +1857,12 @@ func qPoll(now time.Time) {
 	}
 	flushQState(now)
 
+	if moved {
+		// A device moved back to quarantine loses its access now.
+		if err := qChangeLocked(st); err != nil {
+			log.Printf("netgrip: quarantine: applying an automatic move: %v", err)
+		}
+	}
 	if urgent && !full {
 		// A device approved during a learning pause gets through now, not
 		// at the next full check.
@@ -1955,6 +1984,7 @@ func qFullCheckLocked(st *qState, now time.Time) (r qRouter, live, ok bool) {
 			}
 			st.Enabled = false
 			st.Pause = QPause{}
+			st.Detect = QDetect{}
 			_ = saveQState(st)
 			removeQFiles()
 			qMissingPolls = 0

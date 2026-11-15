@@ -474,10 +474,14 @@ func qRadiusHandle(b []byte, from string, now time.Time) []byte {
 	if host != "" && len(qRadiusClients) < 64 {
 		qRadiusClients[host] = true
 	}
+	roam := verdict.accept && v.enabled && v.approved[mac]
 	if ssid != "" && len(qRadiusSSIDs) < 32 {
 		qRadiusSSIDs[ssid] = true
 	}
 	qRadiusMu.Unlock()
+	if roam {
+		qNoteRoam(mac, host, now) // which access point: copied-MAC detection
+	}
 
 	if verdict.learn || verdict.record {
 		select {
