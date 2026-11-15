@@ -53,13 +53,18 @@ const (
 	radAttrNASIdentifier  = 32
 	radAttrMessageAuth    = 80
 	radAttrNASIPAddress   = 4
+	radAttrCHAPPassword   = 3
+	radAttrProxyState     = 33
+	radAttrEAPMessage     = 79
 
 	radiusHeaderLen = 20
 	radiusMaxLen    = 4096
 	qRadiusPort     = 1812
 
 	qRadiusSecretField = "quarantine_radius_secret"
-	qRadiusRule        = "netgrip_quarantine_radius"
+	// One firewall rule per access-point zone (fw4 takes one zone per
+	// rule): netgrip_quarantine_radius_<n>.
+	qRadiusRulePfx = "netgrip_quarantine_radius_"
 )
 
 // QRadiusState is the RADIUS layer's intent.
@@ -201,6 +206,10 @@ func radiusMAC(v string) string {
 
 // radiusSSID takes the SSID from Called-Station-Id ("<AP MAC>:<SSID>").
 func radiusSSID(called string) string {
+	// "aa:bb:cc:dd:ee:ff:SSID" (colons in the MAC) or "AA-BB-...:SSID".
+	if len(called) > 18 && called[17] == ':' && radiusMAC(called[:17]) != "" {
+		return called[18:]
+	}
 	if i := strings.Index(called, ":"); i >= 0 && radiusMAC(called[:i]) != "" {
 		return called[i+1:]
 	}
@@ -215,25 +224,60 @@ type qRadiusView struct {
 	listen   bool // the RADIUS layer is set up: answer access points
 	enabled  bool // the quarantine is on: enforce (off: accept everyone)
 	approved map[string]bool
+	// waiting: devices a learning pause must not let in (pending, already
+	// announced, or excluded when the pause began); learned: how many it
+	// has let in so far.
+	waiting  map[string]bool
+	learned  int
 	pause    QPause
 	secret   []byte
+	unsealed string // why the secret could not be unsealed ("" when fine)
 }
 
 var qRadiusSnap atomic.Pointer[qRadiusView]
+
+// qRadiusLearning counts learn verdicts given since the last refresh, so a
+// burst cannot pass qMaxLearned before the state catches up.
+var qRadiusLearning atomic.Int64
+
+// qRadiusSecretCache avoids unsealing on every save.
+var qRadiusSecretCache struct {
+	sync.Mutex
+	sealed, plain string
+}
 
 // qRadiusRefresh publishes the state's decision view. Called with the
 // state just saved (under qMu); a failed unseal leaves RADIUS refusing
 // every request rather than guessing.
 func qRadiusRefresh(st *qState) {
-	v := &qRadiusView{listen: st.Radius.Enabled, enabled: st.Enabled, approved: map[string]bool{}, pause: st.Pause}
+	v := &qRadiusView{listen: st.Radius.Enabled, enabled: st.Enabled, approved: map[string]bool{}, waiting: map[string]bool{},
+		pause: st.Pause, learned: len(st.Pause.Learned)}
 	for m := range st.Approved {
 		v.approved[m] = true
 	}
-	if st.Radius.Secret != "" {
-		if s, err := unsealSecret(qRadiusSecretField, st.Radius.Secret); err == nil {
-			v.secret = []byte(s)
-		}
+	for m := range st.Pending {
+		v.waiting[m] = true
 	}
+	for m := range st.Notified {
+		v.waiting[m] = true
+	}
+	for _, m := range st.Pause.Excluded {
+		v.waiting[m] = true
+	}
+	if st.Radius.Secret != "" {
+		qRadiusSecretCache.Lock()
+		if qRadiusSecretCache.sealed != st.Radius.Secret {
+			if plain, err := unsealSecret(qRadiusSecretField, st.Radius.Secret); err == nil {
+				qRadiusSecretCache.sealed, qRadiusSecretCache.plain = st.Radius.Secret, plain
+			} else {
+				qRadiusSecretCache.sealed, qRadiusSecretCache.plain = "", ""
+				v.unsealed = "cannot unseal the RADIUS secret (" + err.Error() + "): make a new secret and enter it on the access point"
+			}
+		}
+		v.secret = []byte(qRadiusSecretCache.plain)
+		qRadiusSecretCache.Unlock()
+	}
+	qRadiusLearning.Store(0)
 	qRadiusSnap.Store(v)
 }
 
@@ -254,6 +298,14 @@ func qRadiusDecide(v *qRadiusView, mac string, now time.Time) qRadiusVerdict {
 	case v.approved[mac]:
 		return qRadiusVerdict{accept: true, why: "approved"}
 	case v.pause.active(now) && v.pause.Kind == "learn":
+		// Like the router layer: devices that were already waiting are not
+		// learned, and no more than qMaxLearned per pause.
+		if v.waiting[mac] {
+			return qRadiusVerdict{record: true, why: "was waiting before the pause"}
+		}
+		if v.learned+int(qRadiusLearning.Load()) >= qMaxLearned {
+			return qRadiusVerdict{record: true, why: "the pause has let in its maximum"}
+		}
 		return qRadiusVerdict{accept: true, learn: true, why: "learning pause"}
 	case v.pause.active(now) && v.pause.Kind == "off":
 		return qRadiusVerdict{accept: true, record: true, why: "protection paused"}
@@ -355,6 +407,21 @@ func qRadiusHandle(b []byte, from string, now time.Time) []byte {
 	}
 	qRadiusMu.Unlock()
 
+	var proxy []radiusAttr
+	for _, a := range p.attrs {
+		if a.typ == radAttrProxyState {
+			proxy = append(proxy, a) // echoed unchanged (RFC 2865 5.33)
+		}
+	}
+	// MAC authentication only: a request carrying a credential (an EAP or
+	// CHAP login, e.g. the same profile used for WPA-Enterprise) is not
+	// this server's to answer, and accepting it would skip the check.
+	if _, n := p.attr(radAttrEAPMessage); n > 0 {
+		return buildRadiusResponse(radiusAccessReject, p, v.secret, proxy)
+	}
+	if _, n := p.attr(radAttrCHAPPassword); n > 0 {
+		return buildRadiusResponse(radiusAccessReject, p, v.secret, proxy)
+	}
 	calling, _ := p.attr(radAttrCallingStation)
 	mac := radiusMAC(string(calling))
 	if mac == "" {
@@ -364,14 +431,17 @@ func qRadiusHandle(b []byte, from string, now time.Time) []byte {
 	called, _ := p.attr(radAttrCalledStation)
 	ssid := radiusSSID(string(called))
 	if mac == "" {
-		return buildRadiusResponse(radiusAccessReject, p, v.secret, []radiusAttr{{typ: radAttrReplyMessage, value: []byte("no device address")}})
+		return buildRadiusResponse(radiusAccessReject, p, v.secret, append(proxy, radiusAttr{typ: radAttrReplyMessage, value: []byte("no device address")}))
 	}
 	verdict := qRadiusDecide(v, mac, now)
+	if verdict.learn {
+		qRadiusLearning.Add(1)
+	}
 	code := byte(radiusAccessReject)
 	if verdict.accept {
 		code = radiusAccessAccept
 	}
-	resp := buildRadiusResponse(code, p, v.secret, nil)
+	resp := buildRadiusResponse(code, p, v.secret, proxy)
 
 	host, _, _ := net.SplitHostPort(from)
 	qRadiusMu.Lock()
@@ -379,7 +449,17 @@ func qRadiusHandle(b []byte, from string, now time.Time) []byte {
 	qRadiusStats.LastRequest = now.Unix()
 	if verdict.accept {
 		qRadiusStats.Accepted++
-		qRadiusAccepted[mac] = now
+		// Only approved devices can pair a Wi-Fi 7 data address.
+		if v.enabled && v.approved[mac] {
+			for m, at := range qRadiusAccepted {
+				if now.Sub(at) > qMLOWindow {
+					delete(qRadiusAccepted, m)
+				}
+			}
+			if len(qRadiusAccepted) < 1024 {
+				qRadiusAccepted[mac] = now
+			}
+		}
 	} else {
 		qRadiusStats.Rejected++
 	}
@@ -437,7 +517,7 @@ func qRadiusRecord(e qRadiusEvent) {
 
 // qMLOWindow is how soon after a RADIUS accept the device's data address
 // is expected.
-const qMLOWindow = time.Minute
+const qMLOWindow = 15 * time.Second
 
 // qMLOFromRadius returns the approved RADIUS address a new data address
 // belongs to: accepted within qMLOWindow, one apart in the last octet, and
@@ -450,15 +530,20 @@ func qMLOFromRadius(mac string, now time.Time, st *qState) string {
 			delete(qRadiusAccepted, x)
 			continue
 		}
-		if _, ok := st.Approved[x]; ok {
+		// Never from an address that was itself paired: no chains.
+		if a, ok := st.Approved[x]; ok && a.Via != "mlo" {
 			recent[x] = true
 		}
 	}
-	qRadiusMu.Unlock()
-	if len(recent) == 0 {
-		return ""
+	partner := ""
+	if len(recent) > 0 {
+		partner = qMLOPartner(mac, recent)
 	}
-	return qMLOPartner(mac, recent)
+	if partner != "" {
+		delete(qRadiusAccepted, partner) // one pairing per accept
+	}
+	qRadiusMu.Unlock()
+	return partner
 }
 
 func qApprovedSet(st *qState) map[string]bool {
@@ -488,9 +573,27 @@ func StartQuarantineRadius() {
 		go qRadiusRecordLoop()
 		go func() {
 			var conn net.PacketConn
+			var served chan struct{}
 			for {
 				v := qRadiusSnap.Load()
 				want := v != nil && v.listen && len(v.secret) > 0
+				if v != nil && v.listen && v.unsealed != "" {
+					qRadiusMu.Lock()
+					qRadiusStats.Error = v.unsealed
+					qRadiusMu.Unlock()
+				}
+				if conn != nil {
+					select {
+					case <-served:
+						// The serving loop ended on its own: open again.
+						_ = conn.Close()
+						conn = nil
+						qRadiusMu.Lock()
+						qRadiusStats.Listening = false
+						qRadiusMu.Unlock()
+					default:
+					}
+				}
 				switch {
 				case want && conn == nil:
 					c, err := qRadiusListenFn()
@@ -500,7 +603,8 @@ func StartQuarantineRadius() {
 					} else {
 						qRadiusStats.Listening, qRadiusStats.Error = true, ""
 						conn = c
-						go qRadiusServe(c)
+						served = make(chan struct{})
+						go func(c net.PacketConn, done chan struct{}) { qRadiusServe(c); close(done) }(c, served)
 					}
 					qRadiusMu.Unlock()
 				case !want && conn != nil:
@@ -581,8 +685,13 @@ func qZoneAddresses(zones []QZone, names []string) []string {
 // waiting for the quarantine's lock. nil while the RADIUS layer is off.
 func quarantineRadiusBackupInfo() *probe.QuarantineRadiusInfo {
 	v := qRadiusSnap.Load()
-	if v == nil || !v.listen || len(v.secret) == 0 {
-		return nil
+	if v == nil || len(v.secret) == 0 {
+		return nil // never set up
+	}
+	if !v.listen {
+		// Set up once, now off: the server forgets this router (no
+		// secret is sent with it).
+		return &probe.QuarantineRadiusInfo{Disabled: true}
 	}
 	info := &probe.QuarantineRadiusInfo{Secret: string(v.secret), Enforce: v.enabled, Approved: make([]string, 0, len(v.approved))}
 	for m := range v.approved {
@@ -611,18 +720,21 @@ func qNewRadiusSecret() (string, error) {
 	return string(b), nil
 }
 
-// qRadiusRuleOps writes (zones non-empty) or removes the firewall rule
-// admitting RADIUS from the access points' zones.
+// qRadiusRuleOps writes one firewall rule per access-point zone (fw4 takes
+// a single zone per rule) admitting RADIUS, and removes the others; no
+// zones removes them all.
 func qRadiusRuleOps(fw map[string]uciSection, zones []string) []executor.Op {
 	var ops []executor.Op
-	if len(zones) == 0 {
-		deleteSections(&ops, fw, "firewall", func(n string) bool { return n == qRadiusRule })
-	} else {
-		ensureSection(&ops, fw, "firewall", qRadiusRule, "rule", map[string][]string{
-			"name": {"netgrip quarantine: RADIUS from the access points"}, "src": {strings.Join(zones, " ")},
+	want := map[string]bool{}
+	for i, z := range zones {
+		name := fmt.Sprintf("%s%d", qRadiusRulePfx, i)
+		want[name] = true
+		ensureSection(&ops, fw, "firewall", name, "rule", map[string][]string{
+			"name": {"netgrip quarantine: RADIUS from the access points (" + z + ")"}, "src": {z},
 			"proto": {"udp"}, "dest_port": {fmt.Sprint(qRadiusPort)}, "target": {"ACCEPT"},
 		})
 	}
+	deleteSections(&ops, fw, "firewall", func(n string) bool { return strings.HasPrefix(n, qRadiusRulePfx) && !want[n] })
 	if len(ops) == 0 {
 		return nil
 	}

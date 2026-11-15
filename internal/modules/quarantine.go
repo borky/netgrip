@@ -1844,6 +1844,12 @@ func qRecordSeenFrom(st *qState, seen []qElem, now time.Time, dataPlane bool) (u
 	}
 	var ident *qIdent
 	var announce []QDevice
+	var paired []string
+	defer func() {
+		if len(paired) > 0 {
+			go qNotifyPaired(paired, qChannelsFn, qNotifyFn)
+		}
+	}()
 	for _, e := range seen {
 		mac := strings.ToLower(e.Val)
 		if !reMac.MatchString(mac) {
@@ -1856,11 +1862,15 @@ func qRecordSeenFrom(st *qState, seen []qElem, now time.Time, dataPlane bool) (u
 		// A Wi-Fi 7 device asks RADIUS with one address and sends data
 		// with another (E1): the data address of a device RADIUS just let
 		// in is approved with it.
-		if x := qMLOFromRadius(mac, now, st); dataPlane && x != "" {
-			st.Approved[mac] = QApproved{At: now.Unix(), Via: "mlo", Name: st.Approved[x].Name}
-			delete(st.Pending, mac)
-			urgent = true
-			continue
+		// Only for an address never seen before (not waiting, announced or
+		// excluded), within seconds of the accept, once per accept.
+		if _, told := st.Notified[mac]; dataPlane && !waiting && !told && !excluded[mac] {
+			if x := qMLOFromRadius(mac, now, st); x != "" {
+				st.Approved[mac] = QApproved{At: now.Unix(), Via: "mlo", Name: st.Approved[x].Name}
+				urgent = true
+				paired = append(paired, mac+" ("+firstNonEmpty(st.Approved[x].Name, x)+")")
+				continue
+			}
 		}
 		if learning && !waiting && !excluded[mac] && len(st.Pause.Learned) < qMaxLearned {
 			st.Approved[mac] = QApproved{At: now.Unix(), Via: "pause"}
@@ -2044,6 +2054,19 @@ func qNotifyPendingBatch(devs []QDevice, channels func() bool, notify func(strin
 			fmt.Sprintf("🔒 NetGrip\nNew device quarantined: %s\nMAC: %s%s\nApprove it on the panel's Quarantine page.", label, d.MAC, extra),
 			false)
 	}
+}
+
+// qNotifyPaired tells the user about Wi-Fi 7 data addresses approved
+// with their device's RADIUS address.
+func qNotifyPaired(macs []string, channels func() bool, notify func(string, string, string, bool)) {
+	if !channels() || len(macs) == 0 {
+		return
+	}
+	list := strings.Join(macs, ", ")
+	notify("NetGrip",
+		fmt.Sprintf("🔗 <b>NetGrip</b>\nApproved as the Wi-Fi 7 address of an approved device: %s. Revoke it in the quarantine page if that is not right.", htmlEsc(list)),
+		fmt.Sprintf("🔗 NetGrip\nApproved as the Wi-Fi 7 address of an approved device: %s. Revoke it in the quarantine page if that is not right.", list),
+		false)
 }
 
 func qNotifyLearned(macs []string, channels func() bool, notify func(string, string, string, bool)) {
