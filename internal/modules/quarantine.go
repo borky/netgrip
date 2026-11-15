@@ -1510,6 +1510,10 @@ func QuarantineRevoke(mac, requesterIP string, force bool) (QuarantineProbe, err
 		return probeQuarantineLocked(), errors.New("not an approved device")
 	}
 	delete(st.Approved, mac)
+	// Revoked trust starts over: when the device asks again it is a new
+	// event, announced even if it was announced before it was approved
+	// (that announcement's week would otherwise keep it quiet).
+	delete(st.Notified, mac)
 	err := qChangeLocked(st)
 	return probeQuarantineLocked(), err
 }

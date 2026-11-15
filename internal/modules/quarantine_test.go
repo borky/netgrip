@@ -769,11 +769,20 @@ func TestQuarantineRevokeGuards(t *testing.T) {
 	if _, err := QuarantineRevoke("02:00:00:00:00:20", "198.51.100.7", false); err == nil {
 		t.Fatal("revoked while the panel user's device is unknown")
 	}
+	// It was announced while it waited the first time.
+	st := loadQState()
+	st.Notified["02:00:00:00:00:20"] = time.Now().Unix()
+	if err := saveQState(st); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := QuarantineRevoke("02:00:00:00:00:20", "192.0.2.10", false); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := loadQState().Approved["02:00:00:00:00:20"]; ok {
 		t.Fatal("not revoked")
+	}
+	if _, told := loadQState().Notified["02:00:00:00:00:20"]; told {
+		t.Fatal("a revoked device stays marked as announced: it would wait without a notification")
 	}
 }
 
