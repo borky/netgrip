@@ -971,7 +971,6 @@ export default {
       radio: "Capacidades Wi-Fi",
       roam: "Alterna entre puntos de acceso",
       uradio: "Wi-Fi en UniFi",
-      medium: "Conexión en UniFi (cable o Wi-Fi)",
     },
     source2: {
       fingerprints: "huellas DHCP",

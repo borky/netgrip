@@ -84,7 +84,6 @@ const (
 	qSigRadio    = "radio"    // Wi-Fi capabilities (router SSIDs)
 	qSigRoam     = "roam"     // alternating between two access points
 	qSigURadio   = "uradio"   // Wi-Fi in use on a UniFi access point (via NetPulse)
-	qSigMedium   = "medium"   // wired or Wi-Fi, as UniFi sees it (via NetPulse)
 	qLeasedMark  = "leased"   // profile only: the device has used DHCP
 )
 
@@ -587,7 +586,6 @@ func qObserved(mac string, p *QProfile, o qObs) map[string][]string {
 		add(qSigRoam, v)
 	}
 	if u, ok := o.unifi[mac]; ok {
-		add(qSigMedium, u.medium)
 		add(qSigURadio, u.radio)
 	}
 	return out
@@ -672,15 +670,10 @@ func qHas(list []string, v string) bool {
 }
 
 // qSource groups kinds that come from one observation: the DHCP
-// fingerprint and vendor class are one request (an OS update changes both),
-// and what NetPulse relays from UniFi is one source however many things it
-// says (it must not make an alert, or the automatic move, on its own).
+// fingerprint and vendor class are one request (an OS update changes both).
 func qSource(kind string) string {
-	switch kind {
-	case qSigVendor:
+	if kind == qSigVendor {
 		return qSigDHCP
-	case qSigMedium:
-		return qSigURadio
 	}
 	return kind
 }
@@ -693,7 +686,7 @@ func qSource(kind string) string {
 func qOwnSignals(sigs []QSignal) []QSignal {
 	var out []QSignal
 	for _, s := range sigs {
-		if qSource(s.Kind) != qSigURadio {
+		if s.Kind != qSigURadio {
 			out = append(out, s)
 		}
 	}
@@ -1076,7 +1069,6 @@ var qSignalText = map[string]string{
 	qSigRadio:    "Wi-Fi capabilities",
 	qSigRoam:     "alternating between access points",
 	qSigURadio:   "Wi-Fi on UniFi",
-	qSigMedium:   "connection on UniFi",
 }
 
 func qSignalLine(s QSignal) string {

@@ -23,10 +23,10 @@ func newQDetectFake(t *testing.T, auto bool) *qDetectFake {
 	t.Cleanup(func() {
 		qObserveFn = old
 		qPlacesSeen, qMassRecent, qMassToldAt = map[string]time.Time{}, map[string]time.Time{}, time.Time{}
-		qTakeViewers()
+		qResetViewers()
 	})
 	qPlacesSeen, qMassRecent, qMassToldAt = map[string]time.Time{}, map[string]time.Time{}, time.Time{}
-	qTakeViewers()
+	qResetViewers()
 	f.obs = qObs{fp: map[string]qFP{}, leases: map[string][]ubus.Lease{}, leasesOK: true, uptimeOK: true, neigh: map[string][]qNeigh{}, radio: map[string]string{}}
 	qObserveFn = func(time.Time) qObs { return f.obs }
 	if _, err := QuarantineDetectSet(true, auto); err != nil {
@@ -458,4 +458,12 @@ func TestDetectAnUpdateOrADismissedAlertIsNotEnoughToMove(t *testing.T) {
 			t.Fatalf("the panel shows dismissed evidence again: %+v", r.Signals)
 		}
 	}
+}
+
+// qResetViewers forgets the panel's devices and the per-IP throttle, so no
+// test depends on which ran before it.
+func qResetViewers() {
+	qViewersMu.Lock()
+	qViewers, qViewerIPAt = map[string]time.Time{}, map[string]time.Time{}
+	qViewersMu.Unlock()
 }
