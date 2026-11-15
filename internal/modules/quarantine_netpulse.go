@@ -2,16 +2,16 @@ package modules
 
 // The quarantine and NetPulse (phase 6). Each full push to the monitoring
 // server carries every device's quarantine state, which its device list
-// shows; the server answers with what its UniFi controller says about how
-// those devices are connected, which the copied-MAC detection compares. The
+// shows; the server answers with what its UniFi controller says about the
+// Wi-Fi those devices use, which the copied-MAC detection compares. The
 // embedded agent does both only with an HTTPS server whose key is pinned:
-// the trusted list is what someone copying a MAC wants, and the answer can
-// count towards moving a device back to quarantine. The router stays the
-// source of truth: nothing here is needed for the quarantine to work.
+// the trusted list is what someone copying a MAC wants, and a forged answer
+// must not raise alerts. That answer never counts towards the automatic
+// move (see qOwnSignals). The router stays the source of truth: nothing
+// here is needed for the quarantine to work.
 
 import (
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -27,10 +27,12 @@ const qStationsMaxAge = 5 * time.Minute
 // qMaxStations bounds what one answer may hold.
 const qMaxStations = 4096
 
-// qUnifiObs is one device as UniFi sees it, as signal values.
+// qUnifiObs is one device as UniFi sees it, as signal values. Only Wi-Fi
+// clients of UniFi access points: UniFi calls "wired" any address it learns
+// on a switch port, which includes clients of other access points and of
+// the router's own Wi-Fi, so wired versus Wi-Fi is not compared.
 type qUnifiObs struct {
-	medium string // "wired" or "wifi"
-	radio  string // "<ap model>/<band>:<standard>[,nss<n>][,mlo]"; "" when wired
+	radio string // "<ap model>/<band>:<standard>[,mlo]"
 }
 
 var (
@@ -50,10 +52,12 @@ func QuarantineNoteStations(list []probe.QuarantineStation) {
 			break
 		}
 		mac := strings.ToLower(strings.TrimSpace(s.MAC))
-		if !qIsMAC(mac) {
+		if !reMac.MatchString(mac) {
 			continue
 		}
-		out[mac] = qStationObs(s)
+		if o, ok := qStationObs(s); ok {
+			out[mac] = o
+		}
 	}
 	qStationsMu.Lock()
 	qStations, qStationsAt = out, qStationsNow()
@@ -70,36 +74,32 @@ func qStationsSnapshot(now time.Time) (map[string]qUnifiObs, bool) {
 	return qStations, true
 }
 
-// qStationObs turns one station into signal values. Everything in it came
-// from another machine: only plain codes are kept.
-func qStationObs(s probe.QuarantineStation) qUnifiObs {
+// qStationObs turns one station into signal values (ok false: nothing to
+// compare). Everything in it came from another machine: only plain codes
+// are kept. The context (before ':') is what the connection depends on, not
+// the device: the access point model and the band (an older model offers
+// an older standard). The value is what the device chose there: the Wi-Fi
+// standard and Wi-Fi 7 multi-link, so a device that copies a Wi-Fi 7
+// phone's address but cannot do the same shows. Spatial streams are left
+// out: the controller may report those in use, which vary.
+func qStationObs(s probe.QuarantineStation) (qUnifiObs, bool) {
 	if s.Wired {
-		return qUnifiObs{medium: "wired"}
+		return qUnifiObs{}, false
 	}
-	o := qUnifiObs{medium: "wifi"}
 	proto := qPlainCode(s.Proto, 4, false)
 	if proto == "" {
-		return o // nothing to compare on this connection
+		return qUnifiObs{}, false
 	}
 	band := ""
 	switch s.Band {
 	case "2g", "5g", "6g":
 		band = s.Band
 	}
-	// The context (before ':') is what the connection depends on, not the
-	// device: the access point model, the band, and whether it is a Wi-Fi
-	// 7 multi-link connection (a client can re-associate without it). The
-	// values compared within it describe the device.
-	ctx := qPlainCode(s.APModel, 24, true) + "/" + band
+	v := qPlainCode(s.APModel, 24, true) + "/" + band + ":" + proto
 	if s.MLO {
-		ctx += "/mlo"
+		v += ",mlo"
 	}
-	v := ctx + ":" + proto
-	if s.NSS > 0 && s.NSS <= 16 {
-		v += ",nss" + strconv.Itoa(s.NSS)
-	}
-	o.radio = v
-	return o
+	return qUnifiObs{radio: v}, true
 }
 
 // qPlainCode keeps a short code: lowercase letters only, or, for a model,
@@ -131,23 +131,6 @@ func qPlainCode(s string, max int, model bool) string {
 	return b.String()
 }
 
-func qIsMAC(m string) bool {
-	if len(m) != 17 {
-		return false
-	}
-	for i := 0; i < 17; i++ {
-		c := m[i]
-		if i%3 == 2 {
-			if c != ':' {
-				return false
-			}
-		} else if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
-			return false
-		}
-	}
-	return true
-}
-
 // quarantineReportInfo is the state the agent sends with each full push.
 // It reads the saved state's copy in memory, never waiting for the
 // quarantine's lock. nil when the quarantine was never set up.
@@ -160,10 +143,23 @@ func quarantineReportInfo() *probe.QuarantineInfo {
 		return &probe.QuarantineInfo{Enabled: false}
 	}
 	info := &probe.QuarantineInfo{Enabled: true, Devices: make([]probe.QuarantineDevice, 0, len(st.Approved)+len(st.Pending))}
+	if st.Pause.active(time.Now()) {
+		info.PauseUntil, info.PauseKind = st.Pause.Until, st.Pause.Kind
+	}
 	report := map[string]string{}
 	if st.Detect.Enabled {
 		for mac, s := range st.Detect.Suspects {
-			if s.Dismissed == 0 && s.Action == "" && len(qActive(s.Signals)) > 0 {
+			switch {
+			case s.Action != "" && s.Dismissed == 0:
+				// Moved back automatically: the most important state. It
+				// waits even before it asks to join again.
+				report[mac] = "alert"
+				if _, ok := st.Approved[mac]; !ok {
+					if _, ok := st.Pending[mac]; !ok {
+						info.Devices = append(info.Devices, probe.QuarantineDevice{MAC: mac, State: "waiting", Report: "alert"})
+					}
+				}
+			case s.Dismissed == 0 && len(qActive(s.Signals)) > 0:
 				report[mac] = s.Level
 			}
 		}

@@ -100,12 +100,12 @@ export function QuarantinePage() {
   // A link from NetPulse names a device (#/quarantine?mac=…): a waiting one
   // is marked and scrolled to; an approved one is searched for below.
   const linked = useLinkedMac();
+  // The row the link names, once it exists: a device that asks to join
+  // after the page opened is scrolled to when it appears.
+  const linkedRow = linked ? pendingRows.find(({ d, twin }) => d.mac === linked || twin?.mac === linked)?.d.mac ?? "" : "";
   useEffect(() => {
-    if (!linked || !probe) return;
-    const row = pendingRows.find(({ d, twin }) => d.mac === linked || twin?.mac === linked);
-    if (row) document.getElementById(`q-pending-${row.d.mac}`)?.scrollIntoView({ block: "center" });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [linked, probe === undefined]);
+    if (linkedRow) document.getElementById(`q-pending-${linkedRow}`)?.scrollIntoView({ block: "center" });
+  }, [linkedRow]);
 
   const run = useCallback(async (fn: () => Promise<QResult>, okText?: string) => {
     setBusy(true);
@@ -757,7 +757,9 @@ function ApprovedCard({ devices, you, busy, label, onRevoke }: {
   // user changes afterwards must stay theirs.
   const linkedApproved = !!linked && devices.some((d) => d.mac === linked);
   useEffect(() => {
-    if (linkedApproved) setQuery(linked);
+    if (!linkedApproved) return;
+    setQuery(linked);
+    document.getElementById("q-approved")?.scrollIntoView({ block: "start" });
   }, [linked, linkedApproved]);
   const [source, setSource] = useState<Source>("all");
   const [sort, setSort] = useState<"name" | "recent">("name");
@@ -790,7 +792,7 @@ function ApprovedCard({ devices, you, busy, label, onRevoke }: {
   useEffect(() => setShown(PAGE), [query, source, sort]);
 
   return (
-    <Card title={t("quarantine.approvedTitle", { count: devices.length })} icon={UserCheck}>
+    <Card id="q-approved" title={t("quarantine.approvedTitle", { count: devices.length })} icon={UserCheck}>
       <div className="space-y-3">
         {devices.length > 0 && (
           <>
