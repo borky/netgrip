@@ -931,6 +931,7 @@ export default {
     forget: "Forget",
     namePlaceholder: "Name (optional)",
     lastSeen: "Last seen {{when}}",
+    wantsNetwork: "Wi-Fi network: {{networks}}",
     approvedTitle: "Approved devices ({{count}})",
     you: "This device",
     radiusTitle: "Access points (RADIUS)",

@@ -511,7 +511,7 @@ func qRadiusRecord(e qRadiusEvent) {
 	if e.learn {
 		defer qRadiusLearning.Add(-1) // recorded: the state counts it now
 	}
-	urgent, routine := qRecordSeenFrom(st, []qElem{{Val: e.mac}}, e.at, false, !e.noLearn)
+	urgent, routine := qRecordSeenFrom(st, []qElem{{Val: e.mac, Net: e.ssid}}, e.at, false, !e.noLearn)
 	if p, ok := st.Pending[e.mac]; ok {
 		if partner := qMLOPartner(e.mac, qApprovedSet(st)); partner != "" && p.PairOf != partner {
 			p.PairOf = partner

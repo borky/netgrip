@@ -222,6 +222,10 @@ export function QuarantinePage() {
                   <li key={d.mac} className="py-3 flex flex-wrap items-center gap-3">
                     <div className="min-w-0 flex-1">
                       <div className="font-medium truncate">{label(twin && !d.name && !d.hostname ? twin : d)}</div>
+                      {(() => {
+                        const nets = [...new Set([...(d.networks ?? []), ...(twin?.networks ?? [])])];
+                        return nets.length ? <div className="text-small">{t("quarantine.wantsNetwork", { networks: nets.join(", ") })}</div> : null;
+                      })()}
                       <div className="text-small text-muted mono">{d.mac}{d.ip ? ` · ${d.ip}` : ""}</div>
                       {twin ? <div className="text-small text-muted mono">{twin.mac}{twin.ip ? ` · ${twin.ip}` : ""}</div> : null}
                       {twin ? <div className="text-small text-accent">{t("quarantine.twinHint")}</div> : null}
