@@ -544,9 +544,13 @@ func applyNetPulseAgent(p netpulsePaths) {
 		// The uplink policy this panel manages travels with the push, so
 		// the monitoring side shows the connection actually in use rather
 		// than the one holding the cheapest route.
-		MultiWan:       netpulseMultiWanHook,
-		OnUpgrade:      netPulseUpgradeTrigger,
-		OnConfigBackup: netPulseConfigBackupTrigger,
+		MultiWan: netpulseMultiWanHook,
+		// The quarantine's RADIUS decisions, for the server to answer as
+		// the access points' backup (the runtime sends it only to a pinned
+		// HTTPS server).
+		QuarantineRadius: quarantineRadiusBackupInfo,
+		OnUpgrade:        netPulseUpgradeTrigger,
+		OnConfigBackup:   netPulseConfigBackupTrigger,
 	}
 
 	ctx, cancel := context.WithCancel(base)

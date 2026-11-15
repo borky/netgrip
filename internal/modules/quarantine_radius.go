@@ -38,6 +38,7 @@ import (
 	"time"
 
 	"github.com/gnacho/netgrip/internal/executor"
+	"github.com/gnacho/netpulse/agent/probe"
 )
 
 const (
@@ -573,6 +574,25 @@ func qZoneAddresses(zones []QZone, names []string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// quarantineRadiusBackupInfo is what the monitoring server needs to answer
+// RADIUS while this panel cannot: read from the answers' snapshot, never
+// waiting for the quarantine's lock. nil while the RADIUS layer is off.
+func quarantineRadiusBackupInfo() *probe.QuarantineRadiusInfo {
+	v := qRadiusSnap.Load()
+	if v == nil || !v.listen || len(v.secret) == 0 {
+		return nil
+	}
+	info := &probe.QuarantineRadiusInfo{Secret: string(v.secret), Enforce: v.enabled, Approved: make([]string, 0, len(v.approved))}
+	for m := range v.approved {
+		info.Approved = append(info.Approved, m)
+	}
+	sort.Strings(info.Approved)
+	if v.pause.Until > time.Now().Unix() {
+		info.PauseUntil, info.PauseKind = v.pause.Until, v.pause.Kind
+	}
+	return info
 }
 
 // ---- Turning it on and off ----

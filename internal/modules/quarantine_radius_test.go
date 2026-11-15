@@ -289,3 +289,18 @@ func FuzzParseRadius(f *testing.F) {
 		_ = verifyRequestAuth(p, []byte("x"))
 	})
 }
+
+func TestQuarantineRadiusBackupInfo(t *testing.T) {
+	qRadiusReset(t)
+	qRadiusSnap.Store(&qRadiusView{listen: false, secret: []byte(qTestRadiusSecret)})
+	if quarantineRadiusBackupInfo() != nil {
+		t.Fatal("sent with the RADIUS layer off")
+	}
+	v := qRadiusTestView(true, "02:00:00:00:00:0b", "02:00:00:00:00:0a")
+	v.pause = QPause{Until: time.Now().Add(time.Minute).Unix(), Kind: "learn"}
+	qRadiusSnap.Store(v)
+	info := quarantineRadiusBackupInfo()
+	if info == nil || info.Secret != qTestRadiusSecret || !info.Enforce || strings.Join(info.Approved, ",") != "02:00:00:00:00:0a,02:00:00:00:00:0b" || info.PauseKind != "learn" {
+		t.Fatalf("info: %+v", info)
+	}
+}
