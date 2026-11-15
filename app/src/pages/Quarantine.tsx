@@ -97,6 +97,15 @@ export function QuarantinePage() {
     }
     return rows;
   }, [probe]);
+  // A link from NetPulse names a device (#/quarantine?mac=…): a waiting one
+  // is marked and scrolled to; an approved one is searched for below.
+  const linked = useLinkedMac();
+  useEffect(() => {
+    if (!linked || !probe) return;
+    const row = pendingRows.find(({ d, twin }) => d.mac === linked || twin?.mac === linked);
+    if (row) document.getElementById(`q-pending-${row.d.mac}`)?.scrollIntoView({ block: "center" });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [linked, probe === undefined]);
 
   const run = useCallback(async (fn: () => Promise<QResult>, okText?: string) => {
     setBusy(true);
@@ -222,7 +231,8 @@ export function QuarantinePage() {
             ) : (
               <ul className="divide-y divide-border">
                 {pendingRows.map(({ d, twin }) => (
-                  <li key={d.mac} className="py-3 flex flex-wrap items-center gap-3">
+                  <li key={d.mac} id={`q-pending-${d.mac}`}
+                    className={`py-3 flex flex-wrap items-center gap-3 ${linked && (d.mac === linked || twin?.mac === linked) ? "rounded-md ring-2 ring-accent px-2" : ""}`}>
                     <div className="min-w-0 flex-1">
                       <div className="font-medium truncate">{label(twin && !d.name && !d.hostname ? twin : d)}</div>
                       {(() => {
@@ -704,6 +714,26 @@ const sourceOf = (via?: string): Source =>
   via === "baseline" || via === "pause" || via === "mlo" ? via : "manual";
 const PAGE = 25;
 
+/** The MAC a link into this page names (`#/quarantine?mac=…`, as NetPulse's
+ *  device list builds it), or "" when there is none or it is not a MAC. */
+function macFromHash(hash: string): string {
+  const i = hash.indexOf("?");
+  if (i < 0) return "";
+  const mac = (new URLSearchParams(hash.slice(i + 1)).get("mac") ?? "").trim().toLowerCase();
+  return /^[0-9a-f]{2}(:[0-9a-f]{2}){5}$/.test(mac) ? mac : "";
+}
+
+/** The MAC the page's address names, following later changes to it. */
+function useLinkedMac(): string {
+  const [mac, setMac] = useState(() => macFromHash(window.location.hash));
+  useEffect(() => {
+    const on = () => setMac(macFromHash(window.location.hash));
+    window.addEventListener("hashchange", on);
+    return () => window.removeEventListener("hashchange", on);
+  }, []);
+  return mac;
+}
+
 /** Lowercase hex digits only, so "AA-BB", "aa:bb" and "aabb" all match. */
 const hexOnly = (s: string) => s.toLowerCase().replace(/[^0-9a-f]/g, "");
 
@@ -720,7 +750,15 @@ function ApprovedCard({ devices, you, busy, label, onRevoke }: {
   onRevoke: (d: QDevice) => void;
 }) {
   const { t } = useTranslation();
+  // A link from NetPulse to an approved device opens the list on it.
+  const linked = useLinkedMac();
   const [query, setQuery] = useState("");
+  // Once per link: the list reloads every few seconds, and a search the
+  // user changes afterwards must stay theirs.
+  const linkedApproved = !!linked && devices.some((d) => d.mac === linked);
+  useEffect(() => {
+    if (linkedApproved) setQuery(linked);
+  }, [linked, linkedApproved]);
   const [source, setSource] = useState<Source>("all");
   const [sort, setSort] = useState<"name" | "recent">("name");
   const [shown, setShown] = useState(PAGE);
