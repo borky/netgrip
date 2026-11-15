@@ -1820,6 +1820,40 @@ export interface QuarantineProbe {
   wifi: QWifiProbe;
   /** The access-point layer (phase 3, RADIUS MAC authentication). */
   radius: QRadiusProbe;
+  /** Copied-MAC detection (phase 5). */
+  detect: QDetectProbe;
+}
+
+export interface QSignal {
+  kind: "dhcp" | "vendor" | "hostname" | "clientid" | "ip" | "places" | "radio" | "roam" | string;
+  strong?: boolean;
+  /** The values the device's profile knew. */
+  was?: string[];
+  now: string;
+  first: number;
+  last: number;
+}
+
+export interface QSuspectRow extends QDevice {
+  signals: QSignal[];
+  level: "notice" | "alert";
+  first: number;
+  last: number;
+  /** "quarantined": moved back automatically. */
+  action?: string;
+  action_at?: number;
+}
+
+export interface QDetectProbe {
+  enabled: boolean;
+  auto: boolean;
+  /** Approved devices still learning, and when the last one is done. */
+  learning: number;
+  learn_until?: number;
+  profiles: number;
+  suspects: QSuspectRow[];
+  /** What the router can see: fingerprints, leases, neighbours, stations, radius. */
+  sources: string[];
 }
 
 export interface QRadiusStats {

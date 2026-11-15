@@ -30,6 +30,8 @@ func (s *Server) registerQuarantineRoutes() {
 	s.mux.HandleFunc("POST /api/quarantine/resume", s.requireAuth(s.handleQuarantineResume))
 	s.mux.HandleFunc("POST /api/quarantine/wifi", s.requireAuth(s.handleQuarantineWifi))
 	s.mux.HandleFunc("POST /api/quarantine/radius", s.requireAuth(s.handleQuarantineRadius))
+	s.mux.HandleFunc("POST /api/quarantine/detect", s.requireAuth(s.handleQuarantineDetect))
+	s.mux.HandleFunc("POST /api/quarantine/suspect", s.requireAuth(s.handleQuarantineSuspect))
 	s.mux.HandleFunc("GET /api/quarantine/radius/secret", s.requireAuth(s.handleQuarantineRadiusSecret))
 	s.mux.HandleFunc("POST /api/quarantine/radius/secret", s.requireAuth(s.handleQuarantineRadiusNewSecret))
 }
@@ -263,6 +265,33 @@ func (s *Server) handleQuarantineRevoke(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	p, err := modules.QuarantineRevoke(req.MAC, requesterIP(r), req.Force)
+	writeModuleResult(w, p, false, err)
+}
+
+func (s *Server) handleQuarantineDetect(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Enabled bool `json:"enabled"`
+		Auto    bool `json:"auto"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	p, err := modules.QuarantineDetectSet(req.Enabled, req.Auto)
+	writeModuleResult(w, p, false, err)
+}
+
+// handleQuarantineSuspect resolves a copied-MAC report: "same" (it is the
+// same device: learn the new values) or "dismiss". Moving the device back
+// to quarantine is a revoke.
+func (s *Server) handleQuarantineSuspect(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		MAC    string `json:"mac"`
+		Action string `json:"action"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	p, err := modules.QuarantineSuspectResolve(req.MAC, req.Action)
 	writeModuleResult(w, p, false, err)
 }
 

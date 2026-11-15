@@ -174,6 +174,7 @@ const demoQ: { state: QuarantineProbe; you: string } = {
       { name: "wan", networks: ["wan", "wan6"], wan: true, suggested: false, protected: false },
     ],
     wan: ["eth1"], approved: [], pending: [], pause: {}, issues: [],
+    detect: { enabled: false, auto: false, learning: 0, profiles: 0, suspects: [], sources: [] },
     radius: {
       enabled: false, zones: [], port: 1812, addresses: [],
       stats: { listening: false, accepted: 0, rejected: 0, bad_auth: 0, credential: 0, clients: [], ssids: [] },
@@ -994,6 +995,24 @@ export const demoApi: typeof api = {
     return qResult();
   },
   quarantineRevoke: async (mac, _force) => { demoQ.state.approved = demoQ.state.approved.filter((a) => a.mac !== mac); return qResult(); },
+  quarantineDetect: async (enabled, auto) => {
+    const s = demoQ.state;
+    const now = Math.floor(Date.now() / 1000);
+    s.detect = enabled
+      ? {
+        enabled, auto, learning: 0, profiles: s.approved.length, sources: ["fingerprints", "leases", "neighbours", "radius"],
+        suspects: s.detect.enabled ? s.detect.suspects : [{
+          mac: "02:00:00:00:00:31", name: "Living room TV", ip: "192.0.2.31", level: "alert", first: now - 600, last: now - 60,
+          signals: [{ kind: "dhcp", strong: true, now: "1,121,3,6,15,108,114,119,252", was: ["1,3,6,12,15,28,42"], first: now - 600, last: now - 60 }],
+        }, {
+          mac: "02:00:00:00:00:32", name: "Laptop", ip: "192.0.2.32", level: "notice", first: now - 3600, last: now - 3600,
+          signals: [{ kind: "hostname", now: "laptop-new", was: ["laptop"], first: now - 3600, last: now - 3600 }],
+        }],
+      }
+      : { enabled: false, auto: false, learning: 0, profiles: 0, suspects: [], sources: [] };
+    return qResult();
+  },
+  quarantineSuspect: async (mac) => { demoQ.state.detect.suspects = demoQ.state.detect.suspects.filter((x) => x.mac !== mac); return qResult(); },
   quarantineForget: async (mac) => { demoQ.state.pending = demoQ.state.pending.filter((p) => p.mac !== mac); return qResult(); },
   quarantinePause: async (minutes, kind) => { demoQ.state.pause = { until: Math.floor(Date.now() / 1000) + minutes * 60, kind }; return qResult(); },
   quarantineResume: async () => { demoQ.state.pause = {}; return qResult(); },
