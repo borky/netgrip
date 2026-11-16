@@ -1559,6 +1559,15 @@ func QuarantineApprove(items []QApproveItem) (QuarantineProbe, error) {
 		qRecordPair(st, strings.ToLower(strings.TrimSpace(it.MAC)))
 	}
 	err := qChangeLocked(st)
+	var named []string
+	for _, it := range items {
+		if strings.TrimSpace(it.Name) != "" {
+			named = append(named, it.MAC)
+		}
+	}
+	if len(named) > 0 {
+		kickDeviceNames(named...) // the names into DHCP, for devices that have none
+	}
 	return probeQuarantineLocked(), err
 }
 

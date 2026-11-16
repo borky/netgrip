@@ -91,6 +91,7 @@ func main() {
 	modules.StartSelfUpdateScheduler(version)
 	modules.StartParentalScheduler()
 	modules.StartQuarantine()
+	modules.StartDeviceNames()
 	modules.StartQuotaScheduler()
 	modules.StartFleetDiscovery(version, *port)
 	modules.StartPoEWatchdog()
