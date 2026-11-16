@@ -18,6 +18,10 @@ var (
 	serviceEnabledFn = executor.ServiceEnabled
 	probeModeFn      = ProbeMode
 	cableBlockedFn   = cableBlockedSetImpl
+	// isWirelessPortFn: a bridge port backed by a Wi-Fi radio. Besides the
+	// SSIDs' own interfaces that includes hostapd's per-VLAN ones (such as
+	// the quarantine's <ifname>-ngq), whatever they are called.
+	isWirelessPortFn = isWirelessNetdev
 )
 
 // ClientsSeams overrides the device reads on the clients path. Every
@@ -46,6 +50,8 @@ type ClientsSeams struct {
 	ClientMetaPath  string
 	QuotaConfigFile string
 	QuotaStateFile  string
+	// WirelessPort backs the Wi-Fi bridge-port check (default sysfs).
+	WirelessPort func(port string) bool
 }
 
 // SetClientsSeamsForTest applies the non-zero seams for the duration of
@@ -60,7 +66,9 @@ func SetClientsSeamsForTest(t testT, seams ClientsSeams) {
 	oldParental, oldApplied := parentalPath, parentalAppliedPath
 	oldCable, oldMeta := cableBlockedFn, clientMetaPath
 	oldQuotaCfg, oldQuotaState := quotaConfigFile, quotaStateFile
+	oldWireless := isWirelessPortFn
 	t.Cleanup(func() {
+		isWirelessPortFn = oldWireless
 		leasesFilePath, arpFilePath = oldLeases, oldArp
 		bridgeFdbRead, serviceEnabledFn, probeModeFn, cableBlockedFn = oldFdb, oldSvc, oldProbe, oldCable
 		routerLocalNow = oldClock
@@ -68,6 +76,9 @@ func SetClientsSeamsForTest(t testT, seams ClientsSeams) {
 		clientMetaPath = oldMeta
 		quotaConfigFile, quotaStateFile = oldQuotaCfg, oldQuotaState
 	})
+	if seams.WirelessPort != nil {
+		isWirelessPortFn = seams.WirelessPort
+	}
 	if seams.LeaseFile != "" {
 		leasesFilePath = seams.LeaseFile
 	}

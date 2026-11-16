@@ -136,6 +136,8 @@ func qPlainCode(s string, max int, model bool) string {
 type qReport struct {
 	info *probe.QuarantineInfo // nil: the quarantine was never set up
 	path string                // the state file it was built from
+	// names: the names given when approving, by MAC (for the client lists).
+	names map[string]string
 }
 
 // qReportSnap is the latest report: rebuilt from the state in memory each
@@ -145,7 +147,41 @@ var qReportSnap atomic.Pointer[qReport]
 
 // qReportRefresh publishes the report for the state just saved (under qMu).
 func qReportRefresh(st *qState) {
-	qReportSnap.Store(&qReport{info: qReportFrom(st), path: qStatePath})
+	qReportSnap.Store(qReportBuild(st))
+}
+
+func qReportBuild(st *qState) *qReport {
+	r := &qReport{info: qReportFrom(st), path: qStatePath, names: map[string]string{}}
+	for mac, a := range st.Approved {
+		if a.Name != "" {
+			r.names[mac] = a.Name
+		}
+	}
+	return r
+}
+
+// qReportCurrent: the published report, built once from the state on disk
+// when nothing was saved since the start (unless a save publishes a newer
+// one meanwhile).
+func qReportCurrent() *qReport {
+	r := qReportSnap.Load()
+	if r != nil && r.path == qStatePath {
+		return r
+	}
+	fresh := qReportBuild(loadQState())
+	if qReportSnap.CompareAndSwap(r, fresh) {
+		return fresh
+	}
+	if r = qReportSnap.Load(); r == nil || r.path != qStatePath {
+		return fresh
+	}
+	return r
+}
+
+// QuarantineApprovedName is the name given when the device was approved,
+// or "". It never parses the state once it has been read or saved.
+func QuarantineApprovedName(mac string) string {
+	return qReportCurrent().names[strings.ToLower(mac)]
 }
 
 // quarantineReportInfo is the state the agent sends with each full push.
@@ -153,19 +189,7 @@ func qReportRefresh(st *qState) {
 // saved or read since the start, never parses it. nil when the quarantine
 // was never set up.
 func quarantineReportInfo() *probe.QuarantineInfo {
-	r := qReportSnap.Load()
-	if r == nil || r.path != qStatePath {
-		// Nothing saved since the start: build it once from the state on
-		// disk, unless a save published a newer one meanwhile.
-		fresh := &qReport{info: qReportFrom(loadQState()), path: qStatePath}
-		if !qReportSnap.CompareAndSwap(r, fresh) {
-			if r = qReportSnap.Load(); r == nil || r.path != qStatePath {
-				r = fresh
-			}
-		} else {
-			r = fresh
-		}
-	}
+	r := qReportCurrent()
 	if r.info == nil || r.info.PauseUntil == 0 || r.info.PauseUntil > time.Now().Unix() {
 		return r.info
 	}

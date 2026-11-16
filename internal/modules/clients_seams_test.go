@@ -130,3 +130,77 @@ func (f *fakeClientsBackend) WirelessStatus() ([]ubus.WirelessRadio, error) {
 }
 
 func (f *fakeClientsBackend) SystemBoard() (json.RawMessage, error) { return nil, nil }
+
+// A station the quarantine's Wi-Fi layer moved to a per-VLAN interface
+// (learned on a bridge port such as <ifname>-ngq) is one Wi-Fi row, not also
+// a cable one; a device without a hostname takes the name it was approved
+// with; a name set for the client still wins.
+func TestListClientsWifiVlanPortAndApprovedName(t *testing.T) {
+	newQFake(t)
+	qMu.Lock()
+	st := loadQState()
+	st.Approved["02:00:00:00:00:21"] = QApproved{Name: "Printer", Via: "manual"}
+	st.Approved["02:00:00:00:00:22"] = QApproved{Name: "Approved name", Via: "manual"}
+	if err := saveQState(st); err != nil {
+		t.Fatal(err)
+	}
+	qMu.Unlock()
+
+	dir := t.TempDir()
+	leaseFile := filepath.Join(dir, "dhcp.leases")
+	if err := os.WriteFile(leaseFile, []byte("0 02:00:00:00:00:21 192.0.2.21 * 01:02\n0 02:00:00:00:00:22 192.0.2.22 laptop 01:03\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	meta := filepath.Join(dir, "clients.json")
+	if err := os.WriteFile(meta, []byte(`{"02:00:00:00:00:22":{"name":"Desk"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ubus.SetBackendForTest(t, &fakeClientsBackend{radios: []ubus.WirelessRadio{{
+		Name: "radio0", Band: "2g", Up: true,
+		Interfaces: []ubus.WirelessInterface{{
+			Ifname:  "wl0",
+			Clients: []ubus.WirelessClient{{MAC: "02:00:00:00:00:21", Signal: -60}},
+		}},
+	}}})
+	SetUciExecForTest(t, func(args ...string) ([]byte, error) {
+		if len(args) == 2 && args[0] == "show" {
+			return []byte(""), nil
+		}
+		return nil, errors.New("unexpected uci call")
+	})
+	SetGatewaySSHForTest(t, func(string) (string, error) { return "", errors.New("no gateway in test") })
+	InvalidateKey("ucishow|dhcp")
+	InvalidateKey("ucishow|wireless")
+	SetClientsSeamsForTest(t, ClientsSeams{
+		LeaseFile: leaseFile,
+		ArpFile:   filepath.Join(dir, "arp"),
+		BridgeFdb: func() map[string][]string {
+			return map[string][]string{"wl0-vlan": {"02:00:00:00:00:21"}, "eth1": {"02:00:00:00:00:22"}}
+		},
+		WirelessPort:        func(p string) bool { return p == "wl0-vlan" },
+		ServiceEnabled:      func(string) bool { return true },
+		ProbeMode:           func() *ModeProbe { return &ModeProbe{Mode: "router"} },
+		RouterClock:         func() (time.Time, bool) { return time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC), true },
+		ParentalPath:        filepath.Join(dir, "parental.json"),
+		ParentalAppliedPath: filepath.Join(dir, "parental-applied.json"),
+		CableBlocked:        func() map[string]bool { return map[string]bool{} },
+		ClientMetaPath:      meta,
+		QuotaConfigFile:     filepath.Join(dir, "quota.json"),
+		QuotaStateFile:      filepath.Join(dir, "quota-state.json"),
+	})
+
+	clients := ListClients("")
+	if len(clients) != 2 {
+		t.Fatalf("%d rows, want 2: %+v", len(clients), clients)
+	}
+	byMAC := map[string]Client{}
+	for _, c := range clients {
+		byMAC[c.MAC] = c
+	}
+	if c := byMAC["02:00:00:00:00:21"]; c.Type != "wifi24" || c.Name != "Printer" || c.NameSource != "quarantine" {
+		t.Fatalf("the Wi-Fi station: %+v", c)
+	}
+	if c := byMAC["02:00:00:00:00:22"]; c.Type != "cable" || c.Name != "Desk" || c.NameSource != "" {
+		t.Fatalf("the wired client: %+v", c)
+	}
+}

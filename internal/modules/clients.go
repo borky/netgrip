@@ -40,7 +40,8 @@ type Client struct {
 	IPSource        string `json:"ip_source,omitempty"`    // arp | reservation: no DHCP lease to take it from (#212)
 	// NameSource is set when the name does not come from a DHCP lease:
 	// "reservation" = the name pinned in /etc/config/dhcp, which is all a
-	// device with a fixed address of its own ever gets.
+	// device with a fixed address of its own ever gets; "quarantine" = the
+	// name given when the device was approved.
 	NameSource string `json:"name_source,omitempty"`
 	// Data quota (#308): current-period usage vs the configured cap, empty
 	// when the client has no quota.
@@ -83,6 +84,9 @@ func ListClients(requesterIP string) []Client {
 	isAP := probeModeFn().Mode == "ap"
 
 	var clients []Client
+	// The Wi-Fi rows, so a station is never listed again as wired: its
+	// address is also learned on a bridge port (see isWirelessPortFn).
+	onWifi := map[string]bool{}
 
 	radios, _ := ubus.DefaultBackend.WirelessStatus()
 	for _, radio := range radios {
@@ -112,6 +116,7 @@ func ListClients(requesterIP string) []Client {
 				_, c.Reserved = reservations[mac]
 				c.Reservable = c.IP != ""
 				clients = append(clients, c)
+				onWifi[mac] = true
 			}
 		}
 	}
@@ -145,12 +150,12 @@ func ListClients(requesterIP string) []Client {
 		cableBlk := cableBlockedFn()
 		seenWired := map[string]bool{}
 		for _, port := range fdbPorts {
-			if wifiPorts[port] {
+			if wifiPorts[port] || isWirelessPortFn(port) {
 				continue
 			}
 			for _, mac := range fdb[port] {
 				mac = strings.ToLower(mac)
-				if seenWired[mac] {
+				if seenWired[mac] || onWifi[mac] {
 					continue
 				}
 				seenWired[mac] = true
@@ -168,9 +173,15 @@ func ListClients(requesterIP string) []Client {
 	meta := clientMeta()
 	quotaUsage := QuotaUsageForClients()
 	for i, c := range clients {
+		// A name given when approving the device in the quarantine comes
+		// before what the device calls itself (or nothing, as many send);
+		// a name set here, in the clients' own metadata, comes first.
+		if n := QuarantineApprovedName(c.MAC); n != "" {
+			clients[i].Name, clients[i].NameSource = n, "quarantine"
+		}
 		if m, ok := meta[strings.ToLower(c.MAC)]; ok {
 			if m.Name != "" {
-				clients[i].Name = m.Name
+				clients[i].Name, clients[i].NameSource = m.Name, ""
 			}
 			clients[i].DeviceType = m.DeviceType
 		}
