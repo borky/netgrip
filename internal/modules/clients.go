@@ -113,7 +113,7 @@ func ListClients(requesterIP string) []Client {
 					}
 				}
 				fillIdentity(&c, mac, requesterIP, leaseSource, byMac, arp, reservations)
-				_, c.Reserved = reservations[mac]
+				c.Reserved = reservations[mac].IP != "" // a name-only entry is not a reservation
 				c.Reservable = c.IP != ""
 				clients = append(clients, c)
 				onWifi[mac] = true
@@ -161,7 +161,7 @@ func ListClients(requesterIP string) []Client {
 				seenWired[mac] = true
 				c := Client{MAC: mac, Type: "cable", Iface: port, Blocked: len(denied[mac]) > 0 || cableBlk[mac]}
 				fillIdentity(&c, mac, requesterIP, leaseSource, byMac, arp, reservations)
-				_, c.Reserved = reservations[mac]
+				c.Reserved = reservations[mac].IP != "" // a name-only entry is not a reservation
 				c.Reservable = c.IP != ""
 				c.Blockable = firewallOn
 				clients = append(clients, c)
@@ -582,19 +582,7 @@ func SetClientReservation(mac, ip string, reserved bool) (*[]Client, bool, error
 		_ = executor.Restore("dhcp", snap)
 		_ = executor.Run(executor.Op{Kind: "initd", Args: []string{"dnsmasq", "reload"}})
 	}
-	section := "netgrip_host_" + strings.ReplaceAll(mac, ":", "")
-	var ops []executor.Op
-	if reserved {
-		ops = append(ops,
-			executor.Op{Kind: "uci_set", Args: []string{"dhcp." + section, "host"}},
-			executor.Op{Kind: "uci_set", Args: []string{"dhcp." + section + ".mac", mac}},
-			executor.Op{Kind: "uci_set", Args: []string{"dhcp." + section + ".ip", ip}},
-		)
-	} else {
-		if uciSectionExists("dhcp." + section) {
-			ops = append(ops, executor.Op{Kind: "uci_delete", Args: []string{"dhcp." + section}})
-		}
-	}
+	ops := reservationOps(mac, ip, reserved, uciGetLocal)
 	ops = append(ops,
 		executor.Op{Kind: "uci_commit", Args: []string{"dhcp"}},
 		executor.Op{Kind: "initd", Args: []string{"dnsmasq", "reload"}},
@@ -613,17 +601,13 @@ func setGatewayClientReservation(mac, ip string, reserved bool) (*[]Client, bool
 	if err := gatewaySSHExec("/etc/init.d/dnsmasq running"); err != nil {
 		return nil, false, fmt.Errorf("DHCP reservations on the gateway need a running dnsmasq")
 	}
-	section := "netgrip_host_" + strings.ReplaceAll(mac, ":", "")
-	var commands []string
-	if reserved {
-		commands = append(commands,
-			"uci set dhcp."+section+"=host",
-			"uci set dhcp."+section+".mac="+mac,
-			"uci set dhcp."+section+".ip="+ip,
-		)
-	} else {
-		commands = append(commands, "uci delete dhcp."+section+" 2>/dev/null || true")
+	// The same rules as on a gateway of its own (reservationOps), read
+	// over SSH: the gateway's NetGrip may have named the device already.
+	gwGet := func(key string) (string, bool) {
+		out, err := gatewaySSH("uci -q get " + key)
+		return strings.TrimSpace(out), err == nil
 	}
+	commands := uciShellCommands(reservationOps(mac, ip, reserved, gwGet))
 	commands = append(commands,
 		"uci commit dhcp",
 		"/etc/init.d/dnsmasq reload",
@@ -882,4 +866,66 @@ func radiosForSections(sections []string) []string {
 		}
 	}
 	return radios
+}
+
+// reservationOps: the DHCP changes that reserve ip for mac, or remove its
+// reservation. get reads a uci key (ok false when it does not exist). One
+// NetGrip entry per device: a device NetGrip named in DHCP already has one
+// (netgrip_devname_<mac>, see devnames.go), used only while it still holds
+// that MAC, and a second dhcp-host line for the same MAC would make dnsmasq
+// drop one of them. Removing a reservation from a named entry keeps the
+// name. Pure apart from get.
+func reservationOps(mac, ip string, reserved bool, get func(key string) (string, bool)) []executor.Op {
+	exists := func(key string) bool { _, ok := get(key); return ok }
+	hex := strings.ReplaceAll(mac, ":", "")
+	section := devReservePfx + hex
+	if !exists("dhcp."+section) && exists("dhcp."+devNamePfx+hex) {
+		macs, _ := get("dhcp." + devNamePfx + hex + ".mac")
+		for _, m := range strings.Fields(strings.ToLower(macs)) {
+			if m == mac {
+				section = devNamePfx + hex
+			}
+		}
+	}
+	var ops []executor.Op
+	if reserved {
+		if !exists("dhcp." + section) {
+			ops = append(ops,
+				executor.Op{Kind: "uci_set", Args: []string{"dhcp." + section, "host"}},
+				executor.Op{Kind: "uci_set", Args: []string{"dhcp." + section + ".mac", mac}},
+			)
+		}
+		return append(ops, executor.Op{Kind: "uci_set", Args: []string{"dhcp." + section + ".ip", ip}})
+	}
+	switch {
+	case !exists("dhcp." + section):
+	case exists("dhcp." + section + ".name"):
+		if exists("dhcp." + section + ".ip") {
+			ops = append(ops, executor.Op{Kind: "uci_delete", Args: []string{"dhcp." + section + ".ip"}})
+		}
+	default:
+		ops = append(ops, executor.Op{Kind: "uci_delete", Args: []string{"dhcp." + section}})
+	}
+	return ops
+}
+
+// uciGetLocal reads a uci key on this router.
+func uciGetLocal(key string) (string, bool) {
+	out, err := uciExec("-q", "get", key)
+	return strings.TrimSpace(string(out)), err == nil
+}
+
+// uciShellCommands writes ops as uci commands for a shell. Their values are
+// a validated MAC, IPv4 address, section names made of them, and "host".
+func uciShellCommands(ops []executor.Op) []string {
+	var out []string
+	for _, op := range ops {
+		switch op.Kind {
+		case "uci_set":
+			out = append(out, "uci set "+op.Args[0]+"="+op.Args[1])
+		case "uci_delete":
+			out = append(out, "uci delete "+op.Args[0])
+		}
+	}
+	return out
 }

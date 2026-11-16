@@ -136,8 +136,11 @@ func qPlainCode(s string, max int, model bool) string {
 type qReport struct {
 	info *probe.QuarantineInfo // nil: the quarantine was never set up
 	path string                // the state file it was built from
-	// names: the names given when approving, by MAC (for the client lists).
+	// names: the names given when approving, by MAC (for the client lists);
+	// typed: those the user typed (a manual approval), not ones filled in
+	// when the quarantine was set up (see devNamesWanted).
 	names map[string]string
+	typed map[string]bool
 }
 
 // qReportSnap is the latest report: rebuilt from the state in memory each
@@ -151,10 +154,11 @@ func qReportRefresh(st *qState) {
 }
 
 func qReportBuild(st *qState) *qReport {
-	r := &qReport{info: qReportFrom(st), path: qStatePath, names: map[string]string{}}
+	r := &qReport{info: qReportFrom(st), path: qStatePath, names: map[string]string{}, typed: map[string]bool{}}
 	for mac, a := range st.Approved {
-		if a.Name != "" {
+		if a.Name != "" && !looksLikeMAC(a.Name) {
 			r.names[mac] = a.Name
+			r.typed[mac] = a.Via == "manual"
 		}
 	}
 	return r
@@ -242,4 +246,20 @@ func qReportFrom(st *qState) *probe.QuarantineInfo {
 	}
 	sort.Slice(info.Devices, func(i, j int) bool { return info.Devices[i].MAC < info.Devices[j].MAC })
 	return info
+}
+
+// looksLikeMAC: a name that is only an address (twelve hex digits with or
+// without separators), which some approvals carry as their name.
+func looksLikeMAC(s string) bool {
+	hex := 0
+	for _, r := range strings.ToLower(strings.TrimSpace(s)) {
+		switch {
+		case r >= '0' && r <= '9' || r >= 'a' && r <= 'f':
+			hex++
+		case r == ':' || r == '-' || r == '.':
+		default:
+			return false
+		}
+	}
+	return hex == 12
 }

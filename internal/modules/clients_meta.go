@@ -85,6 +85,9 @@ func SetClientMeta(mac, name, deviceType string) (clientMetaPayload, error) {
 	if err := writeClientMeta(data); err != nil {
 		return clientMetaPayload{}, err
 	}
+	if name != "" {
+		kickDeviceNames(mac) // the name into DHCP, if the device has none
+	}
 	return clientMetaPayload{Meta: data}, nil
 }
 
