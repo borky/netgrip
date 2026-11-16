@@ -311,7 +311,7 @@ func clientTypeFor(mac string) string {
 		}
 	}
 	for port, macs := range bridgeFdb() {
-		if wifiPorts[port] {
+		if wifiPorts[port] || isWirelessPortFn(port) {
 			continue
 		}
 		for _, m := range macs {
