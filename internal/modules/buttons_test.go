@@ -867,8 +867,8 @@ func TestBtnQuarantineRequests(t *testing.T) {
 	want := []string{
 		"paused 60|ok|Button wps pressed twice: quarantine paused for 60 min",
 		"resumed|ok|Button wps pressed twice: quarantine resumed",
-		"-|failed: pressed while NetGrip was not running|Button wps pressed twice: pausing or resuming the quarantine failed (failed: pressed while NetGrip was not running)",
-		"-|failed: the quarantine is off|Button wps held 3 s: pausing or resuming the quarantine failed (failed: the quarantine is off)",
+		"-|failed: pressed while NetGrip was not running|Button wps pressed twice: pausing or resuming the quarantine failed (pressed while NetGrip was not running)",
+		"-|failed: the quarantine is off|Button wps held 3 s: pausing or resuming the quarantine failed (the quarantine is off)",
 	}
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("events:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
@@ -890,5 +890,63 @@ func TestValidateQuarantinePause(t *testing.T) {
 		if err := validateButtons(&bad, none); err == nil {
 			t.Errorf("a pause of %d minutes was accepted", m)
 		}
+	}
+}
+
+func TestBtnStateDirAndRequestFilesAreChecked(t *testing.T) {
+	root, _ := btnTestRouter(t)
+	// A directory others can write is recreated (empty, 0755).
+	btnWriteT(t, filepath.Join(btnStateDir, "request.x"), "quarantine_pause 60 wps press1 1\n")
+	if err := os.Chmod(btnStateDir, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if !btnStateDirSafe() {
+		t.Fatal("not recreated")
+	}
+	if st, _ := os.Lstat(btnStateDir); st.Mode().Perm() != 0o755 || btnExists(filepath.Join(btnStateDir, "request.x")) {
+		t.Fatalf("recreated wrong: %v", st.Mode())
+	}
+	// A link in its place is replaced, the target left alone.
+	target := filepath.Join(root, "elsewhere")
+	btnWriteT(t, filepath.Join(target, "keep"), "x")
+	os.RemoveAll(btnStateDir)
+	if err := os.Symlink(target, btnStateDir); err != nil {
+		t.Fatal(err)
+	}
+	if !btnStateDirSafe() {
+		t.Fatal("link not replaced")
+	}
+	if st, _ := os.Lstat(btnStateDir); st.Mode()&os.ModeSymlink != 0 || !btnExists(filepath.Join(target, "keep")) {
+		t.Fatal("link handling wrong")
+	}
+	// Request files: links, pipes and big files are refused.
+	real := filepath.Join(root, "real")
+	btnWriteT(t, real, "quarantine_pause 60 wps press1 1\n")
+	os.Symlink(real, filepath.Join(btnStateDir, "request.link"))
+	if _, err := btnReadOwned(filepath.Join(btnStateDir, "request.link"), 256); err == nil {
+		t.Error("a link was read")
+	}
+	fifo := filepath.Join(btnStateDir, "request.fifo")
+	if err := exec.Command("mkfifo", fifo).Run(); err == nil {
+		if _, err := btnReadOwned(fifo, 256); err == nil {
+			t.Error("a pipe was read")
+		}
+	}
+	btnWriteT(t, filepath.Join(btnStateDir, "request.big"), strings.Repeat("x", 300))
+	if _, err := btnReadOwned(filepath.Join(btnStateDir, "request.big"), 256); err == nil {
+		t.Error("a big file was read")
+	}
+	if data, err := btnReadOwned(real, 256); err != nil || !strings.HasPrefix(string(data), "quarantine_pause") {
+		t.Errorf("a plain request was refused: %v", err)
+	}
+}
+
+func TestBtnAppendEventTrims(t *testing.T) {
+	_, _ = btnTestRouter(t)
+	for i := 0; i < 105; i++ {
+		btnAppendEvent("wps", "press1", "quarantine_pause", "resumed", "ok")
+	}
+	if n := len(btnReadEvents()); n < 50 || n > 100 {
+		t.Fatalf("%d lines kept", n)
 	}
 }

@@ -1690,6 +1690,33 @@ func QuarantinePause(minutes int, kind string) (QuarantineProbe, error) {
 	return probeQuarantineLocked(), err
 }
 
+// QuarantineTogglePause is a router button's pause: it resumes when a
+// pause runs (of either kind), else pauses with nothing enforced for
+// minutes. Decided under the lock, so a pause ending meanwhile cannot make
+// it do the opposite. It says what it did: "resumed" or "paused <minutes>".
+func QuarantineTogglePause(minutes int) (string, error) {
+	qMu.Lock()
+	st := loadQState()
+	if !st.Enabled {
+		qMu.Unlock()
+		return "", errors.New("the quarantine is off")
+	}
+	if st.Pause.active(time.Now()) {
+		qEndPauseLocked(st)
+		err := qChangeLocked(st)
+		qMu.Unlock()
+		return "resumed", err
+	}
+	qMu.Unlock()
+	// QuarantinePause takes the lock itself; between the two a pause may
+	// have started from the panel, which this one then replaces (the same
+	// as pausing from the panel twice).
+	if _, err := QuarantinePause(minutes, "off"); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("paused %d", minutes), nil
+}
+
 // QuarantineResume ends a pause now. The panel user's device is approved
 // first: during a pause it may have joined without being approved.
 func QuarantineResume(requesterIP string) (QuarantineProbe, error) {

@@ -20,7 +20,7 @@ for s in firewall dropbear netgrip; do
 done
 chmod 755 $R/bin/* $R/initd/*
 if [ "${MODE:-}" = minimal ]; then
-	for a in mkdir rm cat cp mv chmod ls sleep date wc tail sed grep awk readlink ps cut; do ln -s /bin/busybox $R/bin/$a; done
+	for a in mkdir rm cat cp mv chmod ls sleep date wc tail sed grep awk readlink ps cut id; do ln -s /bin/busybox $R/bin/$a; done
 	ln -s /sbin/uci $R/bin/uci
 	export PATH=$R/bin
 else
@@ -87,14 +87,17 @@ sleep $((M + 2)); ok K3 '[ "$(dis)" = 0 ]'
 ok K4 '[ ! -f $R/etc/timed/wl1 ]'
 echo "== L quarantine pause: a request for NetGrip (the sandbox's own state dir: the real NetGrip never sees it)"
 printf 'reset press 1 quarantine_pause - 45\n' > $R/etc/actions; rm -f $R/state/quiet.reset
+echo /usr/sbin/netgrip > $R/etc/daemon   # the real NetGrip runs there
 press reset 5; sleep 1
 ok L 'ls $R/state/request.* >/dev/null 2>&1 && grep -q "^quarantine_pause 45 reset press1 [0-9]*$" $R/state/request.*'
 ok L2 '! ls $R/state/.request.* >/dev/null 2>&1'
 rm -f $R/state/request.*
-printf '#!/bin/sh\nexit 1\n' > $R/bin/pidof; chmod 755 $R/bin/pidof
+echo /nonexistent/netgrip > $R/etc/daemon   # NetGrip "not running"
 sleep 2; press reset 5; sleep 1
 ok L3 '! ls $R/state/request.* >/dev/null 2>&1 && grep -q "	quarantine_pause	-	failed: NetGrip is not running" $R/state/events'
-rm -f $R/bin/pidof
+echo "== M a state directory someone else could write is recreated"
+chmod 777 $R/state; BUTTON=reset ACTION=released SEEN=0 $R/runner seen
+ok M 'ls -ldn $R/state | grep -q "^drwxr-xr-x"'
 echo "== G uninstall"
 printf '#!/bin/sh\n# netgrip-managed-button\n' > $R/rc/reset; mkdir -p $R/hook; echo x > $R/hook/00-netgrip
 $R/runner uninstall

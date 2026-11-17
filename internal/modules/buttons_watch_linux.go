@@ -3,9 +3,12 @@
 package modules
 
 import (
+	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 	"unsafe"
 
@@ -19,14 +22,17 @@ func btnWatch() {
 	for {
 		if err := btnWatchRun(); err != nil {
 			log.Printf("netgrip: buttons watch: %v", err)
+			time.Sleep(time.Minute)
+			continue
 		}
-		time.Sleep(time.Minute)
+		// The directory went away (/tmp cleaned): watch the new one now.
+		time.Sleep(time.Second)
 	}
 }
 
 func btnWatchRun() error {
-	if err := os.MkdirAll(btnStateDir, 0o755); err != nil {
-		return err
+	if !btnStateDirSafe() {
+		return fmt.Errorf("%s is not a safe directory", btnStateDir)
 	}
 	fd, err := unix.InotifyInit1(unix.IN_CLOEXEC)
 	if err != nil {
@@ -92,7 +98,7 @@ func btnWatchRun() error {
 // btnLockEvents takes the runner's lock on its event log (flock, as the
 // runner uses where it has flock).
 func btnLockEvents() func() {
-	f, err := os.OpenFile(btnStateDir+"/events.lock", os.O_WRONLY|os.O_CREATE, 0o644)
+	f, err := os.OpenFile(btnStateDir+"/events.lock", os.O_WRONLY|os.O_CREATE|syscall.O_NOFOLLOW, 0o644)
 	if err != nil {
 		return func() {}
 	}
@@ -101,4 +107,64 @@ func btnLockEvents() func() {
 		_ = unix.Flock(int(f.Fd()), unix.LOCK_UN)
 		f.Close()
 	}
+}
+
+// btnNoFollow: opens never follow a link planted in the state directory.
+const btnNoFollow = syscall.O_NOFOLLOW
+
+// btnStateDirSafe makes sure the runner's state directory (in /tmp) is a
+// real directory owned by this process's user and writable by nobody else,
+// creating it if missing and recreating it otherwise: someone else's
+// directory could feed NetGrip requests (pause the quarantine) or point
+// its writes elsewhere with links.
+func btnStateDirSafe() bool {
+	ok := func() bool {
+		st, err := os.Lstat(btnStateDir)
+		if err != nil {
+			return false
+		}
+		sys, isSys := st.Sys().(*syscall.Stat_t)
+		return st.IsDir() && st.Mode()&os.ModeSymlink == 0 && st.Mode().Perm()&0o022 == 0 &&
+			isSys && int(sys.Uid) == os.Geteuid()
+	}
+	if ok() {
+		return true
+	}
+	if _, err := os.Lstat(btnStateDir); err == nil {
+		log.Printf("netgrip: buttons: %s is not NetGrip's own directory; recreating it", btnStateDir)
+		// RemoveAll removes a link itself, not what it points to.
+		if err := os.RemoveAll(btnStateDir); err != nil {
+			return false
+		}
+	}
+	_ = os.MkdirAll(filepath.Dir(btnStateDir), 0o755) // /tmp on a router
+	if err := os.Mkdir(btnStateDir, 0o755); err != nil && !os.IsExist(err) {
+		return false
+	}
+	_ = os.Chmod(btnStateDir, 0o755)
+	return ok()
+}
+
+// btnReadOwned reads a small regular file this process's user owns,
+// without following a link or blocking on a pipe.
+func btnReadOwned(path string, max int64) ([]byte, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	sys, isSys := st.Sys().(*syscall.Stat_t)
+	if !st.Mode().IsRegular() || !isSys || int(sys.Uid) != os.Geteuid() || st.Size() > max {
+		return nil, fmt.Errorf("%s is not a request file", filepath.Base(path))
+	}
+	buf := make([]byte, st.Size())
+	n, err := f.Read(buf)
+	if err != nil && n == 0 && st.Size() > 0 {
+		return nil, err
+	}
+	return buf[:n], nil
 }
