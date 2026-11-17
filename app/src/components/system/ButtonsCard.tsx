@@ -12,6 +12,11 @@ const HOLDS = [2, 3, 4, 5, 7, 10, 15, 20, 30];
 const DURATIONS = [0, 5, 15, 30, 60, 120, 240, 480];
 const ACTIONS: ButtonActionKind[] = ["wifi_toggle", "wifi_on", "firewall_restart", "access_restart"];
 
+/** A saved action's identity: one action per button and press. */
+function actionKey(a: ButtonAction): string {
+  return `${a.button}|${a.trigger}|${a.count ?? a.seconds ?? 0}`;
+}
+
 /** Actions that switch a Wi-Fi network (they take a network and a time). */
 function isWifi(k: string): boolean {
   return k === "wifi_toggle" || k === "wifi_on";
@@ -106,8 +111,9 @@ export function ButtonsCard({ index = 0 }: { index?: number }) {
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<{ tone: "ok" | "danger"; text: string }>();
   const [adding, setAdding] = useState<string>();
-  // The saved action being edited (its form opens under its row).
-  const [editing, setEditing] = useState<ButtonAction>();
+  // The saved action being edited, by its key (button and press), so a
+  // reload of the card keeps the form open.
+  const [editing, setEditing] = useState<string>();
   // The last press the router had reported when listening started: a
   // different one is the new press. Router times only (the browser's clock
   // may differ). undefined: not listening.
@@ -242,8 +248,8 @@ export function ButtonsCard({ index = 0 }: { index?: number }) {
                           <span className="text-caption text-muted min-w-0 flex-1 truncate">{actionLabel(t, a, ssid)}</span>
                           {net && <NetworkState net={net} />}
                           {p.available && (
-                            <button type="button" disabled={busy} onClick={() => { setAdding(undefined); setEditing(editing === a ? undefined : a); }}
-                              aria-label={t("buttons.edit")} aria-expanded={editing === a}
+                            <button type="button" disabled={busy} onClick={() => { setAdding(undefined); setEditing(editing === actionKey(a) ? undefined : actionKey(a)); }}
+                              aria-label={t("buttons.edit")} aria-expanded={editing === actionKey(a)}
                               className="text-muted hover:text-text ring-focus rounded-sm p-1">
                               <Pencil className="h-3.5 w-3.5" />
                             </button>
@@ -253,7 +259,7 @@ export function ButtonsCard({ index = 0 }: { index?: number }) {
                             <Trash2 className="h-3.5 w-3.5" />
                           </button>
                         </div>
-                        {editing === a && (
+                        {editing === actionKey(a) && (
                           <AddAction button={b} networks={p.networks} taken={mine.filter((x) => x !== a)} busy={busy} hasWifi={hasWifi}
                             initial={a}
                             onCancel={() => setEditing(undefined)}
@@ -370,14 +376,14 @@ function AddAction({ button, networks, taken, busy, hasWifi, initial, onAdd, onC
   const [count, setCount] = useState(initial?.count ?? freePress[0] ?? 1);
   const [seconds, setSeconds] = useState(initial?.seconds ?? freeHold[0] ?? 2);
   const [action, setAction] = useState<ButtonActionKind>(initial?.action ?? (hasWifi ? "wifi_toggle" : "firewall_restart"));
-  const [iface, setIface] = useState(initial?.iface ?? networks[0]?.section ?? "");
+  // A network that no longer exists falls back to the first one.
+  const [iface, setIface] = useState(
+    initial?.iface && networks.some((n) => n.section === initial.iface) ? initial.iface : networks[0]?.section ?? "");
   const [minutes, setMinutes] = useState(initial && isWifi(initial.action) ? initial.minutes ?? 0 : 30);
-  // An edited action may already use a Wi-Fi action on a router that
-  // lost the wifi command: it can keep it, not pick it anew.
-  const wifiOK = hasWifi || (initial !== undefined && isWifi(initial.action));
-
+  // Without the wifi command no Wi-Fi action can be saved (the router
+  // keeps one saved before as it is, but it cannot be changed).
   const can = (trigger === "press" ? freePress.includes(count) : freeHold.includes(seconds))
-    && (!isWifi(action) || iface !== "");
+    && (!isWifi(action) || (iface !== "" && hasWifi));
 
   const submit = () => {
     const a: ButtonAction = { button: button.name, trigger, action };
@@ -410,7 +416,7 @@ function AddAction({ button, networks, taken, busy, hasWifi, initial, onAdd, onC
         <Field label={t("buttons.action")}>
           <select className={SELECT} value={action} onChange={(e) => setAction(e.target.value as ButtonActionKind)}>
             {ACTIONS.map((k) => (
-              <option key={k} value={k} disabled={isWifi(k) && !wifiOK}>{t(`buttons.kind.${k}`)}</option>
+              <option key={k} value={k} disabled={isWifi(k) && !hasWifi}>{t(`buttons.kind.${k}`)}</option>
             ))}
           </select>
         </Field>
@@ -441,6 +447,7 @@ function AddAction({ button, networks, taken, busy, hasWifi, initial, onAdd, onC
           </>
         )}
       </div>
+      {isWifi(action) && !hasWifi && <p className="text-caption text-warn">{t("buttons.missing.wifi", { name: "wifi" })}</p>}
       {action === "access_restart" && <p className="text-caption text-muted">{t("buttons.accessHint")}</p>}
       {action === "firewall_restart" && <p className="text-caption text-muted">{t("buttons.firewallHint")}</p>}
       <div className="flex gap-2">

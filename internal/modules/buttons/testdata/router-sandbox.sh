@@ -9,7 +9,7 @@
 # keeps only basic busybox applets on the PATH.
 R=/tmp/ngbtest
 rm -rf $R; mkdir -p $R/bin $R/etc/orig $R/initd $R/state $R/config $R/rc $R/rom $R/w.d
-REAL_MD5=$(/bin/busybox md5sum /etc/config/wireless | /bin/busybox cut -d' ' -f1); REAL_UCI=$(/bin/busybox ls -la --full-time /tmp/.uci | /bin/busybox md5sum)
+REAL_MD5=$(/bin/busybox md5sum /etc/config/wireless | /bin/busybox cut -d' ' -f1); REAL_UCI=$(/bin/busybox ls -l --full-time /tmp/.uci/ | /bin/busybox md5sum)
 cp /tmp/ngbtest-runner.sh $R/runner; chmod 755 $R/runner
 export NGB_STATE=$R/state NGB_ETC=$R/etc NGB_SELF=$R/runner NGB_LEDS=$R/leds NGB_INITD=$R/initd NGB_MINUTE=${NGB_MINUTE:-4}
 export NGB_CONFIG=$R/config NGB_RCDIR=$R/rc NGB_ROMRC=$R/rom NGB_HOOK=$R/hook/00-netgrip
@@ -78,11 +78,18 @@ u set wireless.wl1.disabled=0; u commit wireless
 sleep 2; press reset 5; sleep $((M + 2)); ok J5 '[ "$(dis)" = 1 ]'
 ok J6 'grep -q "	wifi_on	" $R/state/events'
 ok J7 '[ ! -f $R/etc/timed/wl1 ] && ! ls $R/state/hold/wl1 >/dev/null 2>&1'
+echo "== K switch on during a timed toggle: the toggle's original state comes back"
+printf 'reset press 1 wifi_toggle wl1 3\nreset hold 2 wifi_on wl1 1\n' > $R/etc/actions; rm -f $R/state/quiet.reset
+u set wireless.wl1.disabled=0; u commit wireless
+press reset 5; sleep 2; ok K '[ "$(dis)" = 1 ]'
+ev reset released 2 5 >/dev/null; sleep 1; ok K2 '[ "$(dis)" = 0 ]'
+sleep $((M + 2)); ok K3 '[ "$(dis)" = 0 ]'
+ok K4 '[ ! -f $R/etc/timed/wl1 ]'
 echo "== G uninstall"
 printf '#!/bin/sh\n# netgrip-managed-button\n' > $R/rc/reset; mkdir -p $R/hook; echo x > $R/hook/00-netgrip
 $R/runner uninstall
 ok G 'grep -q ORIG $R/rc/reset && [ ! -f $R/runner ] && [ ! -d $R/etc ] && [ ! -f $R/hook/00-netgrip ]'
 echo "== H real config and pending changes untouched"
 ok H '[ "$(/bin/busybox md5sum /etc/config/wireless | /bin/busybox cut -d" " -f1)" = "$REAL_MD5" ]'
-ok H2 '[ "$(/bin/busybox ls -la --full-time /tmp/.uci | /bin/busybox md5sum)" = "$REAL_UCI" ]'
+ok H2 '[ "$(/bin/busybox ls -l --full-time /tmp/.uci/ | /bin/busybox md5sum)" = "$REAL_UCI" ]'
 cd /; rm -rf $R /tmp/ngbtest-runner.sh /tmp/ngbtest-harness.sh
