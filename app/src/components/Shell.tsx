@@ -360,12 +360,15 @@ function ShellInner({ onLogout }: { onLogout: () => void }) {
   );
 
   // Bottom bar móvil §7.4: los 3-4 destinos más usados del modo actual + Menú.
+  // The last slot is Diagnostics: the Tools page it used to open was merged
+  // into it (#503), and a page outside NAV_GROUPS falls back to the current
+  // one, so the button did nothing.
   const bottomItems: Page[] = (
     isSwitch
-      ? (["overview", "ports", "tools"] as Page[])
+      ? (["overview", "ports", "diagnostics"] as Page[])
       : !isRouter
-        ? (["overview", "wifi", "ports", "tools"] as Page[])
-        : (["overview", "wifi", "traffic", "tools"] as Page[])
+        ? (["overview", "wifi", "ports", "diagnostics"] as Page[])
+        : (["overview", "wifi", "traffic", "diagnostics"] as Page[])
   ).filter(visible);
 
   const demo = isDemo();
