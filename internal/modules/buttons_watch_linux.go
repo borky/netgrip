@@ -66,7 +66,8 @@ func btnWatchRun() error {
 			if ev.Mask&(unix.IN_DELETE_SELF|unix.IN_MOVE_SELF|unix.IN_IGNORED) != 0 {
 				gone = true
 			}
-			if name == "events" {
+			// An overflow lost events: read the log anyway.
+			if name == "events" || ev.Mask&unix.IN_Q_OVERFLOW != 0 {
 				relevant = true
 			}
 			off += unix.SizeofInotifyEvent + nameLen

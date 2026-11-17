@@ -26,15 +26,24 @@ SELF=${NGB_SELF:-/usr/libexec/netgrip-button}
 LEDS=${NGB_LEDS:-/sys/class/leds}
 INITD=${NGB_INITD:-/etc/init.d}
 RCDIR=${NGB_RCDIR:-/etc/rc.button}
+ROMRC=${NGB_ROMRC:-/rom/etc/rc.button}
 HOOK=${NGB_HOOK:-/etc/hotplug.d/button/00-netgrip}
+CONFIG=${NGB_CONFIG:-/etc/config}
 # Seconds between the releases of a double or triple press. Whole seconds:
 # busybox sleep may not take fractions.
 WINDOW=1
 # Holds start at this many seconds; anything shorter is a press.
 HOLD_MIN=2
+# A hold runs its action only up to this many seconds past its time: a much
+# longer hold is meant for the original script (on a reset button whose
+# factory reset this script cannot recognise, for one).
+HOLD_SLACK=2
 # Seconds in a minute (tests shorten it).
 MINUTE=${NGB_MINUTE:-60}
 
+# Nothing it writes is for other users (the wireless copy holds Wi-Fi
+# passwords); files that must keep a mode set it themselves.
+umask 077
 mkdir -p "$STATE" 2>/dev/null
 
 now_cs() {
@@ -50,32 +59,54 @@ log() {
 	logger -t netgrip-button "$*" 2>/dev/null
 }
 
+# Locks. flock is released when the process ends, whatever happens;
+# busybox's lock applet (the fallback) is not, so it is only used where
+# flock is missing. Each lock has its own descriptor, so they can nest.
+if command -v flock >/dev/null 2>&1; then
+	HAVE_FLOCK=1
+else
+	HAVE_FLOCK=
+fi
+# take <name> <fd>, drop <name> <fd>, try_take <name> <fd>
+take() {
+	if [ -n "$HAVE_FLOCK" ]; then
+		eval "exec $2>\"\$STATE/$1.lock\""
+		flock "$2"
+	else
+		lock "$STATE/$1.lock"
+	fi
+}
+try_take() {
+	if [ -n "$HAVE_FLOCK" ]; then
+		eval "exec $2>\"\$STATE/$1.lock\""
+		flock -n "$2"
+	else
+		lock -n "$STATE/$1.lock"
+	fi
+}
+drop() {
+	if [ -n "$HAVE_FLOCK" ]; then
+		eval "exec $2>&-"
+	else
+		lock -u "$STATE/$1.lock"
+	fi
+}
+
 # event <button> <pattern> <action> <detail> <result>: one line per action
-# for the panel and its notifications; the oldest lines are dropped.
+# for the panel and its notifications; the oldest lines are dropped. Under
+# its own lock: the id (uptime) must grow line by line, and the trim must
+# not lose a line another action appends meanwhile.
 event() {
-	printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(now_cs)" "$(date +%s)" "$1" "$2" "$3" "$4" "$5" >> "$STATE/events"
 	local n
+	take events 6
+	printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(now_cs)" "$(date +%s)" "$1" "$2" "$3" "$4" "$5" >> "$STATE/events"
 	n=$(wc -l < "$STATE/events")
 	if [ "$n" -gt 100 ]; then
 		tail -n 50 "$STATE/events" > "$STATE/events.tmp" && mv "$STATE/events.tmp" "$STATE/events"
 	fi
+	drop events 6
 	log "$1 $2: $3 $4 $5"
 }
-
-# take/drop <name>: one lock at a time per process. flock is released when
-# the process ends, whatever happens; busybox's lock applet (the fallback)
-# is not, so it is only used where flock is missing.
-if command -v flock >/dev/null 2>&1; then
-	take() { eval "exec 8>\"\$STATE/$1.lock\""; flock 8; }
-	drop() { flock -u 8; exec 8>&-; }
-	try_take() { eval "exec 7>\"\$STATE/$1.lock\""; flock -n 7; }
-	try_drop() { exec 7>&-; }
-else
-	take() { lock "$STATE/$1.lock"; }
-	drop() { lock -u "$STATE/$1.lock"; }
-	try_take() { lock -n "$STATE/$1.lock"; }
-	try_drop() { lock -u "$STATE/$1.lock"; }
-fi
 
 # spawn: run this script again, detached from procd's button handler, which
 # waits for the wrapper and handles the next press only after it.
@@ -89,7 +120,7 @@ spawn() {
 
 record_seen() {
 	[ -n "$BUTTON" ] || return 0
-	: > "$STATE/seen.$BUTTON"
+	echo "${TYPE:--}" > "$STATE/seen.$BUTTON"
 	printf '%s %s %s %s %s\n' "$(date +%s)" "$BUTTON" "${ACTION:--}" "${SEEN:-0}" "${TYPE:--}" > "$STATE/last.tmp" &&
 		mv "$STATE/last.tmp" "$STATE/last"
 }
@@ -113,14 +144,28 @@ press_line() {
 	actions_for "$1" | awk -v n="$2" '$2 == "press" && $3 == n { print; exit }'
 }
 
-# The hold with the longest time not longer than the one held.
+# The hold with the longest time not longer than the one held, if the
+# button was not held much longer than that.
 hold_line() {
-	actions_for "$1" | awk -v s="$2" '$2 == "hold" && $3 <= s && $3 > best { best = $3; line = $0 } END { if (line != "") print line }'
+	actions_for "$1" | awk -v s="$2" -v k="$HOLD_SLACK" '$2 == "hold" && $3 <= s && $3 > best { best = $3; line = $0 } END { if (line != "" && s <= best + k) print line }'
+}
+
+# The button's original script: the copy NetGrip kept, else the one in the
+# firmware image (if the copy was lost).
+original() {
+	if [ -f "$ETC/orig/$1" ]; then
+		echo "$ETC/orig/$1"
+	elif [ -f "$ROMRC/$1" ]; then
+		echo "$ROMRC/$1"
+	fi
 }
 
 forward() {
-	[ -f "$ETC/orig/$B" ] && exec /bin/sh "$ETC/orig/$B"
-	exit 0
+	local o
+	o=$(original "$B")
+	[ -n "$o" ] || exit 0
+	[ -x "$o" ] && exec "$o"
+	exec /bin/sh "$o"
 }
 
 blink() {
@@ -128,12 +173,12 @@ blink() {
 	[ -n "$led" ] || return 0
 	l="$LEDS/$led"
 	[ -w "$l/trigger" ] || return 0
-	try_take led || return 0
+	try_take led 7 || return 0
 	trig=$(sed -n 's/.*\[\([^]]*\)\].*/\1/p' "$l/trigger")
 	bri=$(cat "$l/brightness")
 	max=$(cat "$l/max_brightness" 2>/dev/null)
 	saved=""
-	for f in device_name link rx tx interval; do
+	for f in device_name link rx tx interval delay_on delay_off; do
 		[ -f "$l/$f" ] && saved="$saved $f=$(cat "$l/$f")"
 	done
 	if echo timer > "$l/trigger" 2>/dev/null; then
@@ -154,7 +199,7 @@ blink() {
 		echo "${kv#*=}" > "$l/${kv%%=*}" 2>/dev/null
 	done
 	[ "$trig" = none ] && echo "$bri" > "$l/brightness"
-	try_drop led
+	drop led 7
 }
 
 # run_line <pattern> <line>: the action of one assigned line, detached.
@@ -165,7 +210,7 @@ run_line() {
 
 cmd_rc() {
 	B="$1"
-	local reserved="${2:-0}" s max line cs n last seq rest
+	local reserved="${2:-0}" s max line cs n last seq lastseen quiet rest
 	record_seen
 	# A switch (a slider, not a button) reports its position: untouched.
 	[ -n "$TYPE" ] && forward
@@ -195,35 +240,51 @@ cmd_rc() {
 	max=$(max_press "$B")
 	[ "$max" -gt 0 ] || forward
 	cs=$(now_cs)
-	take "clicks.$B"
+	take "clicks.$B" 8
+	# Presses right after a pattern that already ran (one press too many)
+	# are absorbed: they must not start a new single press, which on the
+	# reset button would restart the router.
+	quiet=0
+	[ -f "$STATE/quiet.$B" ] && read quiet rest < "$STATE/quiet.$B"
+	if [ $((cs - quiet)) -le $((WINDOW * 100 + 20)) ]; then
+		echo "$cs" > "$STATE/quiet.$B"
+		drop "clicks.$B" 8
+		log "$B: an extra press after an action, ignored"
+		exit 0
+	fi
 	n=0
 	last=0
-	[ -f "$STATE/clicks.$B" ] && read n last seq rest < "$STATE/clicks.$B"
+	[ -f "$STATE/clicks.$B" ] && read n last seq lastseen rest < "$STATE/clicks.$B"
 	if [ $((cs - last)) -le $((WINDOW * 100 + 20)) ]; then
 		n=$((n + 1))
 	else
 		n=1
 	fi
-	echo "$n $cs $cs" > "$STATE/clicks.$B"
-	drop "clicks.$B"
+	echo "$n $cs $cs $s" > "$STATE/clicks.$B"
 	if [ "$n" -ge "$max" ]; then
 		rm -f "$STATE/clicks.$B"
-		fire_count "$n"
+		echo "$cs" > "$STATE/quiet.$B"
+		drop "clicks.$B" 8
+		fire_count "$n" "$s"
 		exit 0
 	fi
+	drop "clicks.$B" 8
 	spawn fire "$B" "$cs"
 	exit 0
 }
 
-# fire_count <n>: the press pattern ended with n presses.
+# fire_count <n> <seen>: the press pattern ended with n presses, the last
+# one held <seen> seconds.
 fire_count() {
 	local line
 	line=$(press_line "$B" "$1")
 	if [ -n "$line" ]; then
 		run_line "press$1" "$line"
 	elif [ "$1" -eq 1 ]; then
-		# A single press nobody assigned does what it always did.
-		export BUTTON="$B" ACTION=released SEEN=0
+		# A single press nobody assigned does what it always did, with
+		# how long it was really held (the reset button restarts the
+		# router only for a press under a second).
+		export BUTTON="$B" ACTION=released SEEN="${2:-0}"
 		forward
 	else
 		log "$B pressed $1 times: nothing assigned"
@@ -232,34 +293,56 @@ fire_count() {
 
 cmd_fire() {
 	B="$1"
-	local seq="$2" n last cur rest
+	local seq="$2" n last cur lastseen rest
 	sleep "$WINDOW"
-	take "clicks.$B"
+	take "clicks.$B" 8
 	cur=""
-	[ -f "$STATE/clicks.$B" ] && read n last cur rest < "$STATE/clicks.$B"
+	[ -f "$STATE/clicks.$B" ] && read n last cur lastseen rest < "$STATE/clicks.$B"
 	if [ "$cur" != "$seq" ]; then
 		# Another press came, or a hold ended it: that one decides.
-		drop "clicks.$B"
+		drop "clicks.$B" 8
 		exit 0
 	fi
 	rm -f "$STATE/clicks.$B"
-	drop "clicks.$B"
-	fire_count "$n"
+	drop "clicks.$B" 8
+	fire_count "$n" "$lastseen"
 }
 
-# set_disabled <iface> <0|1|->: "-" removes the option. Uses its own change
-# directory, so changes someone else left pending are not committed with it.
+# wl <uci args>: uci on the private copy of the wireless config (see
+# set_disabled).
+wl() {
+	uci -q -c "$STATE/wl" -t "$STATE/wl/.d" "$@"
+}
+
+# wl_load: a private copy of the saved wireless config, under a package
+# name of its own. Changes someone else left pending (uci keeps them in
+# /tmp/.uci by package name, and every uci command applies them) do not
+# apply to it, so they are never saved with a button's change.
+wl_load() {
+	rm -rf "$STATE/wl"
+	mkdir -p "$STATE/wl/.d" || return 1
+	cp "$CONFIG/wireless" "$STATE/wl/ngbwifi"
+}
+
+# set_disabled <iface> <0|1|-> [norestart]: "-" removes the option. Under
+# the wifi lock, with wl_load done.
 set_disabled() {
-	local t="$STATE/uci" radio
-	mkdir -p "$t"
+	local radio
 	if [ "$2" = "-" ]; then
-		uci -q -t "$t" delete "wireless.$1.disabled"
+		wl delete "ngbwifi.$1.disabled"
 	else
-		uci -q -t "$t" set "wireless.$1.disabled=$2"
+		wl set "ngbwifi.$1.disabled=$2" || return 1
 	fi
-	uci -q -t "$t" commit wireless || return 1
+	wl commit ngbwifi || return 1
+	radio=$(wl get "ngbwifi.$1.device")
+	# Same file mode as the original (it holds Wi-Fi passwords).
+	cp -p "$CONFIG/wireless" "$CONFIG/.wireless.netgrip-tmp" &&
+		cat "$STATE/wl/ngbwifi" > "$CONFIG/.wireless.netgrip-tmp" &&
+		mv "$CONFIG/.wireless.netgrip-tmp" "$CONFIG/wireless" || {
+		rm -f "$CONFIG/.wireless.netgrip-tmp"
+		return 1
+	}
 	[ "${3:-}" = norestart ] && return 0
-	radio=$(uci -q get "wireless.$1.device")
 	wifi reconf $radio 2>/dev/null || wifi up $radio
 }
 
@@ -270,9 +353,9 @@ state_word() {
 act_wifi() {
 	local b="$1" p="$2" s="$3" m="$4" rec cur new tok prev rest until
 	rec="$ETC/timed/$s"
-	take wifi
-	if [ "$(uci -q get "wireless.$s")" != wifi-iface ]; then
-		drop wifi
+	take wifi 8
+	if ! wl_load || [ "$(wl get "ngbwifi.$s")" != wifi-iface ]; then
+		drop wifi 8
 		event "$b" "$p" wifi_toggle "$s" "failed: no such Wi-Fi network"
 		return
 	fi
@@ -281,11 +364,11 @@ act_wifi() {
 		read prev tok rest < "$rec"
 		rm -f "$rec" "$STATE/hold/$s"
 		set_disabled "$s" "$prev"
-		drop wifi
+		drop wifi 8
 		event "$b" "$p" wifi_toggle "$s $(state_word "$prev") 0" ended
 		return
 	fi
-	cur=$(uci -q get "wireless.$s.disabled")
+	cur=$(wl get "ngbwifi.$s.disabled")
 	if [ "$cur" = 1 ]; then new=0; else new=1; fi
 	mkdir -p "$STATE/hold"
 	tok=$(cat /proc/sys/kernel/random/uuid)
@@ -299,11 +382,11 @@ act_wifi() {
 	echo "$until $tok" > "$STATE/hold/$s"
 	if ! set_disabled "$s" "$new"; then
 		rm -f "$rec" "$STATE/hold/$s"
-		drop wifi
+		drop wifi 8
 		event "$b" "$p" wifi_toggle "$s $(state_word "$new") $m" failed
 		return
 	fi
-	drop wifi
+	drop wifi 8
 	[ "$m" -gt 0 ] && spawn revert "$s" "$tok" "$m" "$b"
 	event "$b" "$p" wifi_toggle "$s $(state_word "$new") $m" ok
 }
@@ -312,17 +395,22 @@ cmd_revert() {
 	local s="$1" tok="$2" m="$3" b="$4" rec prev cur rest
 	rec="$ETC/timed/$s"
 	sleep $((m * MINUTE))
-	take wifi
+	take wifi 8
 	cur=""
 	[ -f "$rec" ] && read prev cur rest < "$rec"
 	if [ "$cur" != "$tok" ]; then
-		drop wifi
+		drop wifi 8
 		exit 0
 	fi
 	rm -f "$rec" "$STATE/hold/$s"
-	set_disabled "$s" "$prev"
-	drop wifi
-	event "$b" timer wifi_toggle "$s $(state_word "$prev") $m" reverted
+	if wl_load && [ "$(wl get "ngbwifi.$s")" = wifi-iface ] && set_disabled "$s" "$prev"; then
+		drop wifi 8
+		event "$b" timer wifi_toggle "$s $(state_word "$prev") $m" reverted
+	else
+		drop wifi 8
+		event "$b" timer wifi_toggle "$s $(state_word "$prev") $m" "failed: could not switch it back"
+	fi
+	rm -rf "$STATE/wl"
 }
 
 act_firewall() {
@@ -366,6 +454,7 @@ cmd_act() {
 	access_restart) act_access "$b" "$p" ;;
 	*) event "$b" "$p" "$a" - "failed: unknown action" ;;
 	esac
+	rm -rf "$STATE/wl"
 	wait
 }
 
@@ -378,28 +467,39 @@ cmd_boot() {
 		s="${rec##*/}"
 		read prev tok rest < "$rec"
 		rm -f "$rec"
-		[ "$(uci -q get "wireless.$s")" = wifi-iface ] || continue
+		wl_load || continue
+		[ "$(wl get "ngbwifi.$s")" = wifi-iface ] || continue
 		set_disabled "$s" "$prev" norestart
 		event boot timer wifi_toggle "$s $(state_word "$prev") 0" reverted
 	done
+	rm -rf "$STATE/wl"
 }
 
 # Everything back as it was before NetGrip: timed toggles end now, each
-# button gets its original script back, and NetGrip's files go.
+# button gets its original script back, and NetGrip's files go. If any
+# button could not get its original back, NetGrip's copies and the runner
+# stay, so that button keeps working (its wrapper still hands presses to
+# the original).
 cmd_uninstall() {
-	local rec s prev tok rest f b
+	local rec s prev tok rest f b o failed=""
 	for rec in "$ETC"/timed/*; do
 		[ -f "$rec" ] || continue
 		s="${rec##*/}"
 		read prev tok rest < "$rec"
 		rm -f "$rec"
-		[ "$(uci -q get "wireless.$s")" = wifi-iface ] && set_disabled "$s" "$prev"
+		wl_load && [ "$(wl get "ngbwifi.$s")" = wifi-iface ] && set_disabled "$s" "$prev"
 	done
 	for f in "$RCDIR"/*; do
 		[ -f "$f" ] && grep -q netgrip-managed-button "$f" || continue
 		b="${f##*/}"
-		if [ -f "$ETC/orig/$b" ]; then
-			cp "$ETC/orig/$b" "$f.netgrip-tmp" && chmod 755 "$f.netgrip-tmp" && mv "$f.netgrip-tmp" "$f"
+		o=$(original "$b")
+		if [ -n "$o" ]; then
+			if cp "$o" "$f.netgrip-tmp" && chmod 755 "$f.netgrip-tmp" && mv "$f.netgrip-tmp" "$f"; then
+				:
+			else
+				rm -f "$f.netgrip-tmp"
+				failed="$failed $b"
+			fi
 		else
 			rm -f "$f"
 		fi
@@ -409,6 +509,10 @@ cmd_uninstall() {
 	if [ -f "$INITD/netgrip-buttons" ]; then
 		"$INITD/netgrip-buttons" disable 2>/dev/null
 		rm -f "$INITD/netgrip-buttons"
+	fi
+	if [ -n "$failed" ]; then
+		log "could not put back the original script of:$failed; kept NetGrip's copies"
+		return 1
 	fi
 	rm -rf "$ETC" "$STATE"
 	rm -f "$SELF"
