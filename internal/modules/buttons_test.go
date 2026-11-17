@@ -3,9 +3,11 @@ package modules
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -809,5 +811,84 @@ func TestBtnRequirements(t *testing.T) {
 	}
 	if err := btnCheckNew(ButtonsConfig{Actions: []ButtonAction{{Button: "reset", Trigger: "press", Count: 1, Action: "firewall_restart"}}}, saved); err == nil {
 		t.Fatal("a new action was accepted on a router missing awk")
+	}
+}
+
+func TestBtnQuarantineRequests(t *testing.T) {
+	_, _ = btnTestRouter(t)
+	now := time.Unix(1_700_000_000, 0)
+	oldNow, oldToggle := btnNow, btnQuarantineToggleFn
+	btnNow = func() time.Time { return now }
+	paused := false
+	enabled := true
+	calls := []int{}
+	btnQuarantineToggleFn = func(m int) (string, error) {
+		calls = append(calls, m)
+		if !enabled {
+			return "", errors.New("the quarantine is off")
+		}
+		if paused {
+			paused = false
+			return "resumed", nil
+		}
+		paused = true
+		return fmt.Sprintf("paused %d", m), nil
+	}
+	t.Cleanup(func() { btnNow, btnQuarantineToggleFn = oldNow, oldToggle })
+	req := func(name, body string) {
+		btnWriteT(t, filepath.Join(btnStateDir, "request."+name), body)
+	}
+	at := strconv.FormatInt(now.Unix(), 10)
+
+	req("a", "quarantine_pause 60 wps press2 "+at+"\n")
+	btnHandleRequests()
+	req("b", "quarantine_pause 60 wps press2 "+at+"\n")
+	btnHandleRequests()
+	// Pressed while NetGrip was down (3 min ago): not carried out.
+	req("c", "quarantine_pause 60 wps press2 "+strconv.FormatInt(now.Add(-3*time.Minute).Unix(), 10)+"\n")
+	// Malformed: ignored.
+	req("d", "quarantine_pause 60 ../x press2 "+at+"\n")
+	req("e", "rm -rf / x y z\n")
+	btnHandleRequests()
+	enabled = false
+	req("f", "quarantine_pause 30 wps hold3 "+at+"\n")
+	btnHandleRequests()
+
+	if fmt.Sprint(calls) != "[60 60 30]" {
+		t.Fatalf("toggle calls = %v", calls)
+	}
+	if left, _ := filepath.Glob(filepath.Join(btnStateDir, "request.*")); len(left) != 0 {
+		t.Fatalf("requests left: %v", left)
+	}
+	var got []string
+	for _, r := range btnReadEvents() {
+		got = append(got, r.ev.Detail+"|"+r.ev.Result+"|"+btnEventText(r.ev, nil))
+	}
+	want := []string{
+		"paused 60|ok|Button wps pressed twice: quarantine paused for 60 min",
+		"resumed|ok|Button wps pressed twice: quarantine resumed",
+		"-|failed: pressed while NetGrip was not running|Button wps pressed twice: pausing or resuming the quarantine failed (failed: pressed while NetGrip was not running)",
+		"-|failed: the quarantine is off|Button wps held 3 s: pausing or resuming the quarantine failed (failed: the quarantine is off)",
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("events:\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+}
+
+func TestValidateQuarantinePause(t *testing.T) {
+	_, _ = btnTestRouter(t)
+	none := func(string) int { return 0 }
+	ok := ButtonsConfig{Actions: []ButtonAction{{Button: "wps", Trigger: "press", Count: 3, Action: "quarantine_pause", Iface: "x", Minutes: 90}}}
+	if err := validateButtons(&ok, none); err != nil {
+		t.Fatal(err)
+	}
+	if a := ok.Actions[0]; a.Iface != "" || a.Minutes != 90 {
+		t.Fatalf("pause kept a network or lost its time: %+v", a)
+	}
+	for _, m := range []int{0, -5, 24*60 + 1} {
+		bad := ButtonsConfig{Actions: []ButtonAction{{Button: "wps", Trigger: "press", Count: 1, Action: "quarantine_pause", Minutes: m}}}
+		if err := validateButtons(&bad, none); err == nil {
+			t.Errorf("a pause of %d minutes was accepted", m)
+		}
 	}
 }

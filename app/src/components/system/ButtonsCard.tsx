@@ -10,7 +10,8 @@ import { fmtDate, fmtTime } from "../../lib/format";
 const SELECT = "h-9 w-full rounded-sm border border-border bg-surface-2 px-2.5 text-small text-text outline-none focus:border-accent ring-focus";
 const HOLDS = [2, 3, 4, 5, 7, 10, 15, 20, 30];
 const DURATIONS = [0, 5, 15, 30, 60, 120, 240, 480];
-const ACTIONS: ButtonActionKind[] = ["wifi_toggle", "wifi_on", "firewall_restart", "access_restart"];
+const ACTIONS: ButtonActionKind[] = ["wifi_toggle", "wifi_on", "quarantine_pause", "firewall_restart", "access_restart"];
+const PAUSES = [5, 15, 30, 60, 120, 240, 480, 1440];
 
 /** A saved action's identity: one action per button and press. */
 function actionKey(a: ButtonAction): string {
@@ -47,6 +48,8 @@ function actionLabel(t: TFunction, a: ButtonAction, ssid: Map<string, string>): 
         ? t("buttons.doWifiOnFor", { name, time: minutesLabel(t, a.minutes ?? 0) })
         : t("buttons.doWifiOn", { name });
     }
+    case "quarantine_pause":
+      return t("buttons.doQuarantine", { time: minutesLabel(t, a.minutes ?? 60) });
     case "firewall_restart":
       return t("buttons.doFirewall");
     case "access_restart":
@@ -68,6 +71,10 @@ function eventLabel(t: TFunction, e: ButtonEvent, ssid: Map<string, string>): st
     else if (e.result === "ended") what = t(on ? "buttons.evEndedOn" : "buttons.evEndedOff", { name });
     else if (Number(min) > 0) what = t(on ? "buttons.evOnFor" : "buttons.evOffFor", { name, time: minutesLabel(t, Number(min)) });
     else what = t(on ? "buttons.evOn" : "buttons.evOff", { name });
+  } else if (e.action === "quarantine_pause") {
+    if (failed) what = t("buttons.evQuarantineFailed", { error: e.result.replace(/^failed: /, "") });
+    else if (e.detail.startsWith("paused ")) what = t("buttons.evQuarantinePaused", { time: minutesLabel(t, Number(e.detail.slice(7))) });
+    else what = t("buttons.evQuarantineResumed");
   } else if (e.action === "firewall_restart") {
     what = t(failed ? "buttons.evFirewallFailed" : "buttons.evFirewall");
   } else if (e.action === "access_restart") {
@@ -260,7 +267,7 @@ export function ButtonsCard({ index = 0 }: { index?: number }) {
                           </button>
                         </div>
                         {editing === actionKey(a) && (
-                          <AddAction button={b} networks={p.networks} taken={mine.filter((x) => x !== a)} busy={busy} hasWifi={hasWifi}
+                          <AddAction button={b} networks={p.networks} taken={mine.filter((x) => x !== a)} busy={busy} hasWifi={hasWifi} quarantine={p.quarantine ?? false}
                             initial={a}
                             onCancel={() => setEditing(undefined)}
                             onAdd={(edited) => save({ ...p.config, actions: actions.map((x) => (x === a ? edited : x)) })} />
@@ -271,7 +278,7 @@ export function ButtonsCard({ index = 0 }: { index?: number }) {
                 </ul>
               )}
               {adding === b.name && (
-                <AddAction button={b} networks={p.networks} taken={mine} busy={busy} hasWifi={hasWifi}
+                <AddAction button={b} networks={p.networks} taken={mine} busy={busy} hasWifi={hasWifi} quarantine={p.quarantine ?? false}
                   onCancel={() => setAdding(undefined)}
                   onAdd={(a) => save({ ...p.config, actions: [...actions, a] })} />
               )}
@@ -358,8 +365,10 @@ function NetworkState({ net }: { net: ButtonNetwork }) {
   return <Pill tone={net.disabled ? "muted" : "ok"}>{t(net.disabled ? "buttons.netOff" : "buttons.netOn")}</Pill>;
 }
 
-function AddAction({ button, networks, taken, busy, hasWifi, initial, onAdd, onCancel }: {
+function AddAction({ button, networks, taken, busy, hasWifi, quarantine, initial, onAdd, onCancel }: {
   button: ButtonInfo;
+  /** The device quarantine is set up (else its pause has nothing to pause). */
+  quarantine: boolean;
   /** The saved action being edited; absent for a new one. */
   initial?: ButtonAction;
   hasWifi: boolean;
@@ -380,6 +389,7 @@ function AddAction({ button, networks, taken, busy, hasWifi, initial, onAdd, onC
   const [iface, setIface] = useState(
     initial?.iface && networks.some((n) => n.section === initial.iface) ? initial.iface : networks[0]?.section ?? "");
   const [minutes, setMinutes] = useState(initial && isWifi(initial.action) ? initial.minutes ?? 0 : 30);
+  const [pause, setPause] = useState(initial?.action === "quarantine_pause" ? initial.minutes ?? 60 : 60);
   // Without the wifi command no Wi-Fi action can be saved (the router
   // keeps one saved before as it is, but it cannot be changed).
   const can = (trigger === "press" ? freePress.includes(count) : freeHold.includes(seconds))
@@ -389,6 +399,7 @@ function AddAction({ button, networks, taken, busy, hasWifi, initial, onAdd, onC
     const a: ButtonAction = { button: button.name, trigger, action };
     if (trigger === "press") a.count = count; else a.seconds = seconds;
     if (isWifi(action)) { a.iface = iface; a.minutes = minutes; }
+    if (action === "quarantine_pause") a.minutes = pause;
     onAdd(a);
   };
 
@@ -446,7 +457,17 @@ function AddAction({ button, networks, taken, busy, hasWifi, initial, onAdd, onC
             )}
           </>
         )}
+        {action === "quarantine_pause" && (
+          <Field label={t("buttons.pauseFor")} hint={t("buttons.pauseHint")}>
+            <select className={SELECT} value={pause} onChange={(e) => setPause(Number(e.target.value))}>
+              {(PAUSES.includes(pause) ? PAUSES : [...PAUSES, pause].sort((x, y) => x - y)).map((m) => (
+                <option key={m} value={m}>{minutesLabel(t, m)}</option>
+              ))}
+            </select>
+          </Field>
+        )}
       </div>
+      {action === "quarantine_pause" && !quarantine && <p className="text-caption text-warn">{t("buttons.quarantineOff")}</p>}
       {isWifi(action) && !hasWifi && <p className="text-caption text-warn">{t("buttons.missing.wifi", { name: "wifi" })}</p>}
       {action === "access_restart" && <p className="text-caption text-muted">{t("buttons.accessHint")}</p>}
       {action === "firewall_restart" && <p className="text-caption text-muted">{t("buttons.firewallHint")}</p>}

@@ -1918,7 +1918,7 @@ export interface QResult {
 }
 
 /** Router buttons: actions a physical button press runs. */
-export type ButtonActionKind = "wifi_toggle" | "wifi_on" | "firewall_restart" | "access_restart";
+export type ButtonActionKind = "wifi_toggle" | "wifi_on" | "quarantine_pause" | "firewall_restart" | "access_restart";
 
 export interface ButtonAction {
   button: string;
@@ -1999,6 +1999,8 @@ export interface ButtonsProbe {
   last_press?: ButtonPress;
   listen_until?: number;
   notify: boolean;
+  /** The device quarantine is set up. */
+  quarantine?: boolean;
 }
 
 export interface ButtonsListen {

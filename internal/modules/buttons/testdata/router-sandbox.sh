@@ -85,6 +85,16 @@ press reset 5; sleep 2; ok K '[ "$(dis)" = 1 ]'
 ev reset released 2 5 >/dev/null; sleep 1; ok K2 '[ "$(dis)" = 0 ]'
 sleep $((M + 2)); ok K3 '[ "$(dis)" = 0 ]'
 ok K4 '[ ! -f $R/etc/timed/wl1 ]'
+echo "== L quarantine pause: a request for NetGrip (the sandbox's own state dir: the real NetGrip never sees it)"
+printf 'reset press 1 quarantine_pause - 45\n' > $R/etc/actions; rm -f $R/state/quiet.reset
+press reset 5; sleep 1
+ok L 'ls $R/state/request.* >/dev/null 2>&1 && grep -q "^quarantine_pause 45 reset press1 [0-9]*$" $R/state/request.*'
+ok L2 '! ls $R/state/.request.* >/dev/null 2>&1'
+rm -f $R/state/request.*
+printf '#!/bin/sh\nexit 1\n' > $R/bin/pidof; chmod 755 $R/bin/pidof
+sleep 2; press reset 5; sleep 1
+ok L3 '! ls $R/state/request.* >/dev/null 2>&1 && grep -q "	quarantine_pause	-	failed: NetGrip is not running" $R/state/events'
+rm -f $R/bin/pidof
 echo "== G uninstall"
 printf '#!/bin/sh\n# netgrip-managed-button\n' > $R/rc/reset; mkdir -p $R/hook; echo x > $R/hook/00-netgrip
 $R/runner uninstall

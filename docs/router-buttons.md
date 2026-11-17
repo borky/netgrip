@@ -9,6 +9,7 @@ when something breaks. Settings → Router buttons.
 | --- | --- |
 | Switch a Wi-Fi network on/off | Flips one access point (`wireless.<section>.disabled`). Optionally switches it back after a time; a press during that time, or a reboot, switches it back at once. NetGrip's Wi-Fi schedule leaves the network alone meanwhile. |
 | Switch a Wi-Fi network on, off after a while | Turns one access point on whatever its state, and off again after the time chosen (or leaves it on). A press while it is on starts the time again; a reboot switches it off. |
+| Pause or resume the device quarantine | Pauses NetGrip's quarantine (nothing enforced) for 1 minute to 24 hours, or resumes it when a pause runs; it resumes on its own when the time ends. The only action that needs NetGrip running: the script leaves a request file in `/tmp/netgrip-buttons` that NetGrip picks up at once. A press while NetGrip is down is logged as failed and never carried out later. |
 | Restart the firewall | `/etc/init.d/firewall restart`. |
 | Restart access | Restarts `dropbear`, `uhttpd`, `nginx` and `netgrip`, only those installed and enabled. |
 

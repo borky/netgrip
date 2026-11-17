@@ -5,6 +5,7 @@ package modules
 import (
 	"log"
 	"os"
+	"strings"
 	"time"
 	"unsafe"
 
@@ -38,7 +39,8 @@ func btnWatchRun() error {
 	if _, err := unix.InotifyAddWatch(fd, btnStateDir, unix.IN_CLOSE_WRITE|unix.IN_MOVED_TO|unix.IN_DELETE_SELF|unix.IN_MOVE_SELF); err != nil {
 		return err
 	}
-	btnNotifyNew() // what ran while NetGrip was not running
+	btnHandleRequests() // stale ones, from before NetGrip started
+	btnNotifyNew()      // what ran while NetGrip was not running
 	buf := make([]byte, 4096)
 	for {
 		n, err := unix.Read(fd, buf)
@@ -48,7 +50,7 @@ func btnWatchRun() error {
 			}
 			return err
 		}
-		relevant, gone := false, false
+		relevant, gone, requests := false, false, false
 		for off := 0; off+unix.SizeofInotifyEvent <= n; {
 			ev := (*unix.InotifyEvent)(unsafe.Pointer(&buf[off]))
 			nameLen := int(ev.Len)
@@ -70,7 +72,13 @@ func btnWatchRun() error {
 			if name == "events" || ev.Mask&unix.IN_Q_OVERFLOW != 0 {
 				relevant = true
 			}
+			if strings.HasPrefix(name, "request.") || ev.Mask&unix.IN_Q_OVERFLOW != 0 {
+				requests = true
+			}
 			off += unix.SizeofInotifyEvent + nameLen
+		}
+		if requests {
+			btnHandleRequests() // logs an event: the next read notifies it
 		}
 		if relevant {
 			btnNotifyNew()
@@ -78,5 +86,19 @@ func btnWatchRun() error {
 		if gone {
 			return nil
 		}
+	}
+}
+
+// btnLockEvents takes the runner's lock on its event log (flock, as the
+// runner uses where it has flock).
+func btnLockEvents() func() {
+	f, err := os.OpenFile(btnStateDir+"/events.lock", os.O_WRONLY|os.O_CREATE, 0o644)
+	if err != nil {
+		return func() {}
+	}
+	_ = unix.Flock(int(f.Fd()), unix.LOCK_EX)
+	return func() {
+		_ = unix.Flock(int(f.Fd()), unix.LOCK_UN)
+		f.Close()
 	}
 }
