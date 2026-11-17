@@ -1916,3 +1916,79 @@ export interface QResult {
   error?: string;
   confirm?: { id: string; expires: number };
 }
+
+/** Router buttons: actions a physical button press runs. */
+export type ButtonActionKind = "wifi_toggle" | "firewall_restart" | "access_restart";
+
+export interface ButtonAction {
+  button: string;
+  trigger: "press" | "hold";
+  /** press: how many presses in a row (1-3). */
+  count?: number;
+  /** hold: at least this many seconds. */
+  seconds?: number;
+  action: ButtonActionKind;
+  /** wifi_toggle: the wireless section, and minutes before it goes back (0 = keeps). */
+  iface?: string;
+  minutes?: number;
+}
+
+export interface ButtonsConfig {
+  actions: ButtonAction[];
+  /** LED that blinks when an action runs; "" for none. */
+  led: string;
+}
+
+export interface ButtonInfo {
+  name: string;
+  board?: boolean;
+  pressed?: boolean;
+  /** What its original script does: reset | wps | rfkill | power | reboot | custom. */
+  stock?: string;
+  /** Holding it this long or longer always does the original (factory reset). */
+  reserved?: number;
+  managed?: boolean;
+}
+
+export interface ButtonNetwork {
+  section: string;
+  ssid: string;
+  disabled: boolean;
+  /** A button toggled it until then (Unix seconds). */
+  until?: number;
+}
+
+export interface ButtonEvent {
+  at: number;
+  button: string;
+  pattern: string;
+  action: string;
+  detail: string;
+  result: string;
+  text: string;
+}
+
+export interface ButtonPress {
+  at: number;
+  button: string;
+  action: string;
+  seen: number;
+  switch?: boolean;
+}
+
+export interface ButtonsProbe {
+  available: boolean;
+  buttons: ButtonInfo[];
+  config: ButtonsConfig;
+  leds: string[];
+  networks: ButtonNetwork[];
+  events: ButtonEvent[];
+  last_press?: ButtonPress;
+  listen_until?: number;
+  notify: boolean;
+}
+
+export interface ButtonsListen {
+  last_press?: ButtonPress;
+  listen_until?: number;
+}

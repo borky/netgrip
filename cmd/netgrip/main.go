@@ -101,6 +101,7 @@ func main() {
 	modules.StartFleetDiscovery(version, *port)
 	modules.StartPoEWatchdog()
 	modules.StartWifiScheduleScheduler()
+	modules.StartButtons()
 	modules.StartBanipWarmup()
 	modules.StartAnnouncements()
 	// The login form posts the router's root password, so how the panel

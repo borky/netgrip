@@ -955,3 +955,26 @@ export const demoUpnp: T.UpnpProbe = {
     { section: "netgrip_upnp_1", action: "deny", int_addr: "192.168.1.66", int_ports: "", ext_ports: "", comment: "smart TV", managed: true },
   ],
 };
+
+/** Router buttons: a demo router with reset and WPS, one action assigned. */
+export const demoButtons: T.ButtonsProbe = {
+  available: true,
+  buttons: [
+    { name: "reset", board: true, stock: "reset", reserved: 5, managed: true },
+    { name: "wps", board: true, stock: "wps" },
+  ],
+  config: {
+    actions: [
+      { button: "reset", trigger: "press", count: 3, action: "wifi_toggle", iface: "wifinet2", minutes: 30 },
+    ],
+    led: "",
+  },
+  leds: ["green:power", "green:status", "red:status"],
+  networks: [
+    { section: "wifinet0", ssid: "CasaGarcia", disabled: false },
+    { section: "wifinet2", ssid: "CasaGarcia-Invitados", disabled: false },
+    { section: "wifinet3", ssid: "CasaGarcia-IoT", disabled: false },
+  ],
+  events: [],
+  notify: true,
+};
