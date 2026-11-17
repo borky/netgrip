@@ -41,10 +41,11 @@ HOLD_SLACK=2
 # Seconds in a minute (tests shorten it).
 MINUTE=${NGB_MINUTE:-60}
 
-# Nothing it writes is for other users (the wireless copy holds Wi-Fi
-# passwords); files that must keep a mode set it themselves.
-umask 077
 mkdir -p "$STATE" 2>/dev/null
+# This process's private copy of the wireless config (see wl_load), gone
+# when it ends, whatever path it takes.
+WL="$STATE/wl.$$"
+trap 'rm -rf "$WL"' EXIT
 
 now_cs() {
 	local u rest
@@ -152,12 +153,18 @@ hold_line() {
 
 # The button's original script: the copy NetGrip kept, else the one in the
 # firmware image (if the copy was lost).
+# No original when the button had no script when NetGrip took it over
+# (orig/<button>.none): one removed on purpose must not come back from the
+# firmware image.
 original() {
-	if [ -f "$ETC/orig/$1" ]; then
-		echo "$ETC/orig/$1"
-	elif [ -f "$ROMRC/$1" ]; then
-		echo "$ROMRC/$1"
-	fi
+	local o
+	[ -f "$ETC/orig/$1.none" ] && return 0
+	for o in "$ETC/orig/$1" "$ROMRC/$1"; do
+		[ -f "$o" ] || continue
+		grep -q netgrip-managed-button "$o" && continue
+		echo "$o"
+		return 0
+	done
 }
 
 forward() {
@@ -247,7 +254,6 @@ cmd_rc() {
 	quiet=0
 	[ -f "$STATE/quiet.$B" ] && read quiet rest < "$STATE/quiet.$B"
 	if [ $((cs - quiet)) -le $((WINDOW * 100 + 20)) ]; then
-		echo "$cs" > "$STATE/quiet.$B"
 		drop "clicks.$B" 8
 		log "$B: an extra press after an action, ignored"
 		exit 0
@@ -308,40 +314,59 @@ cmd_fire() {
 	fire_count "$n" "$lastseen"
 }
 
-# wl <uci args>: uci on the private copy of the wireless config (see
-# set_disabled).
+# wl <uci args>: uci on this process's private copy of the wireless
+# config (see wl_load).
 wl() {
-	uci -q -c "$STATE/wl" -t "$STATE/wl/.d" "$@"
+	uci -q -c "$WL" -t "$WL/.d" "$@"
+}
+
+# wl_cfg: the wireless config file (through a symlink, if it is one).
+wl_cfg() {
+	local f
+	f=$(readlink -f "$CONFIG/wireless" 2>/dev/null)
+	echo "${f:-$CONFIG/wireless}"
 }
 
 # wl_load: a private copy of the saved wireless config, under a package
 # name of its own. Changes someone else left pending (uci keeps them in
 # /tmp/.uci by package name, and every uci command applies them) do not
-# apply to it, so they are never saved with a button's change.
+# apply to it, so they are never saved with a button's change. The
+# directory is root's only: the copy holds Wi-Fi passwords.
 wl_load() {
-	rm -rf "$STATE/wl"
-	mkdir -p "$STATE/wl/.d" || return 1
-	cp "$CONFIG/wireless" "$STATE/wl/ngbwifi"
+	rm -rf "$WL"
+	mkdir -p "$WL" && chmod 700 "$WL" && mkdir -p "$WL/.d" || return 1
+	cp "$(wl_cfg)" "$WL/ngbwifi"
 }
 
 # set_disabled <iface> <0|1|-> [norestart]: "-" removes the option. Under
-# the wifi lock, with wl_load done.
+# the wifi lock. If someone else saved the wireless config meanwhile, it
+# starts over from theirs, so their change is not lost.
 set_disabled() {
-	local radio
-	if [ "$2" = "-" ]; then
-		wl delete "ngbwifi.$1.disabled"
-	else
-		wl set "ngbwifi.$1.disabled=$2" || return 1
-	fi
-	wl commit ngbwifi || return 1
-	radio=$(wl get "ngbwifi.$1.device")
-	# Same file mode as the original (it holds Wi-Fi passwords).
-	cp -p "$CONFIG/wireless" "$CONFIG/.wireless.netgrip-tmp" &&
-		cat "$STATE/wl/ngbwifi" > "$CONFIG/.wireless.netgrip-tmp" &&
-		mv "$CONFIG/.wireless.netgrip-tmp" "$CONFIG/wireless" || {
-		rm -f "$CONFIG/.wireless.netgrip-tmp"
-		return 1
-	}
+	local radio cfg sum try=0
+	cfg=$(wl_cfg)
+	while :; do
+		try=$((try + 1))
+		wl_load || return 1
+		sum=$(cksum < "$cfg")
+		if [ "$2" = "-" ]; then
+			wl delete "ngbwifi.$1.disabled"
+		else
+			wl set "ngbwifi.$1.disabled=$2" || return 1
+		fi
+		wl commit ngbwifi || return 1
+		radio=$(wl get "ngbwifi.$1.device")
+		# Same owner and mode as the original (it holds Wi-Fi passwords).
+		if ! { cp -p "$cfg" "$cfg.netgrip-tmp" && cat "$WL/ngbwifi" > "$cfg.netgrip-tmp"; }; then
+			rm -f "$cfg.netgrip-tmp"
+			return 1
+		fi
+		if [ "$(cksum < "$cfg")" = "$sum" ]; then
+			mv "$cfg.netgrip-tmp" "$cfg" || { rm -f "$cfg.netgrip-tmp"; return 1; }
+			break
+		fi
+		rm -f "$cfg.netgrip-tmp"
+		[ "$try" -ge 3 ] && return 1
+	done
 	[ "${3:-}" = norestart ] && return 0
 	wifi reconf $radio 2>/dev/null || wifi up $radio
 }
@@ -363,9 +388,13 @@ act_wifi() {
 		# A timed toggle is running: a press ends it now.
 		read prev tok rest < "$rec"
 		rm -f "$rec" "$STATE/hold/$s"
-		set_disabled "$s" "$prev"
-		drop wifi 8
-		event "$b" "$p" wifi_toggle "$s $(state_word "$prev") 0" ended
+		if set_disabled "$s" "$prev"; then
+			drop wifi 8
+			event "$b" "$p" wifi_toggle "$s $(state_word "$prev") 0" ended
+		else
+			drop wifi 8
+			event "$b" "$p" wifi_toggle "$s $(state_word "$prev") 0" "failed: could not switch it back"
+		fi
 		return
 	fi
 	cur=$(wl get "ngbwifi.$s.disabled")
@@ -410,7 +439,6 @@ cmd_revert() {
 		drop wifi 8
 		event "$b" timer wifi_toggle "$s $(state_word "$prev") $m" "failed: could not switch it back"
 	fi
-	rm -rf "$STATE/wl"
 }
 
 act_firewall() {
@@ -454,7 +482,6 @@ cmd_act() {
 	access_restart) act_access "$b" "$p" ;;
 	*) event "$b" "$p" "$a" - "failed: unknown action" ;;
 	esac
-	rm -rf "$STATE/wl"
 	wait
 }
 
@@ -462,6 +489,7 @@ cmd_act() {
 # for a limited time goes back as it was (the timer died with the reboot).
 cmd_boot() {
 	local rec s prev tok rest
+	take wifi 8
 	for rec in "$ETC"/timed/*; do
 		[ -f "$rec" ] || continue
 		s="${rec##*/}"
@@ -472,7 +500,7 @@ cmd_boot() {
 		set_disabled "$s" "$prev" norestart
 		event boot timer wifi_toggle "$s $(state_word "$prev") 0" reverted
 	done
-	rm -rf "$STATE/wl"
+	drop wifi 8
 }
 
 # Everything back as it was before NetGrip: timed toggles end now, each
@@ -482,6 +510,7 @@ cmd_boot() {
 # the original).
 cmd_uninstall() {
 	local rec s prev tok rest f b o failed=""
+	take wifi 8
 	for rec in "$ETC"/timed/*; do
 		[ -f "$rec" ] || continue
 		s="${rec##*/}"
@@ -489,6 +518,7 @@ cmd_uninstall() {
 		rm -f "$rec"
 		wl_load && [ "$(wl get "ngbwifi.$s")" = wifi-iface ] && set_disabled "$s" "$prev"
 	done
+	drop wifi 8
 	for f in "$RCDIR"/*; do
 		[ -f "$f" ] && grep -q netgrip-managed-button "$f" || continue
 		b="${f##*/}"
@@ -511,6 +541,8 @@ cmd_uninstall() {
 		rm -f "$INITD/netgrip-buttons"
 	fi
 	if [ -n "$failed" ]; then
+		# The wrappers left must only hand presses on: no actions.
+		rm -f "$ETC/actions" "$ETC/led"
 		log "could not put back the original script of:$failed; kept NetGrip's copies"
 		return 1
 	fi

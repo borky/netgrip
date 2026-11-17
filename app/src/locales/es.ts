@@ -3165,7 +3165,7 @@ export default {
     stockPower: "Una pulsación que no asignes sigue apagando el router.",
     stockReboot: "Mantenerlo sigue reiniciando el router, salvo que esa pulsación esté asignada.",
     stockCustom: "Una pulsación que no asignes ejecuta el script propio del botón, como antes.",
-    multiNote: "Una pulsación simple actúa aproximadamente 1 segundo después de soltar, para distinguirla de una doble o triple.",
+    multiNote: "Una pulsación simple actúa aproximadamente 1 segundo después de soltar, para distinguirla de una doble o triple. Espera 2 s antes de repetir una secuencia.",
     when: "Cuándo",
     trigPress: "Pulsar",
     trigHold: "Mantener",
