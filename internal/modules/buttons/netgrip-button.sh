@@ -447,9 +447,10 @@ act_wifi() {
 
 # act_wifi_on: a network on, whatever its state, and off again after <m>
 # minutes (0: it stays on). A press while it is on starts the time again.
-# The timed record holds the state to go back to: off ("1").
+# The timed record holds the state to go back to: off ("1"), or, when a
+# timed change was already running, what that one was to go back to.
 act_wifi_on() {
-	local b="$1" p="$2" s="$3" m="$4" rec cur tok until
+	local b="$1" p="$2" s="$3" m="$4" rec cur tok until back old="" prev otok rest
 	rec="$ETC/timed/$s"
 	take wifi 8
 	if ! wl_load || [ "$(wl get "ngbwifi.$s")" != wifi-iface ]; then
@@ -458,6 +459,12 @@ act_wifi_on() {
 		return
 	fi
 	cur=$(wl get "ngbwifi.$s.disabled")
+	back=1
+	if [ -f "$rec" ]; then
+		old=$(cat "$rec")
+		read prev otok rest < "$rec"
+		back="$prev"
+	fi
 	mkdir -p "$STATE/hold"
 	tok=$(token)
 	until=0
@@ -465,14 +472,20 @@ act_wifi_on() {
 		mkdir -p "$ETC/timed"
 		# Replaces any earlier timer: its revert finds another token and
 		# does nothing.
-		echo "1 $tok" > "$rec"
+		echo "$back $tok" > "$rec"
 		until=$(($(date +%s) + m * MINUTE))
 	else
 		rm -f "$rec"
 	fi
 	echo "$until $tok" > "$STATE/hold/$s"
 	if [ "$cur" = 1 ] && ! set_disabled "$s" 0; then
-		rm -f "$rec" "$STATE/hold/$s"
+		# Nothing changed: an earlier timer goes on as it was.
+		if [ -n "$old" ]; then
+			echo "$old" > "$rec"
+		else
+			rm -f "$rec"
+		fi
+		rm -f "$STATE/hold/$s"
 		drop wifi 8
 		event "$b" "$p" wifi_on "$s on $m" failed
 		return
