@@ -3,7 +3,7 @@ import { useTranslation } from "react-i18next";
 import type { TFunction } from "i18next";
 import { CircleDot, Plus, Radar, Trash2 } from "lucide-react";
 import { api } from "../../api";
-import type { ButtonAction, ButtonActionKind, ButtonEvent, ButtonInfo, ButtonNetwork, ButtonPress, ButtonsConfig, ButtonsProbe } from "../../types";
+import type { ButtonAction, ButtonActionKind, ButtonEvent, ButtonInfo, ButtonNetwork, ButtonPress, ButtonRequirement, ButtonsConfig, ButtonsProbe } from "../../types";
 import { Button, Card, Field, Pill, SegmentedControl } from "../ui";
 import { fmtDate, fmtTime } from "../../lib/format";
 
@@ -177,30 +177,27 @@ export function ButtonsCard({ index = 0 }: { index?: number }) {
   const missing = (p.requirements ?? []).filter((r) => !r.ok);
   const hasWifi = !missing.some((r) => r.for === "wifi");
 
-  if (!p.available) {
+  const missingRequired = missing.filter((r) => r.required);
+  // Without what the feature needs, nothing new can be added; what is
+  // already assigned is still listed, so it can be removed.
+  const shown = p.available ? p.buttons : p.buttons.filter((b) => actions.some((a) => a.button === b.name));
+
+  if (!p.available && shown.length === 0) {
     return (
       <Card index={index} title={t("buttons.title")} help="buttons" icon={CircleDot} iconTone="accent">
-        <p className="text-small text-muted">{t("buttons.unavailable")}</p>
-        <ul className="mt-2 flex flex-col gap-1">
-          {missing.filter((r) => r.required).map((r) => (
-            <li key={r.name} className="text-caption">
-              <span className="font-medium">{r.name}</span>
-              <span className="text-muted"> · {t("buttons.package", { pkg: r.package })}</span>
-            </li>
-          ))}
-        </ul>
+        <Unavailable missing={missingRequired} />
       </Card>
     );
   }
 
   return (
     <Card index={index} title={t("buttons.title")} help="buttons" icon={CircleDot} iconTone="accent">
-      <p className="text-small text-muted mb-3">{t("buttons.intro")}</p>
+      {p.available ? <p className="text-small text-muted mb-3">{t("buttons.intro")}</p> : <div className="mb-3"><Unavailable missing={missingRequired} /></div>}
 
-      {p.buttons.length === 0 && <p className="text-small text-muted mb-3">{t("buttons.none")}</p>}
+      {p.available && p.buttons.length === 0 && <p className="text-small text-muted mb-3">{t("buttons.none")}</p>}
 
       <div className="divide-y divide-border/60">
-        {p.buttons.map((b) => {
+        {shown.map((b) => {
           const mine = actions.filter((a) => a.button === b.name);
           const hasMulti = mine.some((a) => a.trigger === "press" && (a.count ?? 1) > 1);
           return (
@@ -211,7 +208,7 @@ export function ButtonsCard({ index = 0 }: { index?: number }) {
                 {!b.board && b.pressed && <Pill tone="muted">{t("buttons.detected")}</Pill>}
                 {b.switch && <Pill tone="muted">{t("buttons.switchPill")}</Pill>}
                 <span className="flex-1" />
-                {adding !== b.name && !b.switch && (
+                {adding !== b.name && !b.switch && p.available && (
                   <Button size="sm" variant="ghost" icon={Plus} disabled={busy || actions.length >= 16} onClick={() => setAdding(b.name)}>
                     {t("buttons.add")}
                   </Button>
@@ -248,13 +245,13 @@ export function ButtonsCard({ index = 0 }: { index?: number }) {
         })}
       </div>
 
-      <div className="mt-3 flex flex-wrap items-center gap-2">
+      {p.available && <div className="mt-3 flex flex-wrap items-center gap-2">
         <Button size="sm" variant="secondary" icon={Radar} disabled={listenBase !== undefined} onClick={listen}>
           {t("buttons.detect")}
         </Button>
         {listenBase !== undefined && <span className="text-caption text-muted">{t("buttons.listening")}</span>}
         {listenBase === undefined && detected && <span className="text-caption text-ok">{t("buttons.detectedIs", { name: detected })}</span>}
-      </div>
+      </div>}
 
       {p.leds.length > 0 && (
         <div className="mt-4 max-w-xs">
@@ -270,7 +267,7 @@ export function ButtonsCard({ index = 0 }: { index?: number }) {
 
       {actions.length > 0 && !p.notify && <p className="text-caption text-muted mt-3">{t("buttons.notifyHint")}</p>}
 
-      {missing.length > 0 && (
+      {p.available && missing.length > 0 && (
         <ul className="mt-3 flex flex-col gap-1">
           {missing.map((r) => (
             <li key={r.name} className="text-caption text-muted">
@@ -296,6 +293,25 @@ export function ButtonsCard({ index = 0 }: { index?: number }) {
         </div>
       )}
     </Card>
+  );
+}
+
+function Unavailable({ missing }: { missing: ButtonRequirement[] }) {
+  const { t } = useTranslation();
+  // An older backend sends no list: the plain sentence alone.
+  if (missing.length === 0) return <p className="text-small text-muted">{t("buttons.unavailablePlain")}</p>;
+  return (
+    <>
+      <p className="text-small text-muted">{t("buttons.unavailable")}</p>
+      <ul className="mt-2 flex flex-col gap-1">
+        {missing.map((r) => (
+          <li key={r.name} className="text-caption">
+            <span className="font-medium">{r.name}</span>
+            <span className="text-muted"> · {t("buttons.package", { pkg: r.package })}</span>
+          </li>
+        ))}
+      </ul>
+    </>
   );
 }
 

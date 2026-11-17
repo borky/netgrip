@@ -53,18 +53,20 @@ Removing every action of a button puts its original back; removing the
 ## Requirements
 
 NetGrip installs none of these. The card lists what is missing, with the
-package; without a required one the feature stays off.
+package. Without a required one no action can be added; actions already
+assigned are still listed and can be removed, and NetGrip keeps repairing
+or removing its wrappers.
 
 | Needs | Package | Without it |
 | --- | --- | --- |
 | procd's button rule (`/etc/hotplug.json` → `/etc/rc.button`) | `procd`, `base-files` | Required |
-| `gpio-button-hotplug` | `kmod-gpio-button-hotplug` | Required: buttons send no events |
+| `gpio-button-hotplug` or `button-hotplug` | `kmod-gpio-button-hotplug` (GPIO buttons) or `kmod-button-hotplug` (input-layer buttons, e.g. x86) | Required: buttons send no events |
 | `awk` | `busybox` (awk) or `gawk` | Required |
 | `uci` | `uci` | Required |
-| `wifi` | `wifi-scripts` (`base-files` before 24.10) | No Wi-Fi action |
+| `wifi` | `wifi-scripts` (`netifd` before 24.10) | No Wi-Fi action |
 | `flock` or `lock` | `busybox` | Two actions at the very same moment may interleave |
 | `setsid` | `busybox` | Actions stay attached to procd's button handler; they still run |
-| `md5sum` or `sha256sum` | `busybox` | A Wi-Fi config saved at the same moment is noticed by size only |
+| `md5sum` or `sha256sum` | `busybox` | A Wi-Fi config saved at the same moment is noticed by its size and minute only |
 
 Tested on OpenWrt 25.12 (busybox 1.37, apk) with busybox's own `awk`,
 `sed` and `grep`, and with a PATH holding only basic busybox applets (no

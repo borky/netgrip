@@ -58,8 +58,10 @@ var (
 	btnHookPath   = "/etc/hotplug.d/button/00-netgrip"
 	btnInitPath   = "/etc/init.d/netgrip-buttons"
 	btnLedsDir    = "/sys/class/leds"
-	btnHotplugCfg = "/etc/hotplug.json"               // procd's hotplug rules
-	btnModuleDir  = "/sys/module/gpio_button_hotplug" // the kernel module that reports presses
+	btnHotplugCfg = "/etc/hotplug.json" // procd's hotplug rules
+	// The kernel modules that report presses: GPIO buttons, or the input
+	// layer's (x86 and some boards).
+	btnModuleDirs = []string{"/sys/module/gpio_button_hotplug", "/sys/module/button_hotplug"}
 	btnLookPath   = exec.LookPath
 	btnDTDir      = "/sys/firmware/devicetree/base"
 
@@ -192,14 +194,14 @@ type ButtonRequirement struct {
 type ButtonsProbe struct {
 	Available    bool                `json:"available"`
 	Requirements []ButtonRequirement `json:"requirements"`
-	Buttons     []ButtonInfo    `json:"buttons"`
-	Config      ButtonsConfig   `json:"config"`
-	LEDs        []string        `json:"leds"`
-	Networks    []ButtonNetwork `json:"networks"`
-	Events      []ButtonEvent   `json:"events"`
-	LastPress   *ButtonPress    `json:"last_press,omitempty"`
-	ListenUntil int64           `json:"listen_until,omitempty"`
-	Notify      bool            `json:"notify"`
+	Buttons      []ButtonInfo        `json:"buttons"`
+	Config       ButtonsConfig       `json:"config"`
+	LEDs         []string            `json:"leds"`
+	Networks     []ButtonNetwork     `json:"networks"`
+	Events       []ButtonEvent       `json:"events"`
+	LastPress    *ButtonPress        `json:"last_press,omitempty"`
+	ListenUntil  int64               `json:"listen_until,omitempty"`
+	Notify       bool                `json:"notify"`
 }
 
 var (
@@ -224,19 +226,23 @@ func btnRequirements() []ButtonRequirement {
 	rcdir := err == nil && st.IsDir()
 	rules, _ := os.ReadFile(btnHotplugCfg)
 	procd := rcdir && strings.Contains(string(rules), "rc.button")
-	// The module, or proof it works: a press already reached the runner.
-	_, err = os.Stat(btnModuleDir)
-	kmod := err == nil
+	// A module, or proof one works: a press already reached the runner.
+	kmod := false
+	for _, d := range btnModuleDirs {
+		if _, err := os.Stat(d); err == nil {
+			kmod = true
+		}
+	}
 	if !kmod {
 		seen, _ := filepath.Glob(filepath.Join(btnStateDir, "seen.*"))
 		kmod = len(seen) > 0
 	}
 	return []ButtonRequirement{
 		{Name: "procd button events", OK: procd, Required: true, Package: "procd, base-files", For: "buttons"},
-		{Name: "gpio-button-hotplug", OK: kmod, Required: true, Package: "kmod-gpio-button-hotplug", For: "buttons"},
+		{Name: "button-hotplug", OK: kmod, Required: true, Package: "kmod-gpio-button-hotplug (or kmod-button-hotplug)", For: "buttons"},
 		{Name: "awk", OK: btnHave("awk"), Required: true, Package: "busybox (awk) or gawk", For: "buttons"},
 		{Name: "uci", OK: btnHave("uci"), Required: true, Package: "uci", For: "buttons"},
-		{Name: "wifi", OK: btnHave("wifi"), Package: "wifi-scripts (base-files before 24.10)", For: "wifi"},
+		{Name: "wifi", OK: btnHave("wifi"), Package: "wifi-scripts (netifd before 24.10)", For: "wifi"},
 		{Name: "flock", OK: btnHave("flock", "lock"), Package: "busybox (flock or lock)", For: "locking"},
 		{Name: "setsid", OK: btnHave("setsid"), Package: "busybox (setsid)", For: "detach"},
 		{Name: "md5sum", OK: btnHave("md5sum", "sha256sum"), Package: "busybox (md5sum)", For: "check"},
@@ -251,6 +257,44 @@ func btnAvailable() bool {
 		}
 	}
 	return true
+}
+
+// btnCheckNew refuses actions this router cannot run. Only new ones:
+// removing actions, or keeping those already saved, always works, so a
+// router that lost a package can still be put back as it was.
+func btnCheckNew(cfg, current ButtonsConfig) error {
+	had := map[string]bool{}
+	for _, a := range current.Actions {
+		had[btnLine(a)] = true
+	}
+	avail := btnAvailable()
+	for _, a := range cfg.Actions {
+		if had[btnLine(a)] {
+			continue
+		}
+		if !avail {
+			return btnUnavailable()
+		}
+		if a.Action == "wifi_toggle" && !btnHave("wifi") {
+			return fmt.Errorf("%s: switching Wi-Fi needs the wifi command (wifi-scripts)", a.Button)
+		}
+	}
+	return nil
+}
+
+// btnHasManaged: a NetGrip wrapper is in place on some button. Then the
+// setup is kept up to date (and can be undone) whatever else is missing.
+func btnHasManaged() bool {
+	entries, err := os.ReadDir(btnRcDir)
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if data, err := os.ReadFile(filepath.Join(btnRcDir, e.Name())); err == nil && btnIsOurs(data) {
+			return true
+		}
+	}
+	return false
 }
 
 // btnUnavailable says what is missing.
@@ -361,9 +405,6 @@ func validateButtons(cfg *ButtonsConfig, reserved func(string) int) error {
 			return fmt.Errorf("%s: unknown action %q", a.Button, a.Action)
 		}
 		if a.Action == "wifi_toggle" {
-			if !btnHave("wifi") {
-				return fmt.Errorf("%s: switching Wi-Fi needs the wifi command (wifi-scripts)", a.Button)
-			}
 			if !reBtnIface.MatchString(a.Iface) || uciGet("wireless."+a.Iface) != "wifi-iface" {
 				return fmt.Errorf("%s: choose a Wi-Fi network", a.Button)
 			}
@@ -405,13 +446,13 @@ func validateButtons(cfg *ButtonsConfig, reserved func(string) int) error {
 func SetButtons(cfg ButtonsConfig) (ButtonsProbe, error) {
 	btnMu.Lock()
 	defer btnMu.Unlock()
-	if !btnAvailable() {
-		return btnProbeLocked(), btnUnavailable()
-	}
 	if cfg.Actions == nil {
 		cfg.Actions = []ButtonAction{}
 	}
 	if err := validateButtons(&cfg, btnReserved); err != nil {
+		return btnProbeLocked(), err
+	}
+	if err := btnCheckNew(cfg, loadButtonsConfig()); err != nil {
 		return btnProbeLocked(), err
 	}
 	if err := EnsureNetgripSection("buttons", "buttons"); err != nil {
@@ -1013,7 +1054,7 @@ func ProbeButtons() ButtonsProbe {
 	btnMu.Lock()
 	defer btnMu.Unlock()
 	cfg := loadButtonsConfig()
-	if btnAvailable() && (len(cfg.Actions) > 0 || btnTimedPending()) {
+	if (btnAvailable() || btnHasManaged()) && (len(cfg.Actions) > 0 || btnTimedPending() || btnHasManaged()) {
 		if err := btnApplyLocked(cfg); err != nil {
 			log.Printf("netgrip: buttons: %v", err)
 		}
@@ -1025,11 +1066,11 @@ func btnProbeLocked() ButtonsProbe {
 	cfg := loadButtonsConfig()
 	p := ButtonsProbe{
 		Requirements: btnRequirements(),
-		Config:    cfg,
-		LEDs:      btnLEDs(),
-		Networks:  btnNetworks(),
-		Events:    []ButtonEvent{},
-		Notify:    btnChannelFn(),
+		Config:       cfg,
+		LEDs:         btnLEDs(),
+		Networks:     btnNetworks(),
+		Events:       []ButtonEvent{},
+		Notify:       btnChannelFn(),
 	}
 	p.Available = true
 	for _, r := range p.Requirements {
@@ -1222,7 +1263,7 @@ func btnStartWatch(want bool) {
 // or a package upgrade replaces button scripts) and starts the watcher
 // when actions are assigned. Without actions it only cleans up.
 func StartButtons() {
-	if !btnAvailable() {
+	if !btnAvailable() && !btnHasManaged() {
 		return
 	}
 	btnMu.Lock()
