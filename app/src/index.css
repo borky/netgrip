@@ -124,6 +124,17 @@ html.dark {
   color-scheme: dark;
 }
 
+/* Open dropdown lists follow the theme: some browsers (Firefox, Chromium on
+   Linux) paint a native <select> list white unless its options say
+   otherwise. In the base layer, so a select's own classes still win. */
+@layer base {
+  select option,
+  select optgroup {
+    background-color: var(--color-surface);
+    color: var(--color-text);
+  }
+}
+
 body {
   background: var(--color-bg);
   color: var(--color-text);

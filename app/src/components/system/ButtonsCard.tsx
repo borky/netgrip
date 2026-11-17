@@ -1,24 +1,29 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { TFunction } from "i18next";
-import { CircleDot, Plus, Radar, Trash2 } from "lucide-react";
+import { CircleDot, Pencil, Plus, Radar, Trash2 } from "lucide-react";
 import { api } from "../../api";
 import type { ButtonAction, ButtonActionKind, ButtonEvent, ButtonInfo, ButtonNetwork, ButtonPress, ButtonRequirement, ButtonsConfig, ButtonsProbe } from "../../types";
 import { Button, Card, Field, Pill, SegmentedControl } from "../ui";
 import { fmtDate, fmtTime } from "../../lib/format";
 
-const SELECT = "w-full rounded-lg border bg-elevated px-2 py-1.5 text-small ring-focus";
+const SELECT = "h-9 w-full rounded-sm border border-border bg-surface-2 px-2.5 text-small text-text outline-none focus:border-accent ring-focus";
 const HOLDS = [2, 3, 4, 5, 7, 10, 15, 20, 30];
 const DURATIONS = [0, 5, 15, 30, 60, 120, 240, 480];
-const ACTIONS: ButtonActionKind[] = ["wifi_toggle", "firewall_restart", "access_restart"];
+const ACTIONS: ButtonActionKind[] = ["wifi_toggle", "wifi_on", "firewall_restart", "access_restart"];
+
+/** Actions that switch a Wi-Fi network (they take a network and a time). */
+function isWifi(k: string): boolean {
+  return k === "wifi_toggle" || k === "wifi_on";
+}
 
 function patternLabel(t: TFunction, a: Pick<ButtonAction, "trigger" | "count" | "seconds">): string {
   if (a.trigger === "hold") return t("buttons.hold", { count: a.seconds ?? 0 });
   return t(`buttons.press${a.count ?? 1}`);
 }
 
-function minutesLabel(t: TFunction, m: number): string {
-  if (m <= 0) return t("buttons.keep");
+function minutesLabel(t: TFunction, m: number, zero = "buttons.keep"): string {
+  if (m <= 0) return t(zero);
   if (m < 60) return t("buttons.minutes", { count: m });
   return t("buttons.hours", { count: m / 60 });
 }
@@ -31,6 +36,12 @@ function actionLabel(t: TFunction, a: ButtonAction, ssid: Map<string, string>): 
         ? t("buttons.doWifiFor", { name, time: minutesLabel(t, a.minutes ?? 0) })
         : t("buttons.doWifi", { name });
     }
+    case "wifi_on": {
+      const name = ssid.get(a.iface ?? "") ?? a.iface ?? "";
+      return (a.minutes ?? 0) > 0
+        ? t("buttons.doWifiOnFor", { name, time: minutesLabel(t, a.minutes ?? 0) })
+        : t("buttons.doWifiOn", { name });
+    }
     case "firewall_restart":
       return t("buttons.doFirewall");
     case "access_restart":
@@ -42,7 +53,7 @@ function actionLabel(t: TFunction, a: ButtonAction, ssid: Map<string, string>): 
 function eventLabel(t: TFunction, e: ButtonEvent, ssid: Map<string, string>): string {
   const failed = e.result.startsWith("failed");
   let what: string;
-  if (e.action === "wifi_toggle") {
+  if (isWifi(e.action)) {
     const [sec = "", state = "", min = "0"] = e.detail.split(" ");
     const name = ssid.get(sec) ?? sec;
     const on = state === "on";
@@ -95,6 +106,8 @@ export function ButtonsCard({ index = 0 }: { index?: number }) {
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<{ tone: "ok" | "danger"; text: string }>();
   const [adding, setAdding] = useState<string>();
+  // The saved action being edited (its form opens under its row).
+  const [editing, setEditing] = useState<ButtonAction>();
   // The last press the router had reported when listening started: a
   // different one is the new press. Router times only (the browser's clock
   // may differ). undefined: not listening.
@@ -150,6 +163,7 @@ export function ButtonsCard({ index = 0 }: { index?: number }) {
       const r = await api.setButtons(cfg);
       setP(r.state);
       setAdding(undefined);
+      setEditing(undefined);
       setMsg({ tone: "ok", text: t("buttons.saved") });
     } catch (e) {
       setMsg({ tone: "danger", text: e instanceof Error ? e.message : String(e) });
@@ -209,7 +223,7 @@ export function ButtonsCard({ index = 0 }: { index?: number }) {
                 {b.switch && <Pill tone="muted">{t("buttons.switchPill")}</Pill>}
                 <span className="flex-1" />
                 {adding !== b.name && !b.switch && p.available && (
-                  <Button size="sm" variant="ghost" icon={Plus} disabled={busy || actions.length >= 16} onClick={() => setAdding(b.name)}>
+                  <Button size="sm" variant="ghost" icon={Plus} disabled={busy || actions.length >= 16} onClick={() => { setEditing(undefined); setAdding(b.name); }}>
                     {t("buttons.add")}
                   </Button>
                 )}
@@ -220,16 +234,31 @@ export function ButtonsCard({ index = 0 }: { index?: number }) {
               {mine.length > 0 && (
                 <ul className="mt-2 flex flex-col gap-1.5">
                   {mine.map((a) => {
-                    const net = a.action === "wifi_toggle" ? p.networks.find((n) => n.section === a.iface) : undefined;
+                    const net = isWifi(a.action) ? p.networks.find((n) => n.section === a.iface) : undefined;
                     return (
-                      <li key={`${a.trigger}${a.count ?? a.seconds}`} className="flex items-center gap-2 rounded-md bg-surface-2 px-2.5 py-1.5">
-                        <span className="text-caption font-medium shrink-0">{patternLabel(t, a)}</span>
-                        <span className="text-caption text-muted min-w-0 flex-1 truncate">{actionLabel(t, a, ssid)}</span>
-                        {net && <NetworkState net={net} />}
-                        <button type="button" disabled={busy} onClick={() => remove(a)} aria-label={t("buttons.remove")}
-                          className="text-muted hover:text-danger ring-focus rounded-sm p-1">
-                          <Trash2 className="h-3.5 w-3.5" />
-                        </button>
+                      <li key={`${a.trigger}${a.count ?? a.seconds}`}>
+                        <div className="flex items-center gap-2 rounded-md bg-surface-2 px-2.5 py-1.5">
+                          <span className="text-caption font-medium shrink-0">{patternLabel(t, a)}</span>
+                          <span className="text-caption text-muted min-w-0 flex-1 truncate">{actionLabel(t, a, ssid)}</span>
+                          {net && <NetworkState net={net} />}
+                          {p.available && (
+                            <button type="button" disabled={busy} onClick={() => { setAdding(undefined); setEditing(editing === a ? undefined : a); }}
+                              aria-label={t("buttons.edit")} aria-expanded={editing === a}
+                              className="text-muted hover:text-text ring-focus rounded-sm p-1">
+                              <Pencil className="h-3.5 w-3.5" />
+                            </button>
+                          )}
+                          <button type="button" disabled={busy} onClick={() => remove(a)} aria-label={t("buttons.remove")}
+                            className="text-muted hover:text-danger ring-focus rounded-sm p-1">
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </button>
+                        </div>
+                        {editing === a && (
+                          <AddAction button={b} networks={p.networks} taken={mine.filter((x) => x !== a)} busy={busy} hasWifi={hasWifi}
+                            initial={a}
+                            onCancel={() => setEditing(undefined)}
+                            onAdd={(edited) => save({ ...p.config, actions: actions.map((x) => (x === a ? edited : x)) })} />
+                        )}
                       </li>
                     );
                   })}
@@ -323,8 +352,10 @@ function NetworkState({ net }: { net: ButtonNetwork }) {
   return <Pill tone={net.disabled ? "muted" : "ok"}>{t(net.disabled ? "buttons.netOff" : "buttons.netOn")}</Pill>;
 }
 
-function AddAction({ button, networks, taken, busy, hasWifi, onAdd, onCancel }: {
+function AddAction({ button, networks, taken, busy, hasWifi, initial, onAdd, onCancel }: {
   button: ButtonInfo;
+  /** The saved action being edited; absent for a new one. */
+  initial?: ButtonAction;
   hasWifi: boolean;
   networks: ButtonNetwork[];
   taken: ButtonAction[];
@@ -335,20 +366,23 @@ function AddAction({ button, networks, taken, busy, hasWifi, onAdd, onCancel }: 
   const { t } = useTranslation();
   const freePress = [1, 2, 3].filter((n) => !taken.some((a) => a.trigger === "press" && a.count === n));
   const freeHold = HOLDS.filter((s) => (!button.reserved || s < button.reserved) && !taken.some((a) => a.trigger === "hold" && a.seconds === s));
-  const [trigger, setTrigger] = useState<"press" | "hold">(freePress.length > 0 ? "press" : "hold");
-  const [count, setCount] = useState(freePress[0] ?? 1);
-  const [seconds, setSeconds] = useState(freeHold[0] ?? 2);
-  const [action, setAction] = useState<ButtonActionKind>(hasWifi ? "wifi_toggle" : "firewall_restart");
-  const [iface, setIface] = useState(networks[0]?.section ?? "");
-  const [minutes, setMinutes] = useState(30);
+  const [trigger, setTrigger] = useState<"press" | "hold">(initial?.trigger ?? (freePress.length > 0 ? "press" : "hold"));
+  const [count, setCount] = useState(initial?.count ?? freePress[0] ?? 1);
+  const [seconds, setSeconds] = useState(initial?.seconds ?? freeHold[0] ?? 2);
+  const [action, setAction] = useState<ButtonActionKind>(initial?.action ?? (hasWifi ? "wifi_toggle" : "firewall_restart"));
+  const [iface, setIface] = useState(initial?.iface ?? networks[0]?.section ?? "");
+  const [minutes, setMinutes] = useState(initial && isWifi(initial.action) ? initial.minutes ?? 0 : 30);
+  // An edited action may already use a Wi-Fi action on a router that
+  // lost the wifi command: it can keep it, not pick it anew.
+  const wifiOK = hasWifi || (initial !== undefined && isWifi(initial.action));
 
   const can = (trigger === "press" ? freePress.includes(count) : freeHold.includes(seconds))
-    && (action !== "wifi_toggle" || iface !== "");
+    && (!isWifi(action) || iface !== "");
 
   const submit = () => {
     const a: ButtonAction = { button: button.name, trigger, action };
     if (trigger === "press") a.count = count; else a.seconds = seconds;
-    if (action === "wifi_toggle") { a.iface = iface; a.minutes = minutes; }
+    if (isWifi(action)) { a.iface = iface; a.minutes = minutes; }
     onAdd(a);
   };
 
@@ -376,11 +410,11 @@ function AddAction({ button, networks, taken, busy, hasWifi, onAdd, onCancel }: 
         <Field label={t("buttons.action")}>
           <select className={SELECT} value={action} onChange={(e) => setAction(e.target.value as ButtonActionKind)}>
             {ACTIONS.map((k) => (
-              <option key={k} value={k} disabled={k === "wifi_toggle" && !hasWifi}>{t(`buttons.kind.${k}`)}</option>
+              <option key={k} value={k} disabled={isWifi(k) && !wifiOK}>{t(`buttons.kind.${k}`)}</option>
             ))}
           </select>
         </Field>
-        {action === "wifi_toggle" && (
+        {isWifi(action) && (
           <>
             <Field label={t("buttons.network")} hint={networks.length === 0 ? t("buttons.noNetworks") : undefined}>
               <select className={SELECT} value={iface} onChange={(e) => setIface(e.target.value)}>
@@ -391,11 +425,19 @@ function AddAction({ button, networks, taken, busy, hasWifi, onAdd, onCancel }: 
                 ))}
               </select>
             </Field>
-            <Field label={t("buttons.duration")} hint={t("buttons.durationHint")}>
-              <select className={SELECT} value={minutes} onChange={(e) => setMinutes(Number(e.target.value))}>
-                {DURATIONS.map((m) => <option key={m} value={m}>{minutesLabel(t, m)}</option>)}
-              </select>
-            </Field>
+            {action === "wifi_on" ? (
+              <Field label={t("buttons.offAfter")} hint={t("buttons.offAfterHint")}>
+                <select className={SELECT} value={minutes} onChange={(e) => setMinutes(Number(e.target.value))}>
+                  {DURATIONS.map((m) => <option key={m} value={m}>{minutesLabel(t, m, "buttons.stayOn")}</option>)}
+                </select>
+              </Field>
+            ) : (
+              <Field label={t("buttons.duration")} hint={t("buttons.durationHint")}>
+                <select className={SELECT} value={minutes} onChange={(e) => setMinutes(Number(e.target.value))}>
+                  {DURATIONS.map((m) => <option key={m} value={m}>{minutesLabel(t, m)}</option>)}
+                </select>
+              </Field>
+            )}
           </>
         )}
       </div>

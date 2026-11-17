@@ -97,7 +97,7 @@ export function SelfUpdateCard({ index = 2 }: { index?: number }) {
                   <label className="flex items-center gap-2">
                     <span className="text-small text-muted">{t("selfupdate.interval")}</span>
                     <select
-                      className="rounded-lg border bg-elevated px-2 py-1 text-small"
+                      className="rounded-lg border border-border bg-surface-2 px-2 py-1 text-small text-text"
                       value={cfg.intervalHours <= 24 ? 24 : 168}
                       disabled={saving}
                       onChange={(e) => save({ intervalHours: Number(e.target.value) })}
@@ -109,7 +109,7 @@ export function SelfUpdateCard({ index = 2 }: { index?: number }) {
                   <label className="flex items-center gap-2">
                     <span className="text-small text-muted">{t("selfupdate.window")}</span>
                     <select
-                      className="rounded-lg border bg-elevated px-2 py-1 text-small"
+                      className="rounded-lg border border-border bg-surface-2 px-2 py-1 text-small text-text"
                       value={cfg.windowStart}
                       disabled={saving}
                       onChange={(e) => {

@@ -445,6 +445,43 @@ act_wifi() {
 	event "$b" "$p" wifi_toggle "$s $(state_word "$new") $m" ok
 }
 
+# act_wifi_on: a network on, whatever its state, and off again after <m>
+# minutes (0: it stays on). A press while it is on starts the time again.
+# The timed record holds the state to go back to: off ("1").
+act_wifi_on() {
+	local b="$1" p="$2" s="$3" m="$4" rec cur tok until
+	rec="$ETC/timed/$s"
+	take wifi 8
+	if ! wl_load || [ "$(wl get "ngbwifi.$s")" != wifi-iface ]; then
+		drop wifi 8
+		event "$b" "$p" wifi_on "$s" "failed: no such Wi-Fi network"
+		return
+	fi
+	cur=$(wl get "ngbwifi.$s.disabled")
+	mkdir -p "$STATE/hold"
+	tok=$(token)
+	until=0
+	if [ "$m" -gt 0 ]; then
+		mkdir -p "$ETC/timed"
+		# Replaces any earlier timer: its revert finds another token and
+		# does nothing.
+		echo "1 $tok" > "$rec"
+		until=$(($(date +%s) + m * MINUTE))
+	else
+		rm -f "$rec"
+	fi
+	echo "$until $tok" > "$STATE/hold/$s"
+	if [ "$cur" = 1 ] && ! set_disabled "$s" 0; then
+		rm -f "$rec" "$STATE/hold/$s"
+		drop wifi 8
+		event "$b" "$p" wifi_on "$s on $m" failed
+		return
+	fi
+	drop wifi 8
+	[ "$m" -gt 0 ] && spawn revert "$s" "$tok" "$m" "$b"
+	event "$b" "$p" wifi_on "$s on $m" ok
+}
+
 cmd_revert() {
 	local s="$1" tok="$2" m="$3" b="$4" rec prev cur rest
 	rec="$ETC/timed/$s"
@@ -504,6 +541,7 @@ cmd_act() {
 	blinker=$!
 	case "$a" in
 	wifi_toggle) act_wifi "$b" "$p" "$target" "${m:-0}" ;;
+	wifi_on) act_wifi_on "$b" "$p" "$target" "${m:-0}" ;;
 	firewall_restart) act_firewall "$b" "$p" ;;
 	access_restart) act_access "$b" "$p" ;;
 	*) event "$b" "$p" "$a" - "failed: unknown action" ;;

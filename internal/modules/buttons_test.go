@@ -202,19 +202,23 @@ func TestValidateButtons(t *testing.T) {
 		{Button: "reset", Trigger: "press", Count: 3, Action: "wifi_toggle", Iface: "guest_ap", Minutes: 30},
 		{Button: "reset", Trigger: "hold", Seconds: 4, Action: "access_restart"},
 		{Button: "reset", Trigger: "press", Count: 1, Action: "firewall_restart"},
+		{Button: "wps", Trigger: "press", Count: 2, Action: "wifi_on", Iface: "guest_ap", Minutes: 15},
 	}}
 	if err := validateButtons(&ok, reserved); err != nil {
 		t.Fatalf("valid config refused: %v", err)
 	}
 	// Sorted per button, presses first; options an action does not use
 	// are dropped.
-	want := []string{"reset press 1", "reset press 3", "reset hold 4", "wps hold 10"}
+	want := []string{"reset press 1", "reset press 3", "reset hold 4", "wps press 2", "wps hold 10"}
 	for i, a := range ok.Actions {
 		if got := strings.Join(strings.Fields(btnLine(a))[:3], " "); got != want[i] {
 			t.Errorf("action %d = %q, want %q", i, got, want[i])
 		}
 	}
-	if a := ok.Actions[3]; a.Iface != "" || a.Minutes != 0 {
+	if a := ok.Actions[3]; a.Iface != "guest_ap" || a.Minutes != 15 {
+		t.Errorf("wifi_on lost its network or time: %+v", a)
+	}
+	if a := ok.Actions[4]; a.Iface != "" || a.Minutes != 0 {
 		t.Errorf("firewall action kept wifi options: %+v", a)
 	}
 
@@ -230,6 +234,7 @@ func TestValidateButtons(t *testing.T) {
 		"one second hold":  {Actions: []ButtonAction{{Button: "wps", Trigger: "hold", Seconds: 1, Action: "firewall_restart"}}},
 		"unknown action":   {Actions: []ButtonAction{{Button: "wps", Trigger: "press", Count: 1, Action: "reboot"}}},
 		"unknown network":  {Actions: []ButtonAction{{Button: "wps", Trigger: "press", Count: 1, Action: "wifi_toggle", Iface: "nope"}}},
+		"wifi_on, no net":  {Actions: []ButtonAction{{Button: "wps", Trigger: "press", Count: 1, Action: "wifi_on"}}},
 		"shell in network": {Actions: []ButtonAction{{Button: "wps", Trigger: "press", Count: 1, Action: "wifi_toggle", Iface: "a;b"}}},
 		"too long":         {Actions: []ButtonAction{{Button: "wps", Trigger: "press", Count: 1, Action: "wifi_toggle", Iface: "guest_ap", Minutes: 1441}}},
 		"missing LED":      {LED: "red:none"},
@@ -439,6 +444,7 @@ func TestBtnEventText(t *testing.T) {
 		{ButtonEvent{Button: "reset", Pattern: "timer", Action: "wifi_toggle", Detail: "guest_ap off 30", Result: "reverted"}, `Wi-Fi "Guest" is off again after 30 min`},
 		{ButtonEvent{Button: "boot", Pattern: "timer", Action: "wifi_toggle", Detail: "guest_ap off 0", Result: "reverted"}, `Wi-Fi "Guest" is off again: the router restarted before its time was up`},
 		{ButtonEvent{Button: "wps", Pattern: "hold4", Action: "access_restart", Detail: "dropbear,netgrip", Result: "ok"}, `Button wps held 4 s: restarted dropbear, netgrip`},
+		{ButtonEvent{Button: "wps", Pattern: "press2", Action: "wifi_on", Detail: "guest_ap on 15", Result: "ok"}, `Button wps pressed twice: Wi-Fi "Guest" turned on for 15 min`},
 		{ButtonEvent{Button: "wps", Pattern: "press1", Action: "firewall_restart", Detail: "-", Result: "failed"}, `Button wps pressed: restarting the firewall failed`},
 	}
 	for _, c := range cases {
