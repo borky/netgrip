@@ -90,7 +90,9 @@ func btnTestRouter(t *testing.T) (root string, enabled *[]bool) {
 	}
 	t.Cleanup(func() { btnInitEnableFn = oldInit })
 	set(&btnHotplugCfg, filepath.Join(root, "etc/hotplug.json"))
-	set(&btnModuleDir, filepath.Join(root, "sys/module/gpio_button_hotplug"))
+	oldMods := btnModuleDirs
+	btnModuleDirs = []string{filepath.Join(root, "sys/module/gpio_button_hotplug"), filepath.Join(root, "sys/module/button_hotplug")}
+	t.Cleanup(func() { btnModuleDirs = oldMods })
 	// Every command present unless a test says otherwise.
 	oldLook := btnLookPath
 	btnLookPath = func(c string) (string, error) { return "/usr/bin/" + c, nil }
@@ -767,7 +769,8 @@ func TestBtnRequirements(t *testing.T) {
 		t.Fatalf("message does not name the package: %v", err)
 	}
 	btnWriteT(t, filepath.Join(root, "etc/hotplug.json"), `[ "button", "/etc/rc.button/%BUTTON%" ]`)
-	btnWriteT(t, filepath.Join(root, "sys/module/gpio_button_hotplug/refcnt"), "0\n")
+	// x86-style: the input layer's module counts too.
+	btnWriteT(t, filepath.Join(root, "sys/module/button_hotplug/refcnt"), "0\n")
 	if !btnAvailable() {
 		t.Fatalf("not available with everything required: %+v", btnRequirements())
 	}
@@ -775,15 +778,30 @@ func TestBtnRequirements(t *testing.T) {
 	if r["setsid"].OK || r["wifi"].OK || r["md5sum"].OK || !r["flock"].OK {
 		t.Fatalf("optional checks wrong: %+v", r)
 	}
-	// Without the wifi command, the Wi-Fi action is refused.
-	btnFakeWireless(t, "guest_ap")
-	cfg := ButtonsConfig{Actions: []ButtonAction{{Button: "wps", Trigger: "press", Count: 1, Action: "wifi_toggle", Iface: "guest_ap"}}}
-	if err := validateButtons(&cfg, func(string) int { return 0 }); err == nil || !strings.Contains(err.Error(), "wifi-scripts") {
-		t.Fatalf("wifi action without wifi: %v", err)
+	// Without the wifi command, a new Wi-Fi action is refused, but one
+	// already saved does not block saving the rest.
+	wifiA := ButtonAction{Button: "wps", Trigger: "press", Count: 1, Action: "wifi_toggle", Iface: "guest_ap"}
+	fwA := ButtonAction{Button: "wps", Trigger: "press", Count: 2, Action: "firewall_restart"}
+	if err := btnCheckNew(ButtonsConfig{Actions: []ButtonAction{wifiA}}, ButtonsConfig{}); err == nil || !strings.Contains(err.Error(), "wifi-scripts") {
+		t.Fatalf("new wifi action without wifi: %v", err)
 	}
-	// awk missing: required, so not available.
+	if err := btnCheckNew(ButtonsConfig{Actions: []ButtonAction{wifiA, fwA}}, ButtonsConfig{Actions: []ButtonAction{wifiA}}); err != nil {
+		t.Fatalf("a saved wifi action blocked adding another: %v", err)
+	}
+	// awk missing: required, so not available; nothing new can be added,
+	// but actions can still be removed or kept.
 	missing["awk"] = true
 	if btnAvailable() {
 		t.Fatal("available without awk")
+	}
+	saved := ButtonsConfig{Actions: []ButtonAction{wifiA, fwA}}
+	if err := btnCheckNew(ButtonsConfig{Actions: []ButtonAction{fwA}}, saved); err != nil {
+		t.Fatalf("removing an action refused: %v", err)
+	}
+	if err := btnCheckNew(ButtonsConfig{}, saved); err != nil {
+		t.Fatalf("removing every action refused: %v", err)
+	}
+	if err := btnCheckNew(ButtonsConfig{Actions: []ButtonAction{{Button: "reset", Trigger: "press", Count: 1, Action: "firewall_restart"}}}, saved); err == nil {
+		t.Fatal("a new action was accepted on a router missing awk")
 	}
 }

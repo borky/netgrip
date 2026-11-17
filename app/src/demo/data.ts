@@ -961,10 +961,10 @@ export const demoButtons: T.ButtonsProbe = {
   available: true,
   requirements: [
     { name: "procd button events", ok: true, required: true, package: "procd, base-files", for: "buttons" },
-    { name: "gpio-button-hotplug", ok: true, required: true, package: "kmod-gpio-button-hotplug", for: "buttons" },
+    { name: "button-hotplug", ok: true, required: true, package: "kmod-gpio-button-hotplug (or kmod-button-hotplug)", for: "buttons" },
     { name: "awk", ok: true, required: true, package: "busybox (awk) or gawk", for: "buttons" },
     { name: "uci", ok: true, required: true, package: "uci", for: "buttons" },
-    { name: "wifi", ok: true, required: false, package: "wifi-scripts (base-files before 24.10)", for: "wifi" },
+    { name: "wifi", ok: true, required: false, package: "wifi-scripts (netifd before 24.10)", for: "wifi" },
     { name: "flock", ok: true, required: false, package: "busybox (flock or lock)", for: "locking" },
     { name: "setsid", ok: true, required: false, package: "busybox (setsid)", for: "detach" },
     { name: "md5sum", ok: true, required: false, package: "busybox (md5sum)", for: "check" },

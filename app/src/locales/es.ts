@@ -3124,7 +3124,8 @@ export default {
   buttons: {
     title: "Botones del router",
     intro: "Acciones que ejecutan los botones del propio router, para volver a entrar cuando algo se rompe. Se ejecutan en el router aunque este panel no responda.",
-    unavailable: "Los botones del router necesitan esto, que este router no tiene. Instálalo y recarga la página:",
+    unavailablePlain: "Este router no pasa las pulsaciones de botón a scripts, así que sus botones no pueden ejecutar acciones.",
+    unavailable: "Los botones del router necesitan esto, que este router no tiene. Instálalo y recarga la página; las acciones ya asignadas se pueden quitar:",
     none: "Aún no se conoce ningún botón. Usa Detectar un botón y púlsalo en el router.",
     active: "En uso",
     detected: "Detectado",
@@ -3178,7 +3179,7 @@ export default {
       wifi: "Encender/apagar Wi-Fi necesita el comando {{name}}.",
       locking: "Sin {{name}}, dos acciones en el mismo instante podrían mezclarse.",
       detach: "Sin {{name}}, las acciones se ejecutan unidas al gestor de la pulsación; se ejecutan igual.",
-      check: "Sin {{name}}, una configuración Wi-Fi guardada en el mismo momento solo se detecta por su tamaño.",
+      check: "Sin {{name}}, una configuración Wi-Fi guardada en el mismo momento solo se detecta por su tamaño y minuto.",
     },
     holdFor: "Mantener durante",
     reservedHint_one: "{{count}} s o más es el restablecimiento de fábrica, que se mantiene.",
