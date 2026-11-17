@@ -1918,7 +1918,7 @@ export interface QResult {
 }
 
 /** Router buttons: actions a physical button press runs. */
-export type ButtonActionKind = "wifi_toggle" | "firewall_restart" | "access_restart";
+export type ButtonActionKind = "wifi_toggle" | "wifi_on" | "firewall_restart" | "access_restart";
 
 export interface ButtonAction {
   button: string;
@@ -1928,7 +1928,7 @@ export interface ButtonAction {
   /** hold: at least this many seconds. */
   seconds?: number;
   action: ButtonActionKind;
-  /** wifi_toggle: the wireless section, and minutes before it goes back (0 = keeps). */
+  /** wifi_toggle / wifi_on: the wireless section, and minutes before it goes back (wifi_on: off) (0 = keeps). */
   iface?: string;
   minutes?: number;
 }

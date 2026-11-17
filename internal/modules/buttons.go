@@ -96,6 +96,7 @@ const (
 // The actions a button can run.
 var btnActionKinds = map[string]bool{
 	"wifi_toggle":      true, // one Wi-Fi network on/off, optionally for a while
+	"wifi_on":          true, // one Wi-Fi network on, off again after a while
 	"firewall_restart": true,
 	"access_restart":   true, // SSH, LuCI's web server, the NetGrip panel
 }
@@ -107,6 +108,11 @@ var (
 	reBtnSeenGe = regexp.MustCompile(`SEEN"?\s+-(ge|gt)\s+([0-9]+)`)
 	reBtnQuoted = regexp.MustCompile(`'([^']*)'`)
 )
+
+// btnIsWifiAction: the action switches a Wi-Fi network (Iface, Minutes).
+func btnIsWifiAction(a string) bool {
+	return a == "wifi_toggle" || a == "wifi_on"
+}
 
 // ButtonAction is one assigned action. A press is Count presses in a row
 // (1 to 3); a hold is keeping the button down at least Seconds.
@@ -275,7 +281,7 @@ func btnCheckNew(cfg, current ButtonsConfig) error {
 		if !avail {
 			return btnUnavailable()
 		}
-		if a.Action == "wifi_toggle" && !btnHave("wifi") {
+		if btnIsWifiAction(a.Action) && !btnHave("wifi") {
 			return fmt.Errorf("%s: switching Wi-Fi needs the wifi command (wifi-scripts)", a.Button)
 		}
 	}
@@ -404,7 +410,7 @@ func validateButtons(cfg *ButtonsConfig, reserved func(string) int) error {
 		if !btnActionKinds[a.Action] {
 			return fmt.Errorf("%s: unknown action %q", a.Button, a.Action)
 		}
-		if a.Action == "wifi_toggle" {
+		if btnIsWifiAction(a.Action) {
 			if !reBtnIface.MatchString(a.Iface) || uciGet("wireless."+a.Iface) != "wifi-iface" {
 				return fmt.Errorf("%s: choose a Wi-Fi network", a.Button)
 			}
@@ -1157,7 +1163,7 @@ func btnEventText(e ButtonEvent, ssid map[string]string) string {
 	failed := strings.HasPrefix(e.Result, "failed")
 	var what string
 	switch e.Action {
-	case "wifi_toggle":
+	case "wifi_toggle", "wifi_on":
 		f := strings.Fields(e.Detail)
 		name, state, minutes := e.Detail, "", 0
 		if len(f) >= 2 {
