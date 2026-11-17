@@ -145,6 +145,9 @@ if [ -z "$${IPKG_INSTROOT}" ]; then
 		/etc/init.d/firewall reload 2>/dev/null || true
 		wifi reload 2>/dev/null || true
 	fi
+	# Router buttons: each button gets its original script back and a
+	# Wi-Fi network a button turned on or off for a while goes back now.
+	[ -x /usr/libexec/netgrip-button ] && /usr/libexec/netgrip-button uninstall
 fi
 exit 0
 endef

@@ -377,7 +377,13 @@ func wifiSchedTick() {
 		if !ok {
 			continue
 		}
-		reconcileWifiSchedule(sec, wifiScheduleOffAt(now, sched))
+		off := wifiScheduleOffAt(now, sched)
+		// A router button turned this network on or off: the schedule
+		// waits (see btnScheduleHeld).
+		if btnScheduleHeld(sec, off) {
+			continue
+		}
+		reconcileWifiSchedule(sec, off)
 	}
 	// Self-heal: a schedule deleted from UCI while its window was active
 	// (manual cleanup, factory edit) leaves the interface off with no rule

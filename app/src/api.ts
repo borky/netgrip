@@ -274,6 +274,16 @@ const realApi = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(edit),
     }),
+  buttons: () => request<import("./types").ButtonsProbe>("/api/buttons"),
+  setButtons: (cfg: import("./types").ButtonsConfig) =>
+    request<import("./types").ModuleResult<import("./types").ButtonsProbe>>("/api/buttons", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(cfg),
+    }),
+  listenButtons: () =>
+    request<import("./types").ModuleResult<import("./types").ButtonsProbe>>("/api/buttons/listen", { method: "POST" }),
+  buttonsLast: () => request<import("./types").ButtonsListen>("/api/buttons/last"),
   wifiSchedule: () =>
     request<{ schedules: import("./types").WifiScheduleState[] }>("/api/wifischedule"),
   setWifiSchedule: (sched: import("./types").WifiSchedule) =>

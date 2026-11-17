@@ -24,6 +24,7 @@ const state = {
   wireless: D.demoWireless,
   wifi: D.demoWifi,
   wifischedule: structuredClone(D.demoWifiSchedules),
+  buttons: structuredClone(D.demoButtons),
   wifichan: structuredClone(D.demoWifiChan),
   wg: structuredClone(D.demoWg),
   ddns: { ...D.demoDdns },
@@ -1058,6 +1059,18 @@ export const demoApi: typeof api = {
 
   // wifi
   wifi: () => get({ interfaces: state.wifi }),
+  buttons: () => get(state.buttons),
+  setButtons: async (cfg) => {
+    state.buttons.config = structuredClone(cfg);
+    const used = new Set(cfg.actions.map((a) => a.button));
+    state.buttons.buttons = state.buttons.buttons.map((b) => ({ ...b, managed: used.has(b.name) }));
+    return write(state.buttons);
+  },
+  listenButtons: async () => {
+    state.buttons.listen_until = Math.floor(Date.now() / 1000) + 300;
+    return write(state.buttons);
+  },
+  buttonsLast: () => get({ last_press: state.buttons.last_press, listen_until: state.buttons.listen_until }),
   wifiSchedule: () => get({ schedules: state.wifischedule }),
   setWifiSchedule: async (sched) => {
     const st = state.wifischedule.find((x) => x.section === sched.section);

@@ -13,6 +13,7 @@ import { UpdateCard } from "../components/system/UpdateCard";
 import { SelfUpdateCard } from "../components/system/SelfUpdateCard";
 import { WizardRelaunchCard } from "../components/system/WizardRelaunchCard";
 import { OptionsCard } from "../components/system/OptionsCard";
+import { ButtonsCard } from "../components/system/ButtonsCard";
 import { MdnsCard } from "../components/services/MdnsCard";
 import { NetPulseStandaloneBanner, NetPulseStatusChip } from "../components/system/NetPulseStatus";
 import { useTranslation } from "react-i18next";
@@ -73,7 +74,9 @@ export function System({ board, update, onUpdateChange, onLogout }: {
         {canSwitchMode && <MdnsCard probe={mdnsProbe} onChange={setMdnsProbe} index={3} />}
         <ConfigBackupCard index={4} />
         <OptionsCard index={5} />
-        {isRouter && <WizardRelaunchCard index={6} />}
+        {/* Router buttons: on any OpenWrt device with buttons, AP or router. */}
+        <ButtonsCard index={6} />
+        {isRouter && <WizardRelaunchCard index={7} />}
       </section>
 
       {/* Actualizaciones (#499): última sección, con la identidad y el
