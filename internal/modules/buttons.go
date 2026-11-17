@@ -284,7 +284,7 @@ func validateButtons(cfg *ButtonsConfig, reserved func(string) int) error {
 				return fmt.Errorf("%s: a hold must be %d to %d seconds", a.Button, btnHoldMin, btnHoldMax)
 			}
 			if r := reserved(a.Button); r > 0 && a.Seconds >= r {
-				return fmt.Errorf("%s: holding it %d seconds or more resets the router to factory settings; choose a shorter hold", a.Button, r)
+				return fmt.Errorf("%s: holding it %d seconds or more stays with what the button does on its own (resetting the router); choose a shorter hold", a.Button, r)
 			}
 		default:
 			return fmt.Errorf("%s: unknown trigger %q", a.Button, a.Trigger)
@@ -442,12 +442,22 @@ func btnOriginal(name string) ([]byte, bool) {
 	if data, err := os.ReadFile(filepath.Join(btnRcDir, name)); err == nil && !btnIsOurs(data) {
 		return data, true
 	}
+	if btnHadNone(name) {
+		return nil, false
+	}
 	for _, p := range []string{filepath.Join(btnEtcDir, "orig", name), filepath.Join(btnRomRcDir, name)} {
 		if data, err := os.ReadFile(p); err == nil && !btnIsOurs(data) {
 			return data, true
 		}
 	}
 	return nil, false
+}
+
+// btnHadNone: the button had no script when NetGrip took it over. One
+// removed on purpose must not come back from the firmware image.
+func btnHadNone(name string) bool {
+	_, err := os.Stat(filepath.Join(btnEtcDir, "orig", name+".none"))
+	return err == nil
 }
 
 func btnIsOurs(data []byte) bool {
@@ -621,14 +631,17 @@ func btnWrapper(name string, reserved int) string {
 # press to the original script, kept in %s.
 # Removing the button's actions in NetGrip puts the original back.
 [ -x %s ] && exec %s rc '%s' %d
-# Without NetGrip's runner: the original, else the firmware image's.
+# Without NetGrip's runner: the original, else the firmware image's (not
+# when the button had no script of its own).
+[ -f %s.none ] && exit 0
 for o in %s %s; do
 	[ -f "$o" ] || continue
+	grep -q %s "$o" && continue
 	[ -x "$o" ] && exec "$o"
 	exec /bin/sh "$o"
 done
 exit 0
-`, btnMarker, orig, btnRunnerPath, btnRunnerPath, name, reserved, orig, rom)
+`, btnMarker, orig, btnRunnerPath, btnRunnerPath, name, reserved, orig, orig, rom, btnMarker)
 }
 
 func btnHookScript() string {
@@ -715,10 +728,15 @@ func btnEnsureWrapper(name string) error {
 		if err := btnWrite(orig, cur, 0o755); err != nil {
 			return fmt.Errorf("keep the original %s script: %w", name, err)
 		}
+		_ = os.Remove(orig + ".none")
 	case os.IsNotExist(err):
-		// No script: the button did nothing. Any kept copy is from an
-		// older system and must not come back.
+		// No script: the button did nothing, and must go on doing
+		// nothing for presses not assigned (not the firmware's script).
+		// Any kept copy is from an older system and must not come back.
 		_ = os.Remove(orig)
+		if err := btnWrite(orig+".none", []byte("# "+btnMarker+": "+name+" had no script\n"), 0o644); err != nil {
+			return err
+		}
 	case err != nil:
 		return err
 	}
@@ -730,14 +748,21 @@ func btnEnsureWrapper(name string) error {
 func btnRestore(name string) error {
 	path := filepath.Join(btnRcDir, name)
 	orig := filepath.Join(btnEtcDir, "orig", name)
+	if btnHadNone(name) {
+		_ = os.Remove(orig + ".none")
+		if cur, err := os.ReadFile(path); err == nil && btnIsOurs(cur) {
+			return os.Remove(path)
+		}
+		return nil
+	}
 	data, err := os.ReadFile(orig)
-	if err == nil {
+	if err == nil && !btnIsOurs(data) {
 		if err := btnWrite(path, data, 0o755); err != nil {
 			return err
 		}
 		return os.Remove(orig)
 	}
-	if !os.IsNotExist(err) {
+	if err != nil && !os.IsNotExist(err) {
 		return err
 	}
 	// The kept copy is gone: the firmware image's script, if it has one.
@@ -838,6 +863,11 @@ func btnApplyLocked(cfg ButtonsConfig) error {
 		btnRemoveOurs(btnRunnerPath)
 		_ = os.Remove(filepath.Join(btnEtcDir, "actions"))
 		_ = os.Remove(filepath.Join(btnEtcDir, "led"))
+		if names, _ := filepath.Glob(filepath.Join(btnEtcDir, "orig", "*.none")); len(names) > 0 {
+			for _, n := range names {
+				_ = os.Remove(n)
+			}
+		}
 		_ = os.Remove(filepath.Join(btnEtcDir, "orig"))
 		_ = os.Remove(btnEtcDir)
 	}

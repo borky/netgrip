@@ -3165,7 +3165,7 @@ export default {
     stockPower: "A press you do not assign still powers the router off.",
     stockReboot: "Holding it still restarts the router, unless that hold is assigned.",
     stockCustom: "A press you do not assign runs the button's own script, as before.",
-    multiNote: "A single press acts about 1 second after you let go, to tell it apart from a double or triple press.",
+    multiNote: "A single press acts about 1 second after you let go, to tell it apart from a double or triple press. Wait 2 s before repeating a pattern.",
     when: "When",
     trigPress: "Press",
     trigHold: "Hold",

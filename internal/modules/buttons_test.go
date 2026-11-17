@@ -589,3 +589,150 @@ func TestBtnRunnerScript(t *testing.T) {
 		t.Fatalf("events:\n%s", events)
 	}
 }
+
+func TestBtnHadNoScriptStaysWithout(t *testing.T) {
+	_, _ = btnTestRouter(t)
+	// The user removed reset's script; the firmware image still has it.
+	btnWriteT(t, filepath.Join(btnRomRcDir, "reset"), btnStockReset)
+	cfg := ButtonsConfig{Actions: []ButtonAction{{Button: "reset", Trigger: "press", Count: 2, Action: "firewall_restart"}}}
+	if err := btnApplyLocked(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := btnOriginal("reset"); ok {
+		t.Fatal("the firmware's script counts as the original of a button that had none")
+	}
+	w := btnReadT(t, filepath.Join(btnRcDir, "reset"))
+	if !strings.Contains(w, ".none ] && exit 0") {
+		t.Fatalf("wrapper falls back to the firmware's script:\n%s", w)
+	}
+	if err := btnApplyLocked(ButtonsConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	if btnExists(filepath.Join(btnRcDir, "reset")) {
+		t.Fatal("removing the actions brought the firmware's script back")
+	}
+	if btnExists(filepath.Join(btnEtcDir, "orig", "reset.none")) {
+		t.Fatal("marker left behind")
+	}
+}
+
+// btnRunnerEnv prepares a runner with fake commands in a temporary router.
+func btnRunnerEnv(t *testing.T, actions string) (dir string, env []string, logf string) {
+	t.Helper()
+	for _, tool := range []string{"sh", "flock", "setsid", "awk"} {
+		if _, err := exec.LookPath(tool); err != nil {
+			t.Skipf("no %s", tool)
+		}
+	}
+	if _, err := os.Stat("/proc/uptime"); err != nil {
+		t.Skip("no /proc/uptime")
+	}
+	dir = t.TempDir()
+	bin := filepath.Join(dir, "bin")
+	logf = filepath.Join(dir, "log")
+	btnWriteT(t, filepath.Join(dir, "runner"), string(btnRunnerScript))
+	btnWriteT(t, filepath.Join(bin, "logger"), "#!/bin/sh\n:\n")
+	btnWriteT(t, filepath.Join(bin, "uci"), "#!/bin/sh\necho \"uci $*\" >> "+logf+"\n")
+	btnWriteT(t, filepath.Join(dir, "initd", "firewall"), "#!/bin/sh\n[ \"$1\" = enabled ] && exit 0\necho \"initd firewall $1\" >> "+logf+"\n")
+	btnWriteT(t, filepath.Join(dir, "etc/orig/reset"), "#!/bin/sh\necho \"orig $ACTION $SEEN\" >> "+logf+"\n")
+	btnWriteT(t, filepath.Join(dir, "etc/actions"), actions)
+	env = append(os.Environ(),
+		"PATH="+bin+":"+os.Getenv("PATH"),
+		"NGB_STATE="+filepath.Join(dir, "state"),
+		"NGB_ETC="+filepath.Join(dir, "etc"),
+		"NGB_SELF="+filepath.Join(dir, "runner"),
+		"NGB_INITD="+filepath.Join(dir, "initd"),
+		"NGB_LEDS="+filepath.Join(dir, "leds"),
+		"NGB_ROMRC="+filepath.Join(dir, "rom"),
+		"NGB_RCDIR="+filepath.Join(dir, "rc"),
+		"NGB_HOOK="+filepath.Join(dir, "hook/00-netgrip"),
+		"NGB_CONFIG="+filepath.Join(dir, "config"),
+	)
+	return dir, env, logf
+}
+
+func btnWaitLog(t *testing.T, logf, want string) {
+	t.Helper()
+	for i := 0; i < 40; i++ {
+		if data, _ := os.ReadFile(logf); strings.Contains(string(data), want) {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	data, _ := os.ReadFile(logf)
+	t.Fatalf("%q never logged:\n%s", want, data)
+}
+
+func TestBtnRunnerSlowAndExtraPresses(t *testing.T) {
+	dir, env, logf := btnRunnerEnv(t, "reset press 2 firewall_restart - 0\n")
+	release := func(seen string) {
+		cmd := exec.Command("sh", filepath.Join(dir, "runner"), "rc", "reset", "5")
+		cmd.Env = append(env, "BUTTON=reset", "ACTION=released", "SEEN="+seen)
+		if err := cmd.Run(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A slow single press (1 s) goes to the original with SEEN=1: the
+	// stock reset script restarts the router only under a second.
+	release("1")
+	btnWaitLog(t, logf, "orig released 1")
+	time.Sleep(1500 * time.Millisecond)
+	os.Remove(logf)
+	// Double press, then one press too many: the third is absorbed.
+	release("0")
+	release("0")
+	btnWaitLog(t, logf, "initd firewall restart")
+	release("0")
+	time.Sleep(2500 * time.Millisecond)
+	if data, _ := os.ReadFile(logf); strings.Contains(string(data), "orig released") {
+		t.Fatalf("the extra press reached the original:\n%s", data)
+	}
+}
+
+func TestBtnWrapperWithoutRunner(t *testing.T) {
+	_, _ = btnTestRouter(t)
+	logf := filepath.Join(t.TempDir(), "log")
+	btnWriteT(t, filepath.Join(btnRcDir, "reset"), "#!/bin/sh\necho \"orig $ACTION\" >> "+logf+"\nexit 5\n")
+	cfg := ButtonsConfig{Actions: []ButtonAction{{Button: "reset", Trigger: "press", Count: 1, Action: "firewall_restart"}}}
+	if err := btnApplyLocked(cfg); err != nil {
+		t.Fatal(err)
+	}
+	os.Remove(btnRunnerPath)
+	cmd := exec.Command("sh", filepath.Join(btnRcDir, "reset"))
+	cmd.Env = append(os.Environ(), "ACTION=pressed", "BUTTON=reset")
+	err := cmd.Run()
+	var ee *exec.ExitError
+	if !errors.As(err, &ee) || ee.ExitCode() != 5 {
+		t.Fatalf("wrapper without runner: %v, want the original's exit 5", err)
+	}
+	if !strings.Contains(btnReadT(t, logf), "orig pressed") {
+		t.Fatal("the original did not run")
+	}
+}
+
+func TestBtnRunnerUninstall(t *testing.T) {
+	dir, env, _ := btnRunnerEnv(t, "reset press 1 firewall_restart - 0\n")
+	btnWriteT(t, filepath.Join(dir, "rc/reset"), "#!/bin/sh\n# netgrip-managed-button\n")
+	btnWriteT(t, filepath.Join(dir, "rc/BTN_0"), "#!/bin/sh\n# netgrip-managed-button\n")
+	btnWriteT(t, filepath.Join(dir, "rc/wps"), "#!/bin/sh\n# stock\n")
+	btnWriteT(t, filepath.Join(dir, "hook/00-netgrip"), "# netgrip-managed-button\n")
+	cmd := exec.Command("sh", filepath.Join(dir, "runner"), "uninstall")
+	cmd.Env = env
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("uninstall: %v %s", err, out)
+	}
+	if got := btnReadT(t, filepath.Join(dir, "rc/reset")); !strings.Contains(got, "orig $ACTION") {
+		t.Fatalf("reset not restored: %q", got)
+	}
+	if st, _ := os.Stat(filepath.Join(dir, "rc/reset")); st.Mode().Perm() != 0o755 {
+		t.Fatalf("restored mode %v", st.Mode().Perm())
+	}
+	for _, p := range []string{"rc/BTN_0", "hook/00-netgrip", "etc", "runner", "state"} {
+		if btnExists(filepath.Join(dir, p)) {
+			t.Errorf("%s left behind", p)
+		}
+	}
+	if btnReadT(t, filepath.Join(dir, "rc/wps")) != "#!/bin/sh\n# stock\n" {
+		t.Error("a script NetGrip did not write was changed")
+	}
+}
