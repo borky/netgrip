@@ -62,35 +62,60 @@ log() {
 
 # Locks. flock is released when the process ends, whatever happens;
 # busybox's lock applet (the fallback) is not, so it is only used where
-# flock is missing. Each lock has its own descriptor, so they can nest.
+# flock is missing. Each lock has its own descriptor, so they can nest. A
+# build with neither runs without (two actions at the very same moment
+# could then interleave; a single press never does).
 if command -v flock >/dev/null 2>&1; then
-	HAVE_FLOCK=1
+	LOCKER=flock
+elif command -v lock >/dev/null 2>&1; then
+	LOCKER=lock
 else
-	HAVE_FLOCK=
+	LOCKER=
 fi
 # take <name> <fd>, drop <name> <fd>, try_take <name> <fd>
 take() {
-	if [ -n "$HAVE_FLOCK" ]; then
+	case "$LOCKER" in
+	flock)
 		eval "exec $2>\"\$STATE/$1.lock\""
 		flock "$2"
-	else
-		lock "$STATE/$1.lock"
-	fi
+		;;
+	lock) lock "$STATE/$1.lock" ;;
+	esac
+	return 0
 }
 try_take() {
-	if [ -n "$HAVE_FLOCK" ]; then
+	case "$LOCKER" in
+	flock)
 		eval "exec $2>\"\$STATE/$1.lock\""
 		flock -n "$2"
-	else
-		lock -n "$STATE/$1.lock"
-	fi
+		;;
+	lock) lock -n "$STATE/$1.lock" ;;
+	*) return 0 ;;
+	esac
 }
 drop() {
-	if [ -n "$HAVE_FLOCK" ]; then
-		eval "exec $2>&-"
+	case "$LOCKER" in
+	flock) eval "exec $2>&-" ;;
+	lock) lock -u "$STATE/$1.lock" ;;
+	esac
+	return 0
+}
+
+# fsum <file>: a fingerprint of a file's content, with whatever this build
+# has (busybox's md5sum is on by default; cksum is not).
+fsum() {
+	if command -v md5sum >/dev/null 2>&1; then
+		md5sum < "$1"
+	elif command -v sha256sum >/dev/null 2>&1; then
+		sha256sum < "$1"
 	else
-		lock -u "$STATE/$1.lock"
+		ls -ln "$1"
 	fi
+}
+
+# token: unique enough to tell one timed toggle from the next.
+token() {
+	cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "$(date +%s).$$"
 }
 
 # event <button> <pattern> <action> <detail> <result>: one line per action
@@ -347,7 +372,7 @@ set_disabled() {
 	while :; do
 		try=$((try + 1))
 		wl_load || return 1
-		sum=$(cksum < "$cfg")
+		sum=$(fsum "$cfg")
 		if [ "$2" = "-" ]; then
 			wl delete "ngbwifi.$1.disabled"
 		else
@@ -360,7 +385,7 @@ set_disabled() {
 			rm -f "$cfg.netgrip-tmp"
 			return 1
 		fi
-		if [ "$(cksum < "$cfg")" = "$sum" ]; then
+		if [ "$(fsum "$cfg")" = "$sum" ]; then
 			mv "$cfg.netgrip-tmp" "$cfg" || { rm -f "$cfg.netgrip-tmp"; return 1; }
 			break
 		fi
@@ -400,7 +425,7 @@ act_wifi() {
 	cur=$(wl get "ngbwifi.$s.disabled")
 	if [ "$cur" = 1 ]; then new=0; else new=1; fi
 	mkdir -p "$STATE/hold"
-	tok=$(cat /proc/sys/kernel/random/uuid)
+	tok=$(token)
 	until=0
 	if [ "$m" -gt 0 ]; then
 		mkdir -p "$ETC/timed"

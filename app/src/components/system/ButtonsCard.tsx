@@ -174,10 +174,21 @@ export function ButtonsCard({ index = 0 }: { index?: number }) {
   const actions = p.config.actions;
   const remove = (a: ButtonAction) => save({ ...p.config, actions: actions.filter((x) => x !== a) });
 
+  const missing = (p.requirements ?? []).filter((r) => !r.ok);
+  const hasWifi = !missing.some((r) => r.for === "wifi");
+
   if (!p.available) {
     return (
       <Card index={index} title={t("buttons.title")} help="buttons" icon={CircleDot} iconTone="accent">
         <p className="text-small text-muted">{t("buttons.unavailable")}</p>
+        <ul className="mt-2 flex flex-col gap-1">
+          {missing.filter((r) => r.required).map((r) => (
+            <li key={r.name} className="text-caption">
+              <span className="font-medium">{r.name}</span>
+              <span className="text-muted"> · {t("buttons.package", { pkg: r.package })}</span>
+            </li>
+          ))}
+        </ul>
       </Card>
     );
   }
@@ -228,7 +239,7 @@ export function ButtonsCard({ index = 0 }: { index?: number }) {
                 </ul>
               )}
               {adding === b.name && (
-                <AddAction button={b} networks={p.networks} taken={mine} busy={busy}
+                <AddAction button={b} networks={p.networks} taken={mine} busy={busy} hasWifi={hasWifi}
                   onCancel={() => setAdding(undefined)}
                   onAdd={(a) => save({ ...p.config, actions: [...actions, a] })} />
               )}
@@ -259,6 +270,16 @@ export function ButtonsCard({ index = 0 }: { index?: number }) {
 
       {actions.length > 0 && !p.notify && <p className="text-caption text-muted mt-3">{t("buttons.notifyHint")}</p>}
 
+      {missing.length > 0 && (
+        <ul className="mt-3 flex flex-col gap-1">
+          {missing.map((r) => (
+            <li key={r.name} className="text-caption text-muted">
+              {t(`buttons.missing.${r.for}`, { name: r.name })} {t("buttons.package", { pkg: r.package })}
+            </li>
+          ))}
+        </ul>
+      )}
+
       {msg && <p className={`text-caption mt-2 ${msg.tone === "ok" ? "text-ok" : "text-danger"}`}>{msg.text}</p>}
 
       {p.events.length > 0 && (
@@ -286,8 +307,9 @@ function NetworkState({ net }: { net: ButtonNetwork }) {
   return <Pill tone={net.disabled ? "muted" : "ok"}>{t(net.disabled ? "buttons.netOff" : "buttons.netOn")}</Pill>;
 }
 
-function AddAction({ button, networks, taken, busy, onAdd, onCancel }: {
+function AddAction({ button, networks, taken, busy, hasWifi, onAdd, onCancel }: {
   button: ButtonInfo;
+  hasWifi: boolean;
   networks: ButtonNetwork[];
   taken: ButtonAction[];
   busy: boolean;
@@ -300,7 +322,7 @@ function AddAction({ button, networks, taken, busy, onAdd, onCancel }: {
   const [trigger, setTrigger] = useState<"press" | "hold">(freePress.length > 0 ? "press" : "hold");
   const [count, setCount] = useState(freePress[0] ?? 1);
   const [seconds, setSeconds] = useState(freeHold[0] ?? 2);
-  const [action, setAction] = useState<ButtonActionKind>("wifi_toggle");
+  const [action, setAction] = useState<ButtonActionKind>(hasWifi ? "wifi_toggle" : "firewall_restart");
   const [iface, setIface] = useState(networks[0]?.section ?? "");
   const [minutes, setMinutes] = useState(30);
 
@@ -337,7 +359,9 @@ function AddAction({ button, networks, taken, busy, onAdd, onCancel }: {
         )}
         <Field label={t("buttons.action")}>
           <select className={SELECT} value={action} onChange={(e) => setAction(e.target.value as ButtonActionKind)}>
-            {ACTIONS.map((k) => <option key={k} value={k}>{t(`buttons.kind.${k}`)}</option>)}
+            {ACTIONS.map((k) => (
+              <option key={k} value={k} disabled={k === "wifi_toggle" && !hasWifi}>{t(`buttons.kind.${k}`)}</option>
+            ))}
           </select>
         </Field>
         {action === "wifi_toggle" && (

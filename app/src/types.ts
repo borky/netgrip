@@ -1978,8 +1978,19 @@ export interface ButtonPress {
   switch?: boolean;
 }
 
+/** Something the feature uses on the router, and the package providing it. */
+export interface ButtonRequirement {
+  name: string;
+  ok: boolean;
+  required: boolean;
+  package: string;
+  /** buttons | wifi | locking | detach | check */
+  for: string;
+}
+
 export interface ButtonsProbe {
   available: boolean;
+  requirements: ButtonRequirement[];
   buttons: ButtonInfo[];
   config: ButtonsConfig;
   leds: string[];

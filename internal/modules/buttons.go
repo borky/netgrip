@@ -58,6 +58,9 @@ var (
 	btnHookPath   = "/etc/hotplug.d/button/00-netgrip"
 	btnInitPath   = "/etc/init.d/netgrip-buttons"
 	btnLedsDir    = "/sys/class/leds"
+	btnHotplugCfg = "/etc/hotplug.json"               // procd's hotplug rules
+	btnModuleDir  = "/sys/module/gpio_button_hotplug" // the kernel module that reports presses
+	btnLookPath   = exec.LookPath
 	btnDTDir      = "/sys/firmware/devicetree/base"
 
 	// btnInitEnableFn turns the boot script on or off (rc.common's
@@ -171,9 +174,24 @@ type ButtonPress struct {
 	Switch bool   `json:"switch,omitempty"`
 }
 
+// ButtonRequirement is one thing the feature uses on the router, and the
+// package that provides it. A missing required one turns the feature off;
+// a missing optional one only weakens what it says in For.
+type ButtonRequirement struct {
+	Name     string `json:"name"`
+	OK       bool   `json:"ok"`
+	Required bool   `json:"required"`
+	Package  string `json:"package"`
+	// For: "buttons" (the feature itself), "wifi" (the Wi-Fi action),
+	// "locking" (two actions at once), "detach" (actions run apart from
+	// the press), "check" (noticing a config saved meanwhile).
+	For string `json:"for"`
+}
+
 // ButtonsProbe is the panel's view.
 type ButtonsProbe struct {
-	Available   bool            `json:"available"`
+	Available    bool                `json:"available"`
+	Requirements []ButtonRequirement `json:"requirements"`
 	Buttons     []ButtonInfo    `json:"buttons"`
 	Config      ButtonsConfig   `json:"config"`
 	LEDs        []string        `json:"leds"`
@@ -190,10 +208,60 @@ var (
 	btnListenTimer *time.Timer
 )
 
-// btnAvailable: this system hands button events to /etc/rc.button.
-func btnAvailable() bool {
+func btnHave(cmds ...string) bool {
+	for _, c := range cmds {
+		if _, err := btnLookPath(c); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+// btnRequirements checks what the feature uses. Nothing here is installed
+// by NetGrip: on a router without one, the panel names the package.
+func btnRequirements() []ButtonRequirement {
 	st, err := os.Stat(btnRcDir)
-	return err == nil && st.IsDir()
+	rcdir := err == nil && st.IsDir()
+	rules, _ := os.ReadFile(btnHotplugCfg)
+	procd := rcdir && strings.Contains(string(rules), "rc.button")
+	// The module, or proof it works: a press already reached the runner.
+	_, err = os.Stat(btnModuleDir)
+	kmod := err == nil
+	if !kmod {
+		seen, _ := filepath.Glob(filepath.Join(btnStateDir, "seen.*"))
+		kmod = len(seen) > 0
+	}
+	return []ButtonRequirement{
+		{Name: "procd button events", OK: procd, Required: true, Package: "procd, base-files", For: "buttons"},
+		{Name: "gpio-button-hotplug", OK: kmod, Required: true, Package: "kmod-gpio-button-hotplug", For: "buttons"},
+		{Name: "awk", OK: btnHave("awk"), Required: true, Package: "busybox (awk) or gawk", For: "buttons"},
+		{Name: "uci", OK: btnHave("uci"), Required: true, Package: "uci", For: "buttons"},
+		{Name: "wifi", OK: btnHave("wifi"), Package: "wifi-scripts (base-files before 24.10)", For: "wifi"},
+		{Name: "flock", OK: btnHave("flock", "lock"), Package: "busybox (flock or lock)", For: "locking"},
+		{Name: "setsid", OK: btnHave("setsid"), Package: "busybox (setsid)", For: "detach"},
+		{Name: "md5sum", OK: btnHave("md5sum", "sha256sum"), Package: "busybox (md5sum)", For: "check"},
+	}
+}
+
+// btnAvailable: everything the feature needs is on this router.
+func btnAvailable() bool {
+	for _, r := range btnRequirements() {
+		if r.Required && !r.OK {
+			return false
+		}
+	}
+	return true
+}
+
+// btnUnavailable says what is missing.
+func btnUnavailable() error {
+	var miss []string
+	for _, r := range btnRequirements() {
+		if r.Required && !r.OK {
+			miss = append(miss, r.Name+" ("+r.Package+")")
+		}
+	}
+	return fmt.Errorf("router buttons need: %s", strings.Join(miss, ", "))
 }
 
 // --- configuration ---------------------------------------------------------
@@ -293,6 +361,9 @@ func validateButtons(cfg *ButtonsConfig, reserved func(string) int) error {
 			return fmt.Errorf("%s: unknown action %q", a.Button, a.Action)
 		}
 		if a.Action == "wifi_toggle" {
+			if !btnHave("wifi") {
+				return fmt.Errorf("%s: switching Wi-Fi needs the wifi command (wifi-scripts)", a.Button)
+			}
 			if !reBtnIface.MatchString(a.Iface) || uciGet("wireless."+a.Iface) != "wifi-iface" {
 				return fmt.Errorf("%s: choose a Wi-Fi network", a.Button)
 			}
@@ -335,7 +406,7 @@ func SetButtons(cfg ButtonsConfig) (ButtonsProbe, error) {
 	btnMu.Lock()
 	defer btnMu.Unlock()
 	if !btnAvailable() {
-		return btnProbeLocked(), fmt.Errorf("this router does not hand button presses to scripts (%s is missing)", btnRcDir)
+		return btnProbeLocked(), btnUnavailable()
 	}
 	if cfg.Actions == nil {
 		cfg.Actions = []ButtonAction{}
@@ -898,7 +969,7 @@ func ListenButtons() (ButtonsProbe, error) {
 	btnMu.Lock()
 	defer btnMu.Unlock()
 	if !btnAvailable() {
-		return btnProbeLocked(), fmt.Errorf("this router does not hand button presses to scripts (%s is missing)", btnRcDir)
+		return btnProbeLocked(), btnUnavailable()
 	}
 	btnListenUntil = btnNow().Add(btnListenFor)
 	err := btnApplyLocked(loadButtonsConfig())
@@ -953,12 +1024,18 @@ func ProbeButtons() ButtonsProbe {
 func btnProbeLocked() ButtonsProbe {
 	cfg := loadButtonsConfig()
 	p := ButtonsProbe{
-		Available: btnAvailable(),
+		Requirements: btnRequirements(),
 		Config:    cfg,
 		LEDs:      btnLEDs(),
 		Networks:  btnNetworks(),
 		Events:    []ButtonEvent{},
 		Notify:    btnChannelFn(),
+	}
+	p.Available = true
+	for _, r := range p.Requirements {
+		if r.Required && !r.OK {
+			p.Available = false
+		}
 	}
 	p.Buttons = btnButtonsLocked(cfg)
 	ssid := map[string]string{}
