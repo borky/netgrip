@@ -25,7 +25,6 @@ package modules
 import (
 	_ "embed"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -936,6 +935,14 @@ func btnApplyLocked(cfg ButtonsConfig) error {
 		if err := btnWrite(filepath.Join(btnEtcDir, "actions"), []byte(b.String()), 0o644); err != nil {
 			return err
 		}
+		// The daemon's executable, for the runner to tell whether NetGrip
+		// runs (the quarantine pause needs it).
+		if exe, err := os.Executable(); err == nil {
+			if real, err := filepath.EvalSymlinks(exe); err == nil {
+				exe = real
+			}
+			_ = btnWrite(filepath.Join(btnEtcDir, "daemon"), []byte(exe+"\n"), 0o644)
+		}
 		ledPath := filepath.Join(btnEtcDir, "led")
 		if cfg.LED != "" {
 			if err := btnWrite(ledPath, []byte(cfg.LED+"\n"), 0o644); err != nil {
@@ -944,7 +951,7 @@ func btnApplyLocked(cfg ButtonsConfig) error {
 		} else {
 			_ = os.Remove(ledPath)
 		}
-		_ = os.MkdirAll(btnStateDir, 0o755)
+		_ = btnStateDirSafe()
 	}
 	for name := range used {
 		if err := btnEnsureWrapper(name); err != nil {
@@ -991,6 +998,7 @@ func btnApplyLocked(cfg ButtonsConfig) error {
 		btnRemoveOurs(btnRunnerPath)
 		_ = os.Remove(filepath.Join(btnEtcDir, "actions"))
 		_ = os.Remove(filepath.Join(btnEtcDir, "led"))
+		_ = os.Remove(filepath.Join(btnEtcDir, "daemon"))
 		if names, _ := filepath.Glob(filepath.Join(btnEtcDir, "orig", "*.none")); len(names) > 0 {
 			for _, n := range names {
 				_ = os.Remove(n)
@@ -1162,18 +1170,7 @@ var (
 	btnQuarantineOnFn = func() bool { return loadQState().Enabled }
 	// btnQuarantineToggleFn pauses (nothing enforced) for minutes, or
 	// resumes when a pause runs. It says what it did.
-	btnQuarantineToggleFn = func(minutes int) (string, error) {
-		st := loadQState()
-		if !st.Enabled {
-			return "", errors.New("the quarantine is off")
-		}
-		if st.Pause.active(time.Now()) {
-			_, err := QuarantineResume("")
-			return "resumed", err
-		}
-		_, err := QuarantinePause(minutes, "off")
-		return fmt.Sprintf("paused %d", minutes), err
-	}
+	btnQuarantineToggleFn = QuarantineTogglePause
 )
 
 // btnRequestMaxAge: a request older than this was made while NetGrip was
@@ -1189,12 +1186,18 @@ var btnRequestMu sync.Mutex
 func btnHandleRequests() {
 	btnRequestMu.Lock()
 	defer btnRequestMu.Unlock()
+	if !btnStateDirSafe() {
+		return
+	}
 	files, _ := filepath.Glob(filepath.Join(btnStateDir, "request.*"))
 	sort.Strings(files)
 	for _, f := range files {
-		data, err := os.ReadFile(f)
+		// Only a small regular file NetGrip's own user wrote (the runner
+		// runs as root, like NetGrip); never through a link.
+		data, err := btnReadOwned(f, 256)
 		_ = os.Remove(f)
 		if err != nil {
+			log.Printf("netgrip: buttons: ignoring a request: %v", err)
 			continue
 		}
 		fl := strings.Fields(string(data))
@@ -1209,8 +1212,12 @@ func btnHandleRequests() {
 			continue
 		}
 		button, pattern := fl[2], fl[3]
-		if age := btnNow().Sub(time.Unix(at, 0)); age > btnRequestMaxAge || age < -btnRequestMaxAge {
+		switch age := btnNow().Sub(time.Unix(at, 0)); {
+		case age > btnRequestMaxAge:
 			btnAppendEvent(button, pattern, "quarantine_pause", "-", "failed: pressed while NetGrip was not running")
+			continue
+		case age < -btnRequestMaxAge:
+			btnAppendEvent(button, pattern, "quarantine_pause", "-", "failed: the router's clock changed since the press")
 			continue
 		}
 		did, err := btnQuarantineToggleFn(minutes)
@@ -1236,18 +1243,29 @@ func btnOneLine(s string) string {
 // btnAppendEvent adds a line to the runner's event log the way the runner
 // does (its lock, its id: the uptime in hundredths).
 func btnAppendEvent(button, pattern, action, detail, result string) {
-	if err := os.MkdirAll(btnStateDir, 0o755); err != nil {
+	if !btnStateDirSafe() {
 		return
 	}
 	unlock := btnLockEvents()
 	defer unlock()
 	line := fmt.Sprintf("%d\t%d\t%s\t%s\t%s\t%s\t%s\n", btnUptimeCS(), btnNow().Unix(), button, pattern, action, detail, result)
-	f, err := os.OpenFile(filepath.Join(btnStateDir, "events"), os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o644)
+	path := filepath.Join(btnStateDir, "events")
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND|os.O_CREATE|btnNoFollow, 0o644)
 	if err != nil {
 		return
 	}
 	_, _ = f.WriteString(line)
 	_ = f.Close()
+	// Trimmed like the runner does: the newest 50 once over 100 lines.
+	if data, err := os.ReadFile(path); err == nil {
+		lines := strings.SplitAfter(string(data), "\n")
+		if lines[len(lines)-1] == "" {
+			lines = lines[:len(lines)-1]
+		}
+		if len(lines) > 100 {
+			_ = writeFileAtomic(path, []byte(strings.Join(lines[len(lines)-50:], "")))
+		}
+	}
 	log.Printf("netgrip: buttons: %s %s: %s %s %s", button, pattern, action, detail, result)
 }
 
@@ -1315,7 +1333,7 @@ func btnEventText(e ButtonEvent, ssid map[string]string) string {
 	case "quarantine_pause":
 		switch {
 		case failed:
-			what = "pausing or resuming the quarantine failed (" + e.Result + ")"
+			what = "pausing or resuming the quarantine failed (" + strings.TrimPrefix(e.Result, "failed: ") + ")"
 		case strings.HasPrefix(e.Detail, "paused "):
 			m, _ := strconv.Atoi(strings.TrimPrefix(e.Detail, "paused "))
 			what = fmt.Sprintf("quarantine paused for %d min", m)

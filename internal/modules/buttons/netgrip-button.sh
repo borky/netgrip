@@ -41,7 +41,24 @@ HOLD_SLACK=2
 # Seconds in a minute (tests shorten it).
 MINUTE=${NGB_MINUTE:-60}
 
-mkdir -p "$STATE" 2>/dev/null
+# The state directory (in /tmp) must be this script's user's own (root's)
+# and writable by nobody else; any other is recreated: someone else's could
+# feed NetGrip requests or point this script's writes elsewhere with links.
+state_ok() {
+	local perm n owner rest
+	[ -d "$STATE" ] && [ ! -L "$STATE" ] || return 1
+	set -- $(ls -ldn "$STATE")
+	perm="$1" owner="$3"
+	[ "$owner" = "$(id -u 2>/dev/null || echo 0)" ] || return 1
+	case "$perm" in
+	?????w* | ????????w*) return 1 ;;
+	esac
+	return 0
+}
+if ! state_ok; then
+	[ -e "$STATE" ] || [ -L "$STATE" ] && rm -rf "$STATE"
+	mkdir -p "$STATE" 2>/dev/null && chmod 755 "$STATE"
+fi
 # This process's private copy of the wireless config (see wl_load), gone
 # when it ends, whatever path it takes.
 WL="$STATE/wl.$$"
@@ -521,9 +538,26 @@ cmd_revert() {
 # needs it running: the request is a file NetGrip picks up at once (it
 # watches this directory) and answers in the event log. A press while
 # NetGrip is down is logged as failed and never carried out later.
+# netgrip_running: NetGrip's daemon runs (its executable, which NetGrip
+# records; a name match would also catch its init script).
+netgrip_running() {
+	local exe="" p l
+	[ -f "$ETC/daemon" ] && read exe < "$ETC/daemon"
+	[ -n "$exe" ] || exe=/usr/sbin/netgrip
+	if command -v readlink >/dev/null 2>&1; then
+		for p in /proc/[0-9]*; do
+			l=$(readlink "$p/exe" 2>/dev/null) || continue
+			[ "$l" = "$exe" ] || [ "$l" = "$exe (deleted)" ] && return 0
+		done
+		return 1
+	fi
+	command -v pidof >/dev/null 2>&1 || return 0
+	pidof netgrip >/dev/null 2>&1
+}
+
 act_quarantine() {
 	local b="$1" p="$2" m="$3" tok
-	if command -v pidof >/dev/null 2>&1 && ! pidof netgrip >/dev/null 2>&1; then
+	if ! netgrip_running; then
 		event "$b" "$p" quarantine_pause - "failed: NetGrip is not running"
 		return
 	fi
