@@ -51,6 +51,8 @@ const btnMarker = "netgrip-managed-button"
 var (
 	btnRunnerPath = "/usr/libexec/netgrip-button"
 	btnRcDir      = "/etc/rc.button"
+	btnRomRcDir   = "/rom/etc/rc.button" // the firmware image's own copy
+	btnRcdDir     = "/etc/rc.d"
 	btnEtcDir     = "/etc/netgrip/buttons"
 	btnStateDir   = "/tmp/netgrip-buttons"
 	btnHookPath   = "/etc/hotplug.d/button/00-netgrip"
@@ -97,7 +99,7 @@ var (
 	reBtnName   = regexp.MustCompile(`^[A-Za-z0-9_-]{1,32}$`)
 	reBtnIface  = regexp.MustCompile(`^[A-Za-z0-9_]{1,64}$`)
 	reBtnLED    = regexp.MustCompile(`^[A-Za-z0-9_:.+-]{1,64}$`)
-	reBtnSeenGe = regexp.MustCompile(`SEEN"?\s+-ge\s+([0-9]+)`)
+	reBtnSeenGe = regexp.MustCompile(`SEEN"?\s+-(ge|gt)\s+([0-9]+)`)
 	reBtnQuoted = regexp.MustCompile(`'([^']*)'`)
 )
 
@@ -135,6 +137,8 @@ type ButtonInfo struct {
 	// original does (the factory reset); 0 when nothing is reserved.
 	Reserved int  `json:"reserved,omitempty"`
 	Managed  bool `json:"managed,omitempty"` // NetGrip's wrapper is in place
+	// Switch: it reports a position (a slider), so it cannot run actions.
+	Switch bool `json:"switch,omitempty"`
 }
 
 // ButtonNetwork is a Wi-Fi network a button can turn on or off.
@@ -264,6 +268,9 @@ func validateButtons(cfg *ButtonsConfig, reserved func(string) int) error {
 		a.Button = strings.TrimSpace(a.Button)
 		if !reBtnName.MatchString(a.Button) || a.Button == "failsafe" {
 			return fmt.Errorf("%q is not a button name", a.Button)
+		}
+		if btnIsSwitch(a.Button) {
+			return fmt.Errorf("%s is a switch, not a button: it cannot run actions", a.Button)
 		}
 		switch a.Trigger {
 		case "press":
@@ -407,6 +414,10 @@ func btnBoardButtons() []string {
 					if err != nil || len(raw) != 4 {
 						continue
 					}
+					// A switch (EV_SW, 5) reports a position, not a press.
+					if it, err := os.ReadFile(filepath.Join(node, k.Name(), "linux,input-type")); err == nil && len(it) == 4 && binary.BigEndian.Uint32(it) == 5 {
+						continue
+					}
 					if name, ok := btnKeyNames[binary.BigEndian.Uint32(raw)]; ok && !seen[name] {
 						seen[name] = true
 						out = append(out, name)
@@ -424,14 +435,17 @@ func btnBoardButtons() []string {
 	return out
 }
 
-// btnOriginal is the button's original script: the copy NetGrip keeps
-// while its wrapper is in place, else the script itself.
+// btnOriginal is the button's original script: the script itself when it
+// is not NetGrip's, else the copy NetGrip keeps, else (that copy lost) the
+// firmware image's own.
 func btnOriginal(name string) ([]byte, bool) {
 	if data, err := os.ReadFile(filepath.Join(btnRcDir, name)); err == nil && !btnIsOurs(data) {
 		return data, true
 	}
-	if data, err := os.ReadFile(filepath.Join(btnEtcDir, "orig", name)); err == nil {
-		return data, true
+	for _, p := range []string{filepath.Join(btnEtcDir, "orig", name), filepath.Join(btnRomRcDir, name)} {
+		if data, err := os.ReadFile(p); err == nil && !btnIsOurs(data) {
+			return data, true
+		}
 	}
 	return nil, false
 }
@@ -448,7 +462,19 @@ func btnReserved(name string) int {
 	if !ok {
 		return 0
 	}
-	return btnReservedIn(string(data))
+	return btnReservedFor(name, string(data))
+}
+
+// btnReservedFor is btnReservedIn, with one more precaution: a script for
+// the button the kernel calls "reset" (KEY_RESTART) that does not read as
+// OpenWrt's may still reset the router in a way not recognised here (a
+// vendor tool), so no hold is offered on it.
+func btnReservedFor(name, script string) int {
+	r := btnReservedIn(script)
+	if r == 0 && name == "reset" && btnStock(script) == "custom" {
+		return btnHoldMin
+	}
+	return r
 }
 
 func btnReservedIn(script string) int {
@@ -457,7 +483,14 @@ func btnReservedIn(script string) int {
 	}
 	min := 0
 	for _, m := range reBtnSeenGe.FindAllStringSubmatch(script, -1) {
-		if n, err := strconv.Atoi(m[1]); err == nil && n > 0 && (min == 0 || n < min) {
+		n, err := strconv.Atoi(m[2])
+		if err != nil {
+			continue
+		}
+		if m[1] == "gt" {
+			n++ // more than n seconds: from n+1 on, in whole seconds
+		}
+		if n > 0 && (min == 0 || n < min) {
 			min = n
 		}
 	}
@@ -506,7 +539,9 @@ func btnButtonsLocked(cfg ButtonsConfig) []ButtonInfo {
 	if entries, err := os.ReadDir(btnStateDir); err == nil {
 		for _, e := range entries {
 			if n, ok := strings.CutPrefix(e.Name(), "seen."); ok && reBtnName.MatchString(n) && n != "failsafe" {
-				get(n).Pressed = true
+				b := get(n)
+				b.Pressed = true
+				b.Switch = btnIsSwitch(n)
 			}
 		}
 	}
@@ -517,7 +552,7 @@ func btnButtonsLocked(cfg ButtonsConfig) []ButtonInfo {
 	for _, b := range byName {
 		if data, ok := btnOriginal(b.Name); ok {
 			b.Stock = btnStock(string(data))
-			b.Reserved = btnReservedIn(string(data))
+			b.Reserved = btnReservedFor(b.Name, string(data))
 		}
 		if data, err := os.ReadFile(filepath.Join(btnRcDir, b.Name)); err == nil && btnIsOurs(data) {
 			b.Managed = true
@@ -526,6 +561,14 @@ func btnButtonsLocked(cfg ButtonsConfig) []ButtonInfo {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
+}
+
+// btnIsSwitch: the button reported a position when it was last pressed
+// (the runner records procd's TYPE): a slider, which cannot run actions.
+func btnIsSwitch(name string) bool {
+	data, err := os.ReadFile(filepath.Join(btnStateDir, "seen."+name))
+	t := strings.TrimSpace(string(data))
+	return err == nil && t != "" && t != "-"
 }
 
 func btnLEDs() []string {
@@ -571,15 +614,21 @@ func btnNetworks() []ButtonNetwork {
 
 func btnWrapper(name string, reserved int) string {
 	orig := filepath.Join(btnEtcDir, "orig", name)
+	rom := filepath.Join(btnRomRcDir, name)
 	return fmt.Sprintf(`#!/bin/sh
 # %s
 # NetGrip runs the actions assigned to this button and hands every other
 # press to the original script, kept in %s.
 # Removing the button's actions in NetGrip puts the original back.
 [ -x %s ] && exec %s rc '%s' %d
-[ -f %s ] && exec /bin/sh %s
+# Without NetGrip's runner: the original, else the firmware image's.
+for o in %s %s; do
+	[ -f "$o" ] || continue
+	[ -x "$o" ] && exec "$o"
+	exec /bin/sh "$o"
+done
 exit 0
-`, btnMarker, orig, btnRunnerPath, btnRunnerPath, name, reserved, orig, orig)
+`, btnMarker, orig, btnRunnerPath, btnRunnerPath, name, reserved, orig, rom)
 }
 
 func btnHookScript() string {
@@ -691,6 +740,10 @@ func btnRestore(name string) error {
 	if !os.IsNotExist(err) {
 		return err
 	}
+	// The kept copy is gone: the firmware image's script, if it has one.
+	if data, err := os.ReadFile(filepath.Join(btnRomRcDir, name)); err == nil && !btnIsOurs(data) {
+		return btnWrite(path, data, 0o755)
+	}
 	if cur, err := os.ReadFile(path); err == nil && btnIsOurs(cur) {
 		return os.Remove(path)
 	}
@@ -769,11 +822,16 @@ func btnApplyLocked(cfg ButtonsConfig) error {
 	if len(used) > 0 || timed {
 		if err := btnWrite(btnInitPath, []byte(btnInitScript()), 0o755); err != nil {
 			errs = append(errs, err.Error())
-		} else if err := btnInitEnableFn(true); err != nil {
-			errs = append(errs, err.Error())
+		} else if !btnInitLinked() {
+			// Only when its link is missing: enable rewrites it on flash.
+			if err := btnInitEnableFn(true); err != nil {
+				errs = append(errs, err.Error())
+			}
 		}
 	} else if data, err := os.ReadFile(btnInitPath); err == nil && btnIsOurs(data) {
-		_ = btnInitEnableFn(false)
+		if btnInitLinked() {
+			_ = btnInitEnableFn(false)
+		}
 		_ = os.Remove(btnInitPath)
 	}
 	if !need {
@@ -787,6 +845,12 @@ func btnApplyLocked(cfg ButtonsConfig) error {
 		return fmt.Errorf("buttons: %s", strings.Join(errs, "; "))
 	}
 	return nil
+}
+
+// btnInitLinked: the boot script is enabled (rc.common's S<NN> link).
+func btnInitLinked() bool {
+	links, _ := filepath.Glob(filepath.Join(btnRcdDir, "S*"+filepath.Base(btnInitPath)))
+	return len(links) > 0
 }
 
 // btnRemoveOurs removes a file only if NetGrip wrote it.

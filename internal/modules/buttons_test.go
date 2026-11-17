@@ -64,6 +64,8 @@ func btnTestRouter(t *testing.T) (root string, enabled *[]bool) {
 	}
 	set(&btnRunnerPath, filepath.Join(root, "usr/libexec/netgrip-button"))
 	set(&btnRcDir, filepath.Join(root, "etc/rc.button"))
+	set(&btnRomRcDir, filepath.Join(root, "rom/etc/rc.button"))
+	set(&btnRcdDir, filepath.Join(root, "etc/rc.d"))
 	set(&btnEtcDir, filepath.Join(root, "etc/netgrip/buttons"))
 	set(&btnStateDir, filepath.Join(root, "tmp/netgrip-buttons"))
 	set(&btnHookPath, filepath.Join(root, "etc/hotplug.d/button/00-netgrip"))
@@ -76,7 +78,16 @@ func btnTestRouter(t *testing.T) (root string, enabled *[]bool) {
 	calls := []bool{}
 	enabled = &calls
 	oldInit := btnInitEnableFn
-	btnInitEnableFn = func(on bool) error { calls = append(calls, on); return nil }
+	// Like rc.common: enable makes the S<NN> link, disable removes it.
+	btnInitEnableFn = func(on bool) error {
+		calls = append(calls, on)
+		link := filepath.Join(btnRcdDir, "S15"+filepath.Base(btnInitPath))
+		if on {
+			_ = os.MkdirAll(btnRcdDir, 0o755)
+			return os.WriteFile(link, nil, 0o644)
+		}
+		return os.Remove(link)
+	}
 	t.Cleanup(func() { btnInitEnableFn = oldInit })
 	oldUntil := btnListenUntil
 	btnListenUntil = time.Time{}
@@ -137,6 +148,8 @@ func TestBtnReservedAndStock(t *testing.T) {
 		{"#!/bin/sh\nfactoryreset -y\n", btnHoldMin, "reset"}, // resets, but when is unclear
 		{"#!/bin/sh\n[ \"$SEEN\" -ge 10 ] && jffs2reset -y\n[ \"$SEEN\" -ge 3 ] && reboot\n", 3, "reset"},
 		{"#!/bin/sh\nexec /sbin/poweroff\n", 0, "power"},
+		{"#!/bin/sh\n[ \"$SEEN\" -gt 5 ] && firstboot -y\n", 6, "reset"}, // more than 5 s: from 6
+
 		{"#!/bin/sh\nlogger hi\n", 0, "custom"},
 		{"", 0, ""},
 	}
@@ -259,6 +272,14 @@ func TestBtnApplyInstallsRepairsAndRestores(t *testing.T) {
 	if !btnExists(btnHookPath) || !btnExists(btnInitPath) || len(*enabled) == 0 || !(*enabled)[len(*enabled)-1] {
 		t.Fatalf("hook/boot script not in place (enabled calls %v)", *enabled)
 	}
+	// Applying again (each start, each panel visit) touches nothing.
+	before := len(*enabled)
+	if err := btnApplyLocked(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if len(*enabled) != before {
+		t.Fatalf("the boot script was enabled again: %v", *enabled)
+	}
 
 	// An upgrade writes a new stock script over the wrapper: the new one
 	// becomes the kept original and the wrapper comes back.
@@ -291,6 +312,59 @@ func TestBtnApplyInstallsRepairsAndRestores(t *testing.T) {
 	}
 	if btnReadT(t, filepath.Join(btnRcDir, "wps")) != btnStockWPS {
 		t.Fatalf("wps changed")
+	}
+}
+
+func TestBtnReservedForUnrecognisedReset(t *testing.T) {
+	// A vendor reset script NetGrip cannot read: no hold on "reset".
+	vendor := "#!/bin/sh\n[ \"$SEEN\" -ge 8 ] && /usr/bin/vendor-erase\n"
+	if got := btnReservedFor("reset", vendor); got != btnHoldMin {
+		t.Fatalf("unrecognised reset script: reserved %d, want %d", got, btnHoldMin)
+	}
+	if got := btnReservedFor("BTN_1", vendor); got != 0 {
+		t.Fatalf("other button: reserved %d, want 0", got)
+	}
+	if got := btnReservedFor("reset", btnStockReset); got != 5 {
+		t.Fatalf("stock reset: reserved %d", got)
+	}
+}
+
+func TestValidateButtonsRefusesSwitches(t *testing.T) {
+	_, _ = btnTestRouter(t)
+	btnWriteT(t, filepath.Join(btnStateDir, "seen.rfkill"), "switch\n")
+	btnWriteT(t, filepath.Join(btnStateDir, "seen.wps"), "-\n")
+	sw := ButtonsConfig{Actions: []ButtonAction{{Button: "rfkill", Trigger: "press", Count: 1, Action: "firewall_restart"}}}
+	if err := validateButtons(&sw, func(string) int { return 0 }); err == nil {
+		t.Fatal("a switch was accepted")
+	}
+	ok := ButtonsConfig{Actions: []ButtonAction{{Button: "wps", Trigger: "press", Count: 1, Action: "firewall_restart"}}}
+	if err := validateButtons(&ok, func(string) int { return 0 }); err != nil {
+		t.Fatalf("a button was refused: %v", err)
+	}
+}
+
+func TestBtnLostCopyFallsBackToFirmware(t *testing.T) {
+	_, _ = btnTestRouter(t)
+	reset := filepath.Join(btnRcDir, "reset")
+	btnWriteT(t, reset, btnStockReset)
+	btnWriteT(t, filepath.Join(btnRomRcDir, "reset"), btnStockReset)
+	cfg := ButtonsConfig{Actions: []ButtonAction{{Button: "reset", Trigger: "press", Count: 2, Action: "firewall_restart"}}}
+	if err := btnApplyLocked(cfg); err != nil {
+		t.Fatal(err)
+	}
+	// NetGrip's kept copy is lost (flash cleaned by hand, say).
+	os.RemoveAll(filepath.Join(btnEtcDir, "orig"))
+	if err := btnApplyLocked(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if w := btnReadT(t, reset); !strings.Contains(w, "rc 'reset' 5") {
+		t.Fatalf("the factory reset hold was lost with the copy:\n%s", w)
+	}
+	if err := btnApplyLocked(ButtonsConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	if btnReadT(t, reset) != btnStockReset {
+		t.Fatal("the firmware's script was not put back")
 	}
 }
 
@@ -464,6 +538,8 @@ func TestBtnRunnerScript(t *testing.T) {
 		"NGB_SELF="+runner,
 		"NGB_INITD="+filepath.Join(dir, "initd"),
 		"NGB_LEDS="+filepath.Join(dir, "leds"),
+		"NGB_ROMRC="+filepath.Join(dir, "rom"),
+		"NGB_CONFIG="+filepath.Join(dir, "config"),
 	)
 	run := func(action, seen string) int {
 		cmd := exec.Command("sh", runner, "rc", "reset", "5")

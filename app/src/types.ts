@@ -1948,6 +1948,8 @@ export interface ButtonInfo {
   /** Holding it this long or longer always does the original (factory reset). */
   reserved?: number;
   managed?: boolean;
+  /** It reports a position (a slider): no actions. */
+  switch?: boolean;
 }
 
 export interface ButtonNetwork {

@@ -3,7 +3,7 @@ import { useTranslation } from "react-i18next";
 import type { TFunction } from "i18next";
 import { CircleDot, Plus, Radar, Trash2 } from "lucide-react";
 import { api } from "../../api";
-import type { ButtonAction, ButtonActionKind, ButtonEvent, ButtonInfo, ButtonNetwork, ButtonsConfig, ButtonsProbe } from "../../types";
+import type { ButtonAction, ButtonActionKind, ButtonEvent, ButtonInfo, ButtonNetwork, ButtonPress, ButtonsConfig, ButtonsProbe } from "../../types";
 import { Button, Card, Field, Pill, SegmentedControl } from "../ui";
 import { fmtDate, fmtTime } from "../../lib/format";
 
@@ -56,7 +56,9 @@ function eventLabel(t: TFunction, e: ButtonEvent, ssid: Map<string, string>): st
     what = t(failed ? "buttons.evFirewallFailed" : "buttons.evFirewall");
   } else if (e.action === "access_restart") {
     const list = e.detail === "-" ? "" : e.detail.split(",").join(", ");
-    what = failed ? t("buttons.evAccessFailed", { list, error: e.result }) : list ? t("buttons.evAccess", { list }) : t("buttons.evAccessNone");
+    what = failed
+      ? list ? t("buttons.evAccessFailed", { list, error: e.result }) : e.result
+      : list ? t("buttons.evAccess", { list }) : t("buttons.evAccessNone");
   } else {
     what = `${e.action} ${e.result}`;
   }
@@ -64,6 +66,11 @@ function eventLabel(t: TFunction, e: ButtonEvent, ssid: Map<string, string>): st
   if (!m) return what;
   const how = m[1] === "hold" ? t("buttons.hold", { count: Number(m[2]) }) : t(`buttons.press${m[2]}`);
   return `${e.button} · ${how}: ${what}`;
+}
+
+/** One press event as the router logged it, to tell a new one apart. */
+function pressKey(p: ButtonPress): string {
+  return `${p.at}|${p.button}|${p.action}|${p.seen}`;
 }
 
 /** What a button does on its own, from its original script. */
@@ -88,7 +95,10 @@ export function ButtonsCard({ index = 0 }: { index?: number }) {
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<{ tone: "ok" | "danger"; text: string }>();
   const [adding, setAdding] = useState<string>();
-  const [listenFrom, setListenFrom] = useState<number>();
+  // The last press the router had reported when listening started: a
+  // different one is the new press. Router times only (the browser's clock
+  // may differ). undefined: not listening.
+  const [listenBase, setListenBase] = useState<string>();
   const [detected, setDetected] = useState<string>();
   const timer = useRef<number | undefined>(undefined);
 
@@ -99,28 +109,35 @@ export function ButtonsCard({ index = 0 }: { index?: number }) {
 
   // While listening, poll only the last press (cheap) until one comes.
   useEffect(() => {
-    if (listenFrom === undefined) return;
+    if (listenBase === undefined) return;
+    let cancelled = false;
     const tick = async () => {
       try {
         const r = await api.buttonsLast();
+        if (cancelled) return;
         const lp = r.last_press;
-        if (lp && lp.at >= listenFrom) {
-          setListenFrom(undefined);
+        if (lp && pressKey(lp) !== listenBase) {
+          setListenBase(undefined);
           setDetected(lp.switch ? `${lp.button} (${t("buttons.isSwitch")})` : lp.button);
           load();
           return;
         }
-        if (!r.listen_until || r.listen_until * 1000 < Date.now()) {
-          setListenFrom(undefined);
+        // The router stops listening on its own clock: no time left is
+        // reported once it has.
+        if (!r.listen_until) {
+          setListenBase(undefined);
           load();
           return;
         }
       } catch { /* the next tick tries again */ }
-      timer.current = window.setTimeout(tick, 2000);
+      if (!cancelled) timer.current = window.setTimeout(tick, 2000);
     };
     timer.current = window.setTimeout(tick, 2000);
-    return () => window.clearTimeout(timer.current);
-  }, [listenFrom, load, t]);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer.current);
+    };
+  }, [listenBase, load, t]);
 
   const ssid = useMemo(() => new Map((p?.networks ?? []).map((n) => [n.section, n.ssid || n.section])), [p]);
 
@@ -148,7 +165,7 @@ export function ButtonsCard({ index = 0 }: { index?: number }) {
     try {
       const r = await api.listenButtons();
       setP(r.state);
-      setListenFrom(Math.floor(Date.now() / 1000) - 1);
+      setListenBase(r.state.last_press ? pressKey(r.state.last_press) : "");
     } catch (e) {
       setMsg({ tone: "danger", text: e instanceof Error ? e.message : String(e) });
     }
@@ -181,8 +198,9 @@ export function ButtonsCard({ index = 0 }: { index?: number }) {
                 <span className="font-mono text-small font-medium">{b.name}</span>
                 {b.managed && <Pill tone="ok">{t("buttons.active")}</Pill>}
                 {!b.board && b.pressed && <Pill tone="muted">{t("buttons.detected")}</Pill>}
+                {b.switch && <Pill tone="muted">{t("buttons.switchPill")}</Pill>}
                 <span className="flex-1" />
-                {adding !== b.name && (
+                {adding !== b.name && !b.switch && (
                   <Button size="sm" variant="ghost" icon={Plus} disabled={busy || actions.length >= 16} onClick={() => setAdding(b.name)}>
                     {t("buttons.add")}
                   </Button>
@@ -220,11 +238,11 @@ export function ButtonsCard({ index = 0 }: { index?: number }) {
       </div>
 
       <div className="mt-3 flex flex-wrap items-center gap-2">
-        <Button size="sm" variant="secondary" icon={Radar} disabled={listenFrom !== undefined} onClick={listen}>
+        <Button size="sm" variant="secondary" icon={Radar} disabled={listenBase !== undefined} onClick={listen}>
           {t("buttons.detect")}
         </Button>
-        {listenFrom !== undefined && <span className="text-caption text-muted">{t("buttons.listening")}</span>}
-        {listenFrom === undefined && detected && <span className="text-caption text-ok">{t("buttons.detectedIs", { name: detected })}</span>}
+        {listenBase !== undefined && <span className="text-caption text-muted">{t("buttons.listening")}</span>}
+        {listenBase === undefined && detected && <span className="text-caption text-ok">{t("buttons.detectedIs", { name: detected })}</span>}
       </div>
 
       {p.leds.length > 0 && (
@@ -247,8 +265,8 @@ export function ButtonsCard({ index = 0 }: { index?: number }) {
         <div className="mt-4">
           <p className="text-eyebrow text-faint mb-1.5">{t("buttons.recent")}</p>
           <ul className="flex flex-col gap-1">
-            {p.events.slice(0, 10).map((e) => (
-              <li key={`${e.at}${e.button}${e.pattern}${e.result}`} className="flex gap-2 text-caption">
+            {p.events.slice(0, 10).map((e, i) => (
+              <li key={i} className="flex gap-2 text-caption">
                 <span className="text-muted shrink-0 tabular-nums">{fmtDate(e.at)}</span>
                 <span className={e.result.startsWith("failed") ? "text-danger" : ""}>{eventLabel(t, e, ssid)}</span>
               </li>
@@ -308,7 +326,8 @@ function AddAction({ button, networks, taken, busy, onAdd, onCancel }: {
             </select>
           </Field>
         ) : (
-          <Field label={t("buttons.holdFor")} hint={button.reserved ? t("buttons.reservedHint", { count: button.reserved }) : undefined}>
+          <Field label={t("buttons.holdFor")}
+            hint={[t("buttons.holdHint"), button.reserved ? t("buttons.reservedHint", { count: button.reserved }) : ""].filter(Boolean).join(" ")}>
             <select className={SELECT} value={seconds} onChange={(e) => setSeconds(Number(e.target.value))}>
               {HOLDS.filter((s) => !button.reserved || s < button.reserved).map((s) => (
                 <option key={s} value={s} disabled={!freeHold.includes(s)}>{t("buttons.hold", { count: s })}</option>
