@@ -498,16 +498,20 @@ act_access() {
 }
 
 cmd_act() {
-	local b="$1" p="$2" a="$3" target="$4" m="$5" led=""
+	local b="$1" p="$2" a="$3" target="$4" m="$5" led="" blinker
 	[ -f "$ETC/led" ] && read led < "$ETC/led"
 	blink "$led" &
+	blinker=$!
 	case "$a" in
 	wifi_toggle) act_wifi "$b" "$p" "$target" "${m:-0}" ;;
 	firewall_restart) act_firewall "$b" "$p" ;;
 	access_restart) act_access "$b" "$p" ;;
 	*) event "$b" "$p" "$a" - "failed: unknown action" ;;
 	esac
-	wait
+	# Only the blink: a plain wait would also wait for the timer a timed
+	# toggle starts, and keep this process (and its copy of the wireless
+	# config) around until it ends.
+	wait "$blinker"
 }
 
 # At boot, before networking starts: a network a button turned on or off
