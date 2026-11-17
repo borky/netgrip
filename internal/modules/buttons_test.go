@@ -89,6 +89,12 @@ func btnTestRouter(t *testing.T) (root string, enabled *[]bool) {
 		return os.Remove(link)
 	}
 	t.Cleanup(func() { btnInitEnableFn = oldInit })
+	set(&btnHotplugCfg, filepath.Join(root, "etc/hotplug.json"))
+	set(&btnModuleDir, filepath.Join(root, "sys/module/gpio_button_hotplug"))
+	// Every command present unless a test says otherwise.
+	oldLook := btnLookPath
+	btnLookPath = func(c string) (string, error) { return "/usr/bin/" + c, nil }
+	t.Cleanup(func() { btnLookPath = oldLook })
 	oldUntil := btnListenUntil
 	btnListenUntil = time.Time{}
 	t.Cleanup(func() { btnListenUntil = oldUntil })
@@ -734,5 +740,50 @@ func TestBtnRunnerUninstall(t *testing.T) {
 	}
 	if btnReadT(t, filepath.Join(dir, "rc/wps")) != "#!/bin/sh\n# stock\n" {
 		t.Error("a script NetGrip did not write was changed")
+	}
+}
+
+func TestBtnRequirements(t *testing.T) {
+	root, _ := btnTestRouter(t)
+	missing := map[string]bool{"setsid": true, "wifi": true, "md5sum": true, "sha256sum": true}
+	btnLookPath = func(c string) (string, error) {
+		if missing[c] {
+			return "", errors.New("not found")
+		}
+		return "/usr/bin/" + c, nil
+	}
+	req := func() map[string]ButtonRequirement {
+		out := map[string]ButtonRequirement{}
+		for _, r := range btnRequirements() {
+			out[r.Name] = r
+		}
+		return out
+	}
+	// No procd rule, no module: not available, and the panel names what.
+	if btnAvailable() {
+		t.Fatal("available without procd's rule and the module")
+	}
+	if err := btnUnavailable(); !strings.Contains(err.Error(), "kmod-gpio-button-hotplug") {
+		t.Fatalf("message does not name the package: %v", err)
+	}
+	btnWriteT(t, filepath.Join(root, "etc/hotplug.json"), `[ "button", "/etc/rc.button/%BUTTON%" ]`)
+	btnWriteT(t, filepath.Join(root, "sys/module/gpio_button_hotplug/refcnt"), "0\n")
+	if !btnAvailable() {
+		t.Fatalf("not available with everything required: %+v", btnRequirements())
+	}
+	r := req()
+	if r["setsid"].OK || r["wifi"].OK || r["md5sum"].OK || !r["flock"].OK {
+		t.Fatalf("optional checks wrong: %+v", r)
+	}
+	// Without the wifi command, the Wi-Fi action is refused.
+	btnFakeWireless(t, "guest_ap")
+	cfg := ButtonsConfig{Actions: []ButtonAction{{Button: "wps", Trigger: "press", Count: 1, Action: "wifi_toggle", Iface: "guest_ap"}}}
+	if err := validateButtons(&cfg, func(string) int { return 0 }); err == nil || !strings.Contains(err.Error(), "wifi-scripts") {
+		t.Fatalf("wifi action without wifi: %v", err)
+	}
+	// awk missing: required, so not available.
+	missing["awk"] = true
+	if btnAvailable() {
+		t.Fatal("available without awk")
 	}
 }

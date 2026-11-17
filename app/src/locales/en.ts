@@ -3124,7 +3124,7 @@ export default {
   buttons: {
     title: "Router buttons",
     intro: "Actions the router's own buttons run, to get back in when something breaks. They run on the router even when this panel does not answer.",
-    unavailable: "This router does not hand button presses to scripts, so its buttons cannot run actions.",
+    unavailable: "Router buttons need these, which this router does not have. Install them and reload this page:",
     none: "No buttons known yet. Use Detect a button and press it on the router.",
     active: "In use",
     detected: "Detected",
@@ -3172,6 +3172,14 @@ export default {
     presses: "Presses",
     switchPill: "Switch: no actions",
     holdHint: "Let go within 2 s of that time: a much longer hold does what the button always did.",
+    package: "Package: {{pkg}}.",
+    missing: {
+      buttons: "Missing: {{name}}.",
+      wifi: "Switching Wi-Fi needs the {{name}} command.",
+      locking: "Without {{name}}, two actions at the very same moment may interleave.",
+      detach: "Without {{name}}, actions run attached to the press handler; they still run.",
+      check: "Without {{name}}, a Wi-Fi config saved at the same moment is noticed by size only.",
+    },
     holdFor: "Hold for",
     reservedHint_one: "{{count}} s or more is the factory reset, which stays.",
     reservedHint_other: "{{count}} s or more is the factory reset, which stays.",
