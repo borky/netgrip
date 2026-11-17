@@ -987,4 +987,5 @@ export const demoButtons: T.ButtonsProbe = {
   ],
   events: [],
   notify: true,
+  quarantine: true,
 };

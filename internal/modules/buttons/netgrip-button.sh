@@ -516,6 +516,22 @@ cmd_revert() {
 	fi
 }
 
+# act_quarantine: pause NetGrip's device quarantine for <m> minutes, or
+# resume it if paused. The quarantine lives in NetGrip, so this one action
+# needs it running: the request is a file NetGrip picks up at once (it
+# watches this directory) and answers in the event log. A press while
+# NetGrip is down is logged as failed and never carried out later.
+act_quarantine() {
+	local b="$1" p="$2" m="$3" tok
+	if command -v pidof >/dev/null 2>&1 && ! pidof netgrip >/dev/null 2>&1; then
+		event "$b" "$p" quarantine_pause - "failed: NetGrip is not running"
+		return
+	fi
+	tok=$(token)
+	printf '%s %s %s %s %s\n' quarantine_pause "$m" "$b" "$p" "$(date +%s)" > "$STATE/.request.$tok" &&
+		mv "$STATE/.request.$tok" "$STATE/request.$tok"
+}
+
 act_firewall() {
 	if "$INITD/firewall" restart >/dev/null 2>&1; then
 		event "$1" "$2" firewall_restart - ok
@@ -555,6 +571,7 @@ cmd_act() {
 	case "$a" in
 	wifi_toggle) act_wifi "$b" "$p" "$target" "${m:-0}" ;;
 	wifi_on) act_wifi_on "$b" "$p" "$target" "${m:-0}" ;;
+	quarantine_pause) act_quarantine "$b" "$p" "${m:-60}" ;;
 	firewall_restart) act_firewall "$b" "$p" ;;
 	access_restart) act_access "$b" "$p" ;;
 	*) event "$b" "$p" "$a" - "failed: unknown action" ;;

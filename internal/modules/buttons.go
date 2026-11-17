@@ -25,6 +25,7 @@ package modules
 import (
 	_ "embed"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -97,6 +98,7 @@ const (
 var btnActionKinds = map[string]bool{
 	"wifi_toggle":      true, // one Wi-Fi network on/off, optionally for a while
 	"wifi_on":          true, // one Wi-Fi network on, off again after a while
+	"quarantine_pause": true, // pause the device quarantine for a while, or resume it
 	"firewall_restart": true,
 	"access_restart":   true, // SSH, LuCI's web server, the NetGrip panel
 }
@@ -208,6 +210,9 @@ type ButtonsProbe struct {
 	LastPress    *ButtonPress        `json:"last_press,omitempty"`
 	ListenUntil  int64               `json:"listen_until,omitempty"`
 	Notify       bool                `json:"notify"`
+	// Quarantine: the device quarantine is set up (its pause action has
+	// something to pause).
+	Quarantine bool `json:"quarantine"`
 }
 
 var (
@@ -416,6 +421,11 @@ func validateButtons(cfg *ButtonsConfig, reserved func(string) int) error {
 			}
 			if a.Minutes < 0 || a.Minutes > btnMinutesMax {
 				return fmt.Errorf("%s: minutes must be 0 to %d", a.Button, btnMinutesMax)
+			}
+		} else if a.Action == "quarantine_pause" {
+			a.Iface = ""
+			if a.Minutes < 1 || a.Minutes > int(qMaxPause/time.Minute) {
+				return fmt.Errorf("%s: the pause must be 1 to %d minutes", a.Button, int(qMaxPause/time.Minute))
 			}
 		} else {
 			a.Iface, a.Minutes = "", 0
@@ -1078,6 +1088,7 @@ func btnProbeLocked() ButtonsProbe {
 		Events:       []ButtonEvent{},
 		Notify:       btnChannelFn(),
 	}
+	p.Quarantine = btnQuarantineOnFn()
 	p.Available = true
 	for _, r := range p.Requirements {
 		if r.Required && !r.OK {
@@ -1144,6 +1155,118 @@ func btnReadEvents() []btnEventRec {
 	return out
 }
 
+// --- requests the runner hands to NetGrip ----------------------------------
+
+// The quarantine, as the pause action sees it (tests replace these).
+var (
+	btnQuarantineOnFn = func() bool { return loadQState().Enabled }
+	// btnQuarantineToggleFn pauses (nothing enforced) for minutes, or
+	// resumes when a pause runs. It says what it did.
+	btnQuarantineToggleFn = func(minutes int) (string, error) {
+		st := loadQState()
+		if !st.Enabled {
+			return "", errors.New("the quarantine is off")
+		}
+		if st.Pause.active(time.Now()) {
+			_, err := QuarantineResume("")
+			return "resumed", err
+		}
+		_, err := QuarantinePause(minutes, "off")
+		return fmt.Sprintf("paused %d", minutes), err
+	}
+)
+
+// btnRequestMaxAge: a request older than this was made while NetGrip was
+// not running; it is not carried out (a pause long after the press would
+// surprise), only logged.
+const btnRequestMaxAge = 2 * time.Minute
+
+var btnRequestMu sync.Mutex
+
+// btnHandleRequests carries out what the runner asked of NetGrip (files
+// request.<token>: <action> <minutes> <button> <pattern> <unix time>) and
+// logs each in the runner's event log.
+func btnHandleRequests() {
+	btnRequestMu.Lock()
+	defer btnRequestMu.Unlock()
+	files, _ := filepath.Glob(filepath.Join(btnStateDir, "request.*"))
+	sort.Strings(files)
+	for _, f := range files {
+		data, err := os.ReadFile(f)
+		_ = os.Remove(f)
+		if err != nil {
+			continue
+		}
+		fl := strings.Fields(string(data))
+		if len(fl) != 5 || fl[0] != "quarantine_pause" || !reBtnName.MatchString(fl[2]) || !reBtnPattern.MatchString(fl[3]) {
+			log.Printf("netgrip: buttons: ignoring a malformed request")
+			continue
+		}
+		minutes, err1 := strconv.Atoi(fl[1])
+		at, err2 := strconv.ParseInt(fl[4], 10, 64)
+		if err1 != nil || err2 != nil || minutes < 1 || minutes > int(qMaxPause/time.Minute) {
+			log.Printf("netgrip: buttons: ignoring a malformed request")
+			continue
+		}
+		button, pattern := fl[2], fl[3]
+		if age := btnNow().Sub(time.Unix(at, 0)); age > btnRequestMaxAge || age < -btnRequestMaxAge {
+			btnAppendEvent(button, pattern, "quarantine_pause", "-", "failed: pressed while NetGrip was not running")
+			continue
+		}
+		did, err := btnQuarantineToggleFn(minutes)
+		if err != nil {
+			btnAppendEvent(button, pattern, "quarantine_pause", "-", "failed: "+btnOneLine(err.Error()))
+			continue
+		}
+		btnAppendEvent(button, pattern, "quarantine_pause", did, "ok")
+	}
+}
+
+var reBtnPattern = regexp.MustCompile(`^(press[1-3]|hold[0-9]{1,2})$`)
+
+// btnOneLine keeps a message to one line without the log's separators.
+func btnOneLine(s string) string {
+	s = strings.NewReplacer("\t", " ", "\n", " ", "\r", " ").Replace(s)
+	if len(s) > 160 {
+		s = s[:160]
+	}
+	return s
+}
+
+// btnAppendEvent adds a line to the runner's event log the way the runner
+// does (its lock, its id: the uptime in hundredths).
+func btnAppendEvent(button, pattern, action, detail, result string) {
+	if err := os.MkdirAll(btnStateDir, 0o755); err != nil {
+		return
+	}
+	unlock := btnLockEvents()
+	defer unlock()
+	line := fmt.Sprintf("%d\t%d\t%s\t%s\t%s\t%s\t%s\n", btnUptimeCS(), btnNow().Unix(), button, pattern, action, detail, result)
+	f, err := os.OpenFile(filepath.Join(btnStateDir, "events"), os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o644)
+	if err != nil {
+		return
+	}
+	_, _ = f.WriteString(line)
+	_ = f.Close()
+	log.Printf("netgrip: buttons: %s %s: %s %s %s", button, pattern, action, detail, result)
+}
+
+// btnUptimeCS: the router's uptime in hundredths of a second, the runner's
+// event ids (increasing since boot).
+func btnUptimeCS() int64 {
+	data, err := os.ReadFile("/proc/uptime")
+	if err != nil {
+		return 0
+	}
+	f := strings.Fields(string(data))
+	if len(f) == 0 {
+		return 0
+	}
+	whole, frac, _ := strings.Cut(f[0], ".")
+	n, _ := strconv.ParseInt(whole+(frac + "00")[:2], 10, 64)
+	return n
+}
+
 func btnPatternText(button, p string) string {
 	switch {
 	case p == "press1":
@@ -1188,6 +1311,16 @@ func btnEventText(e ButtonEvent, ssid map[string]string) string {
 			what = fmt.Sprintf("Wi-Fi %q turned %s for %d min", name, state, minutes)
 		default:
 			what = fmt.Sprintf("Wi-Fi %q turned %s", name, state)
+		}
+	case "quarantine_pause":
+		switch {
+		case failed:
+			what = "pausing or resuming the quarantine failed (" + e.Result + ")"
+		case strings.HasPrefix(e.Detail, "paused "):
+			m, _ := strconv.Atoi(strings.TrimPrefix(e.Detail, "paused "))
+			what = fmt.Sprintf("quarantine paused for %d min", m)
+		default:
+			what = "quarantine resumed"
 		}
 	case "firewall_restart":
 		what = "firewall restarted"
