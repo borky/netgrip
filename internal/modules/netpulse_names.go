@@ -61,8 +61,8 @@ func NoteNetPulseNames(in map[string]string) {
 	npNames.Store(&npNameSet{names: out, at: npNow()})
 }
 
-// npCleanName drops control and text-direction characters, folds runs of
-// spaces and bounds the length.
+// npCleanName drops control and invisible format characters, folds runs
+// of spaces and bounds the length.
 func npCleanName(s string) string {
 	if !utf8.ValidString(s) {
 		return ""
@@ -74,7 +74,9 @@ func npCleanName(s string) string {
 		case unicode.IsSpace(r): // tabs and line breaks too: one space
 			space = true
 			continue
-		case unicode.IsControl(r), unicode.Is(unicode.Bidi_Control, r), r == 0x200B, r == 0xFEFF: // zero-width space, BOM
+		// Controls and invisible format characters: direction overrides,
+		// zero-width ones, soft hyphens, word joiners, tags, BOM.
+		case unicode.IsControl(r), unicode.Is(unicode.Cf, r):
 			continue
 		}
 		if space && b.Len() > 0 {

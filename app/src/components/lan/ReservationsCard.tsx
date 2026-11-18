@@ -47,7 +47,8 @@ export function ReservationsCard({ cfg, onChange, index = 1 }: {
   const fillFromMac = (mac: string) => {
     const c = clients.find((x) => x.mac?.toLowerCase() === mac.trim().toLowerCase());
     if (c) {
-      if (c.name) setRName(c.name);
+      // A name shown from NetPulse is display only: never offered for DHCP.
+      if (c.name && c.name_source !== "netpulse") setRName(c.name);
       if (c.ip && isValidIp(c.ip)) setRIp(c.ip);
     }
   };
@@ -140,10 +141,13 @@ export function ReservationsCard({ cfg, onChange, index = 1 }: {
           <Field label="IP" mono error={rIp && !isValidIp(rIp) ? t("lan.invalidIp") : undefined}
             inputProps={{ value: rIp, onFocus: () => { if (!rIp) setRIp(defaultIp()); }, onChange: (e) => setRIp(e.target.value), placeholder: "192.168.8.10" }} />
           <datalist id="resv-clients">
-            {clients.map((c) => (c.mac ? <option key={c.mac} value={c.mac} label={c.name || c.ip || undefined}>{`${c.name || c.ip || ""} · ${c.mac}`}</option> : null))}
+            {clients.map((c) => {
+              const name = c.name_source === "netpulse" ? "" : c.name;
+              return c.mac ? <option key={c.mac} value={c.mac} label={name || c.ip || undefined}>{`${name || c.ip || ""} · ${c.mac}`}</option> : null;
+            })}
           </datalist>
           <datalist id="resv-clients-name">
-            {clients.map((c) => (c.name ? <option key={c.mac} value={c.name} label={c.ip || undefined}>{`${c.name} · ${c.ip || ""}`}</option> : null))}
+            {clients.map((c) => (c.name && c.name_source !== "netpulse" ? <option key={c.mac} value={c.name} label={c.ip || undefined}>{`${c.name} · ${c.ip || ""}`}</option> : null))}
           </datalist>
           <Button size="sm" onClick={add} disabled={busy || !rMac || !rIp || !!formError} loading={busy}>
             {t("lan.pin")}

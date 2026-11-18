@@ -171,6 +171,8 @@ func StopNetPulseAgent() {
 		npCancel()
 		npCancel = nil
 	}
+	// Names from the server that was just stopped or replaced go with it.
+	npNames.Store(nil)
 	if npBaseCancel != nil {
 		npBaseCancel()
 		npBaseCancel = nil
@@ -504,6 +506,8 @@ func applyNetPulseAgent(p netpulsePaths) {
 		npCancel()
 		npCancel = nil
 	}
+	// Names from the server that was just stopped or replaced go with it.
+	npNames.Store(nil)
 	npGen++
 	npStatus = runtime.Status{}
 	base := npBaseCtx

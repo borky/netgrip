@@ -876,6 +876,9 @@ function DetailClientModal({ client, rate, qos, onUpdateQos, parental, onUpdateP
           </span>
           <div className="min-w-0 flex-1">
             <span className="block truncate text-h2">{client.name || client.mac}</span>
+            {client.name_source === "netpulse" && (
+              <span className="block text-caption text-faint">{t("clients.fromNetPulseTip")}</span>
+            )}
             <span className="inline-flex items-center gap-1.5 text-caption text-muted">
               <span className="h-1.5 w-1.5 rounded-full bg-ok" aria-hidden="true" />
               {connLabel}
@@ -883,7 +886,7 @@ function DetailClientModal({ client, rate, qos, onUpdateQos, parental, onUpdateP
           </div>
         </div>
         <div className="rounded-md border border-border/60 px-3 divide-y divide-border/60">
-          <DetailRow label={t("clients.host")} value={client.name || client.mac} />
+          <DetailRow label={t("clients.host")} value={client.name_source === "netpulse" ? client.mac : client.name || client.mac} />
           <DetailRow label={t("clients.typeLabel")}
             value={<span className="inline-flex items-center gap-1.5"><span className="text-teal"><DevIcon size={14} aria-hidden="true" /></span>{t(DEVICE_TYPES[client.device_type as DeviceType]?.labelKey ?? "clients.type.other")}</span>} />
           <DetailRow label={t("clients.connection")}

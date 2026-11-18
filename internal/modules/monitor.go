@@ -126,6 +126,9 @@ func (m *Monitor) checkNewClients() {
 		if name == "" {
 			name = "Unknown device"
 		}
+		if c.NameSource == "netpulse" {
+			name += " (NetPulse)"
+		}
 		notifyAll("NetGrip",
 			fmt.Sprintf("📱 <b>NetGrip</b>\nNew client: <b>%s</b>\nMAC: %s · %s", htmlEsc(name), c.MAC, c.Type),
 			fmt.Sprintf("📱 NetGrip\nNew client: %s\nMAC: %s · %s", name, c.MAC, c.Type),
