@@ -537,10 +537,15 @@ func applyNetPulseAgent(p netpulsePaths) {
 		EnvFile:      p.env,
 		Version:      version,
 		Kind:         "netgrip",
-		SelfMQTT:     netPulseSelfMQTT,
-		PanelPort:    panelPort,
-		PanelTLS:     panelServesTLS,
-		PanelSPKI:    panelSPKIHook,
+		// The wired keepalive (clients_keepalive.go) already keeps quiet
+		// neighbours fresh, with one in-process datagram each and only when
+		// they are about to age out: the agent's own ping round to every
+		// STALE neighbour would repeat that work with a process per ping.
+		NoStalePing: true,
+		SelfMQTT:    netPulseSelfMQTT,
+		PanelPort:   panelPort,
+		PanelTLS:    panelServesTLS,
+		PanelSPKI:   panelSPKIHook,
 		// The uplink policy this panel manages travels with the push, so
 		// the monitoring side shows the connection actually in use rather
 		// than the one holding the cheapest route.
