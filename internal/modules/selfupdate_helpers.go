@@ -31,6 +31,13 @@ const helperMarker = "# netgrip helper - managed"
 // helperScripts are the packaged helpers that must converge with the binary.
 var helperScripts = []string{"netgrip-heal-register", "netgrip-restore-rules"}
 
+// helperSkip (fork): helpers the binary does not install or update. The
+// registry heal reinstalls the package from upstream's releases
+// (api.github.com/repos/gnacho/netgrip) when apk does not list it, which is
+// always so on a router where NetGrip is installed by hand: it can never
+// help there, and its job is to pull upstream's package over this build.
+var helperSkip = map[string]bool{"netgrip-heal-register": true}
+
 // helperScriptDir is a package-level variable so tests can point it at a
 // t.TempDir() directory.
 var helperScriptDir = "/usr/libexec"
@@ -76,6 +83,9 @@ func SyncHelperScriptsAtBoot(currentVersion string) {
 // already in place.
 func syncHelperScripts(reason, currentVersion string) {
 	for _, name := range helperScripts {
+		if helperSkip[name] {
+			continue
+		}
 		desired, err := canonicalHelperScript(name)
 		if err != nil {
 			log.Printf("netgrip: %s: embedded %s unreadable: %v", reason, name, err)

@@ -14,7 +14,9 @@ func useTempHelperDir(t *testing.T) string {
 	dir := t.TempDir()
 	old := helperScriptDir
 	helperScriptDir = dir
-	t.Cleanup(func() { helperScriptDir = old })
+	oldSkip := helperSkip
+	helperSkip = nil // upstream's tests cover every helper
+	t.Cleanup(func() { helperScriptDir, helperSkip = old, oldSkip })
 	return dir
 }
 
