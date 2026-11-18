@@ -21,8 +21,10 @@ type Monitor struct {
 	lastSeen    map[string]int64 // in memory; saved along with a new device
 	knownLoaded bool
 	// resync: the next check records the list without announcing it: the
-	// first one after a start or after notifications were off, when the
-	// devices that joined meanwhile were not watched.
+	// first one after notifications were off (or NetGrip started with them
+	// off), when the devices that joined meanwhile were not watched. A
+	// plain restart needs none: the saved list says what is already known,
+	// and a device that joined during the restart is still announced.
 	resync bool
 	stopCh chan struct{}
 }
@@ -35,7 +37,6 @@ func StartMonitor() {
 	}
 	m := &Monitor{
 		stopCh: make(chan struct{}),
-		resync: true,
 	}
 	monitorInstance = m
 	go m.run()

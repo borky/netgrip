@@ -39,6 +39,9 @@ type knownClientsFile struct {
 func loadKnownClients() (first, last map[string]int64, ok bool) {
 	data, err := os.ReadFile(knownClientsPath)
 	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("netgrip: known clients: %v; starting it again", err)
+		}
 		return nil, nil, false
 	}
 	var f knownClientsFile

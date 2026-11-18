@@ -22,14 +22,14 @@ package modules
 
 import (
 	"net"
-
-	"github.com/gnacho/netgrip/internal/ubus"
 	"os"
 	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/gnacho/netgrip/internal/ubus"
 )
 
 const (
@@ -262,11 +262,14 @@ func onDeviceSubnet(ip, dev string, subnets []ubus.Subnet) bool {
 	return false
 }
 
+// sysNetDir: sysfs's network devices (tests point it elsewhere).
+var sysNetDir = "/sys/class/net"
+
 // bridgeDevices: the bridge and the devices stacked on it (its VLAN
 // devices, whatever they are named), from sysfs.
 func bridgeDevices(bridge string) map[string]bool {
 	devs := map[string]bool{bridge: true}
-	entries, _ := os.ReadDir("/sys/class/net/" + bridge)
+	entries, _ := os.ReadDir(sysNetDir + "/" + bridge)
 	for _, e := range entries {
 		if name, ok := strings.CutPrefix(e.Name(), "upper_"); ok && name != "" {
 			devs[name] = true

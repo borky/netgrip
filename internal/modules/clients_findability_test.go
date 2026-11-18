@@ -1,6 +1,7 @@
 package modules
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -277,5 +278,53 @@ func TestKnownClientsSilentResync(t *testing.T) {
 	}
 	if got := m.newClients([]Client{{MAC: "02:00:00:00:00:02"}, {MAC: "02:00:00:00:00:03"}}, now, false); len(got) != 1 || got[0].MAC != "02:00:00:00:00:03" {
 		t.Fatalf("after resync: %v", got)
+	}
+}
+
+func TestParseSubnetsKeepsTheDevice(t *testing.T) {
+	raw := []byte(`{"interface":[{"interface":"lan","up":true,"l3_device":"br-lan.10","ipv4-address":[{"address":"192.0.2.1","mask":24}]}]}`)
+	got, err := ubus.ParseSubnets(raw)
+	if err != nil || len(got) != 1 || got[0].Device != "br-lan.10" {
+		t.Fatalf("ParseSubnets = %+v, %v", got, err)
+	}
+}
+
+func TestBridgeDevicesFromSysfs(t *testing.T) {
+	dir := t.TempDir()
+	old := sysNetDir
+	sysNetDir = dir
+	t.Cleanup(func() { sysNetDir = old })
+	for _, n := range []string{"br0/upper_vlan-iot", "br0/upper_br0.20", "br0/lower_lan1", "br0/bridge"} {
+		if err := os.MkdirAll(filepath.Join(dir, n), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got := bridgeDevices("br0")
+	if len(got) != 3 || !got["br0"] || !got["vlan-iot"] || !got["br0.20"] {
+		t.Fatalf("bridge devices = %v", got)
+	}
+}
+
+func TestKnownClientsLoadsAFileWithoutLastSeen(t *testing.T) {
+	old := knownClientsPath
+	knownClientsPath = filepath.Join(t.TempDir(), "known-clients.json")
+	t.Cleanup(func() { knownClientsPath = old })
+	if err := os.WriteFile(knownClientsPath, []byte(`{"first_seen":{"02:00:00:00:00:01":100,"bogus":5}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	first, last, ok := loadKnownClients()
+	if !ok || len(first) != 1 || last["02:00:00:00:00:01"] != 100 {
+		t.Fatalf("first=%v last=%v ok=%v", first, last, ok)
+	}
+}
+
+func TestMonitorStartsWithoutResync(t *testing.T) {
+	// A restart is not a resync: the saved list already says what is known,
+	// and a device that joined meanwhile must still be announced.
+	StopMonitor()
+	StartMonitor()
+	t.Cleanup(StopMonitor)
+	if monitorInstance.resync {
+		t.Fatal("the monitor starts silent")
 	}
 }

@@ -292,7 +292,7 @@ export function ClientsPage() {
     const q = query.trim().toLowerCase();
     // A MAC typed without separators, or with others: only for a query made
     // of hex digits and separators (a name like "dad's" is not a MAC).
-    const qHex = /^[0-9a-f:.\-]+$/.test(q) ? q.replace(/[^0-9a-f]/g, "") : "";
+    const qHex = /^[0-9a-f:.\- ]+$/.test(q) ? q.replace(/[^0-9a-f]/g, "") : "";
     return clients.filter((c) => {
       if (view.conn === "wifi" ? c.type === "cable" : view.conn === "cable" ? c.type !== "cable" : view.conn !== "all" && c.type !== view.conn) return false;
       if (view.network && c.network !== view.network) return false;
