@@ -227,7 +227,7 @@ func installFakeFW(t *testing.T, f *fakeFW) {
 	clientSubnetsFn = func() []ubus.Subnet {
 		return []ubus.Subnet{{Interface: "lan", Device: "br-lan", Address: "192.0.2.1", Mask: 24}}
 	}
-	allowLookupFn = func(ctx context.Context, host string) ([]netip.Addr, error) {
+	allowLookupFn = func(ctx context.Context, network, host string) ([]netip.Addr, error) {
 		return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
 	}
 	allowSnapshotFn = func(string) (string, error) { snap = f.clone(); return "snap", nil }
@@ -257,11 +257,17 @@ func installFakeFW(t *testing.T, f *fakeFW) {
 		}
 		return "", errors.New("No such file or directory")
 	}
+	// fw4's rendering: each enabled rule using a set, named in its comment.
 	allowRulesetFn = func() (string, error) {
 		var b strings.Builder
 		for _, s := range f.secs {
-			if v := s.opts["ipset"]; len(v) > 0 {
-				fmt.Fprintf(&b, "ip saddr @%s counter accept\n", strings.TrimPrefix(v[0], "!"))
+			if v := s.opts["ipset"]; len(v) > 0 && !(len(s.opts["enabled"]) > 0 && s.opts["enabled"][0] == "0") {
+				name := ""
+				if n := s.opts["name"]; len(n) > 0 {
+					name = n[0]
+				}
+				set, _ := ipsetRef(v[0])
+				fmt.Fprintf(&b, "\t\tip saddr @%s counter accept comment \"!fw4: %s\"\n", set, name)
 			}
 		}
 		return b.String(), nil
@@ -294,18 +300,34 @@ func baseFW() *fakeFW {
 	return f
 }
 
-func fakeLookup(m map[string][]string) func(context.Context, string) ([]netip.Addr, error) {
-	return func(_ context.Context, host string) ([]netip.Addr, error) {
+// fakeLookup answers from m: "TIMEOUT" fails both families, "TIMEOUT6"
+// only IPv6. A family with no address answers "no such host", as the
+// resolver does.
+func fakeLookup(m map[string][]string) func(context.Context, string, string) ([]netip.Addr, error) {
+	return func(_ context.Context, network, host string) ([]netip.Addr, error) {
+		if !strings.HasSuffix(host, ".") {
+			return nil, errors.New("not queried as an absolute name")
+		}
+		host = strings.TrimSuffix(host, ".")
 		v, ok := m[host]
 		if !ok {
 			return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
 		}
-		if len(v) == 1 && v[0] == "TIMEOUT" {
-			return nil, &net.DNSError{Err: "i/o timeout", Name: host, IsTimeout: true, IsTemporary: true}
-		}
 		var out []netip.Addr
 		for _, s := range v {
-			out = append(out, netip.MustParseAddr(s))
+			if s == "TIMEOUT" || (s == "TIMEOUT6" && network == "ip6") {
+				return nil, &net.DNSError{Err: "i/o timeout", Name: host, IsTimeout: true, IsTemporary: true}
+			}
+			if s == "TIMEOUT6" {
+				continue
+			}
+			a := netip.MustParseAddr(s)
+			if a.Is4() == (network == "ip4") {
+				out = append(out, a)
+			}
+		}
+		if len(out) == 0 {
+			return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
 		}
 		return out, nil
 	}
@@ -428,11 +450,11 @@ func TestAllowElementsAndKeep(t *testing.T) {
 	}}
 	a := netip.MustParseAddr
 	hosts := map[string]*allowHost{
-		"a.example.net": {Addrs: []netip.Addr{a("192.0.2.44"), a("2001:db8::9")}, OKAt: now},
+		"a.example.net": {V4: allowFam{Addrs: []netip.Addr{a("192.0.2.44")}, OKAt: now}, V6: allowFam{Addrs: []netip.Addr{a("2001:db8::9")}, OKAt: now}},
 		// lookups failing for 2 h: kept (6 h allowed)
-		"b.example.net": {Addrs: []netip.Addr{a("192.0.2.55")}, OKAt: now.Add(-2 * time.Hour), Err: "timeout"},
+		"b.example.net": {V4: allowFam{Addrs: []netip.Addr{a("192.0.2.55")}, OKAt: now.Add(-2 * time.Hour), Err: "timeout"}, V6: allowFam{NotFound: true}},
 		// the name is gone: dropped at once
-		"c.example.net": {Addrs: nil, OKAt: now.Add(-time.Minute), Err: "gone", NotFound: true},
+		"c.example.net": {V4: allowFam{NotFound: true}, V6: allowFam{NotFound: true}},
 	}
 	v4, v6 := allowElements(l, hosts, now)
 	if strings.Join(v4, ",") != "192.0.2.44,192.0.2.55,198.51.100.0/24,203.0.113.5" {
@@ -441,12 +463,12 @@ func TestAllowElementsAndKeep(t *testing.T) {
 	if strings.Join(v6, ",") != "2001:db8::/48" { // 2001:db8::9 lies inside
 		t.Errorf("v6 %v", v6)
 	}
-	hosts["b.example.net"].OKAt = now.Add(-7 * time.Hour)
+	hosts["b.example.net"].V4.OKAt = now.Add(-7 * time.Hour)
 	if v4, _ = allowElements(l, hosts, now); strings.Contains(strings.Join(v4, ","), "192.0.2.55") {
 		t.Errorf("kept past the window: %v", v4)
 	}
 	l.KeepHours = 0
-	hosts["b.example.net"].OKAt = now.Add(-time.Second)
+	hosts["b.example.net"].V4.OKAt = now.Add(-time.Second)
 	if v4, _ = allowElements(l, hosts, now); strings.Contains(strings.Join(v4, ","), "192.0.2.55") {
 		t.Errorf("kept with keep 0: %v", v4)
 	}
@@ -517,15 +539,15 @@ func TestAllowSectionFamily(t *testing.T) {
 func TestAllowAttachOpsForward(t *testing.T) {
 	f := baseFW()
 	secs := parseUCIShow(f.show(), "firewall")
-	ops, sets, err := allowAttachOps(secs, "@redirect[0]", "home")
+	ops, sets, err := allowAttachOps(secs, "@redirect[0]", "home", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(ops) != 1 || ops[0].Args[0] != "firewall.@redirect[0].ipset" || ops[0].Args[1] != "netgrip_allow_home_v4" {
 		t.Errorf("ops %+v", ops)
 	}
-	if len(sets) != 1 || sets[0] != "netgrip_allow_home_v4" {
-		t.Errorf("sets %v", sets)
+	if len(sets) != 1 || sets[0].Set != "netgrip_allow_home_v4" || sets[0].Name != "Web" {
+		t.Errorf("checks %v", sets)
 	}
 }
 
@@ -535,7 +557,7 @@ func TestAllowAttachOpsDualFamilyAnonymous(t *testing.T) {
 	old := allowRandName
 	allowRandName = func() string { return "abc123" }
 	defer func() { allowRandName = old }()
-	ops, sets, err := allowAttachOps(secs, "@rule[0]", "home")
+	ops, sets, err := allowAttachOps(secs, "@rule[0]", "home", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -566,8 +588,8 @@ func TestAllowAttachOpsDualFamilyAnonymous(t *testing.T) {
 			t.Errorf("twin %s = %v, want %s", k, got, v)
 		}
 	}
-	if len(sets) != 2 {
-		t.Errorf("sets %v", sets)
+	if len(sets) != 2 || sets[1].Name != "VPN-in (IPv6, netgrip allowlists)" {
+		t.Errorf("checks %v", sets)
 	}
 	// In step now: nothing more to do.
 	if ops := allowCompanionSyncOps(parseUCIShow(f.show(), "firewall")); len(ops) != 0 {
@@ -711,14 +733,14 @@ func TestAllowUseFlow(t *testing.T) {
 	vpn := ruleBy(t, "VPN-in")
 	ref := &AllowRuleRef{Name: vpn.Name, Port: vpn.SrcDport, Proto: vpn.Proto, Kind: vpn.Kind}
 	// The page's view went stale: refused.
-	if _, _, err := AllowUse(AllowUseRequest{Section: vpn.Section, List: "home",
+	if _, _, _, err := AllowUse(AllowUseRequest{Section: vpn.Section, List: "home",
 		Expect: &AllowRuleRef{Name: "other", Port: "1", Proto: "udp", Kind: "input"}}, local); err == nil {
 		t.Fatal("stale reference accepted")
 	}
-	if _, _, err := AllowUse(AllowUseRequest{Section: vpn.Section, List: "home"}, local); err == nil {
+	if _, _, _, err := AllowUse(AllowUseRequest{Section: vpn.Section, List: "home"}, local); err == nil {
 		t.Fatal("anonymous section without details accepted")
 	}
-	if _, rb, err := AllowUse(AllowUseRequest{Section: vpn.Section, List: "home", Expect: ref}, local); err != nil || rb {
+	if _, rb, _, err := AllowUse(AllowUseRequest{Section: vpn.Section, List: "home", Expect: ref}, local); err != nil || rb {
 		t.Fatalf("attach: rb=%v %v", rb, err)
 	}
 	vpn = ruleBy(t, "VPN-in")
@@ -741,12 +763,12 @@ func TestAllowUseFlow(t *testing.T) {
 		t.Errorf("delete in use: %v", err)
 	}
 	// Opening to anyone needs the explicit flag.
-	_, _, err := AllowUse(AllowUseRequest{Section: vpn.Section, List: ""}, local)
+	_, _, _, err := AllowUse(AllowUseRequest{Section: vpn.Section, List: ""}, local)
 	var nf *AllowNeedsForce
 	if !errors.As(err, &nf) {
 		t.Fatalf("open without flag: %v", err)
 	}
-	if _, _, err := AllowUse(AllowUseRequest{Section: vpn.Section, List: "", OpenToAnyone: true}, local); err != nil {
+	if _, _, _, err := AllowUse(AllowUseRequest{Section: vpn.Section, List: "", OpenToAnyone: true}, local); err != nil {
 		t.Fatal(err)
 	}
 	vpn = ruleBy(t, "VPN-in")
@@ -773,7 +795,7 @@ func TestAllowUseLockoutFromOutside(t *testing.T) {
 	}
 	ssh := ruleBy(t, "netgrip-remote-ssh")
 	outside := "198.51.100.99"
-	_, _, err := AllowUse(AllowUseRequest{Section: ssh.Section, List: "office"}, outside)
+	_, _, _, err := AllowUse(AllowUseRequest{Section: ssh.Section, List: "office"}, outside)
 	var nf *AllowNeedsForce
 	if !errors.As(err, &nf) || !strings.Contains(nf.Reason, outside) {
 		t.Fatalf("lockout not caught: %v", err)
@@ -782,7 +804,7 @@ func TestAllowUseLockoutFromOutside(t *testing.T) {
 		t.Error("firewall touched before the user confirmed")
 	}
 	// From inside the office range: fine.
-	if _, _, err := AllowUse(AllowUseRequest{Section: ssh.Section, List: "office"}, "203.0.113.20"); err != nil {
+	if _, _, _, err := AllowUse(AllowUseRequest{Section: ssh.Section, List: "office"}, "203.0.113.20"); err != nil {
 		t.Fatal(err)
 	}
 	// Editing the list in use to drop the requester, from outside: refused.
@@ -804,7 +826,7 @@ func TestAllowUseRollsBackWhenTheFirewallDropsTheRule(t *testing.T) {
 	}
 	allowRulesetFn = func() (string, error) { return "", nil } // fw4 skipped the rule
 	ssh := ruleBy(t, "netgrip-remote-ssh")
-	_, rb, err := AllowUse(AllowUseRequest{Section: ssh.Section, List: "home"}, "192.0.2.50")
+	_, rb, _, err := AllowUse(AllowUseRequest{Section: ssh.Section, List: "home"}, "192.0.2.50")
 	if err == nil || !rb {
 		t.Fatalf("rb=%v err=%v", rb, err)
 	}
@@ -814,7 +836,7 @@ func TestAllowUseRollsBackWhenTheFirewallDropsTheRule(t *testing.T) {
 	// A failing op: rolled back too.
 	allowRulesetFn = func() (string, error) { return "@netgrip_allow_home_v4 x", nil }
 	f.failOn = "uci_set firewall.netgrip_remote_ssh.ipset"
-	_, rb, err = AllowUse(AllowUseRequest{Section: ssh.Section, List: "home"}, "192.0.2.50")
+	_, rb, _, err = AllowUse(AllowUseRequest{Section: ssh.Section, List: "home"}, "192.0.2.50")
 	if err == nil || !rb || f.show() != before {
 		t.Errorf("failed op: rb=%v err=%v", rb, err)
 	}
@@ -876,7 +898,7 @@ func TestAllowRefreshPushesOnlyChanges(t *testing.T) {
 		t.Fatalf("nft for a set not in use: %v", scripts)
 	}
 	ssh := ruleBy(t, "netgrip-remote-ssh")
-	if _, _, err := AllowUse(AllowUseRequest{Section: ssh.Section, List: "home"}, "192.0.2.50"); err != nil {
+	if _, _, _, err := AllowUse(AllowUseRequest{Section: ssh.Section, List: "home"}, "192.0.2.50"); err != nil {
 		t.Fatal(err)
 	}
 	scripts = nil
@@ -907,7 +929,7 @@ func TestAllowRefreshPushesOnlyChanges(t *testing.T) {
 	}
 	// ...and dropped once the hour is over.
 	allowMu.Lock()
-	allowHosts["home.example.net"].OKAt = allowNow().Add(-2 * time.Hour)
+	allowHosts["home.example.net"].V4.OKAt = allowNow().Add(-2 * time.Hour)
 	allowMu.Unlock()
 	allowRefresh(false)
 	if len(scripts) != 1 || strings.Contains(scripts[0], "198.51.100.8") {
@@ -938,7 +960,7 @@ func TestAllowRefreshNothingWithoutLists(t *testing.T) {
 	f := baseFW()
 	installFakeFW(t, f)
 	lookups := 0
-	allowLookupFn = func(context.Context, string) ([]netip.Addr, error) { lookups++; return nil, nil }
+	allowLookupFn = func(context.Context, string, string) ([]netip.Addr, error) { lookups++; return nil, nil }
 	allowNftFn = func(string) error { t.Error("nft ran"); return nil }
 	calls := 0
 	SetUciExecForTest(t, func(args ...string) ([]byte, error) { calls++; return nil, errors.New("x") })
@@ -975,7 +997,11 @@ func TestAllowRequesterLocal(t *testing.T) {
 		}
 	}
 	for ip, want := range map[string]bool{
-		"192.0.2.77": true, "::ffff:192.0.2.77": true, "127.0.0.1": true, "fd00::5": true, "fe80::1": true,
+		// Loopback is how an SSH tunnel arrives, from anywhere: not local.
+		"192.0.2.77": true, "::ffff:192.0.2.77": true, "127.0.0.1": false, "fd00::5": true, "fe80::1": true,
+		// The host a port open to the Internet forwards to (a reverse proxy
+		// passes on the Internet's requests): not local.
+		"192.0.2.10":   false,
 		"198.51.100.9": false, "203.0.113.1": false, "2001:db8::1": false, "": false, "junk": false,
 	} {
 		if got := AllowRequesterLocal(ip); got != want {
@@ -1147,5 +1173,313 @@ func TestAllowDeleteOrder(t *testing.T) {
 	}
 	if len(f.secs) != 1 || f.secs[0].opts["name"][0] != "keep" {
 		t.Errorf("left %s", f.show())
+	}
+}
+
+// ---- review findings ----
+
+func TestIpsetRefNegationWithSpace(t *testing.T) {
+	for in, want := range map[string]string{"trusted": "trusted", "!trusted": "!trusted", "! trusted": "!trusted",
+		"  !  trusted src": "!trusted", "": "", "!": "!"} {
+		n, neg := ipsetRef(in)
+		got := n
+		if neg {
+			got = "!" + n
+		}
+		if got != want {
+			t.Errorf("%q: %q", in, got)
+		}
+	}
+	// A DROP rule written "! trusted" is a reference: the set cannot be
+	// taken over (deleting it would make fw4 skip the DROP rule).
+	f := baseFW()
+	installFakeFW(t, f)
+	f.add("", "ipset", "name", "trusted", "match", "src_ip")
+	f.add("", "rule", "name", "Block-SSH", "src", "wan", "proto", "tcp", "dest_port", "22", "target", "DROP", "ipset", "! trusted")
+	f.add("", "rule", "name", "SSH-in", "src", "wan", "proto", "tcp", "dest_port", "22", "target", "ACCEPT", "ipset", "trusted")
+	secs := parseUCIShow(f.show(), "firewall")
+	if refs := allowReferences(secs, "trusted"); len(refs) != 2 {
+		t.Errorf("refs %v", refs)
+	}
+	InvalidatePrefix("")
+	for _, e := range allowExternalSets(allowSections(), ProbeFwd().Rules) {
+		if e.Set == "trusted" && e.Manage {
+			t.Error("a set a DROP rule uses offered for take over")
+		}
+	}
+}
+
+func TestTakeoverKeepsTheFamily(t *testing.T) {
+	// A rule answering both families, limited to an IPv4 set elsewhere,
+	// only let IPv4 in: after the take over it must not let IPv6 in.
+	f := baseFW()
+	vpn := f.find("@rule[0]")
+	vpn.opts["ipset"] = []string{"web_allowed"}
+	vpn.keys = append(vpn.keys, "ipset")
+	secs := parseUCIShow(f.show(), "firewall")
+	ops, checks, err := allowAttachOps(secs, "@rule[0]", "home", 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, op := range ops {
+		if err := f.run(op); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if vpn.opts["family"][0] != "ipv4" || vpn.opts["ipset"][0] != "netgrip_allow_home_v4" || len(checks) != 1 {
+		t.Errorf("rule %+v checks %v", vpn.opts, checks)
+	}
+	for _, s := range f.secs {
+		if strings.HasSuffix(f.label(s), allowCompanionSuffix) {
+			t.Error("IPv6 twin made")
+		}
+	}
+	// The background check does not add one later either.
+	if ops := allowCompanionSyncOps(parseUCIShow(f.show(), "firewall")); len(ops) != 0 {
+		t.Errorf("sync %+v", ops)
+	}
+	// An IPv4 rule with an IPv6 set: refused (fw4 skipped it before).
+	if _, _, err := allowAttachOps(parseUCIShow(f.show(), "firewall"), "@redirect[0]", "home", 6); err == nil {
+		t.Error("family mismatch accepted")
+	}
+}
+
+func TestCompanionSettlesWithOddOptions(t *testing.T) {
+	f := baseFW()
+	ssh := f.find("netgrip_remote_ssh")
+	ssh.opts["ipset"] = []string{"netgrip_allow_home_v4"}
+	ssh.opts["icmp_type"] = nil // `uci show` prints an empty list as "key="
+	ssh.keys = append(ssh.keys, "ipset", "icmp_type")
+	ssh.opts["name"] = []string{"ssh; `x`"}
+	sync := func() []executor.Op {
+		ops := allowCompanionSyncOps(parseUCIShow(f.show(), "firewall"))
+		for _, op := range ops {
+			if err := f.run(op); err != nil {
+				t.Fatalf("%+v: %v", op, err)
+			}
+		}
+		return ops
+	}
+	sync()
+	if ops := sync(); len(ops) != 0 {
+		t.Fatalf("does not settle: %+v", ops)
+	}
+	if n := f.find("netgrip_remote_ssh_ngal6").opts["name"][0]; n != "ssh x (IPv6, netgrip allowlists)" {
+		t.Errorf("twin name %q", n)
+	}
+	// A value NetGrip cannot write: no twin (IPv6 closed), and stable.
+	ssh.opts["extra"] = []string{"a;b"}
+	ssh.keys = append(ssh.keys, "extra")
+	sync()
+	if f.find("netgrip_remote_ssh_ngal6") != nil {
+		t.Error("twin kept for a rule it cannot copy")
+	}
+	if ops := sync(); len(ops) != 0 {
+		t.Errorf("does not settle: %+v", ops)
+	}
+	InvalidatePrefix("")
+	af := allowedFromOf("netgrip_remote_ssh", parseUCIShow(f.show(), "firewall")["netgrip_remote_ssh"], parseUCIShow(f.show(), "firewall"), nil)
+	if !af.IPv6Closed || af.Families != "ipv4" {
+		t.Errorf("%+v", af)
+	}
+}
+
+func TestTwinOutOfStepIsListed(t *testing.T) {
+	f := baseFW()
+	installFakeFW(t, f)
+	ssh := f.find("netgrip_remote_ssh")
+	ssh.opts["ipset"] = []string{"netgrip_allow_home_v4"}
+	ssh.keys = append(ssh.keys, "ipset")
+	for _, op := range allowCompanionSyncOps(parseUCIShow(f.show(), "firewall")) {
+		_ = f.run(op)
+	}
+	ssh.opts["dest_port"] = []string{"2222"} // changed in LuCI, twin not repaired yet
+	InvalidatePrefix("")
+	found := false
+	for _, r := range ProbeFwd().Rules {
+		if r.Section == "netgrip_remote_ssh_ngal6" && r.SrcDport == "22" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("a twin out of step is hidden")
+	}
+}
+
+func TestDNSPerFamilyAndParked(t *testing.T) {
+	f := baseFW()
+	installFakeFW(t, f)
+	answers := map[string][]string{"home.example.net": {"198.51.100.7", "2001:db8::7"}}
+	allowLookupFn = fakeLookup(answers)
+	if _, err := AllowSave(AllowSaveRequest{Name: "Home", KeepHours: 6, Entries: []AllowEntry{{Value: "home.example.net"}}}, "192.0.2.50"); err != nil {
+		t.Fatal(err)
+	}
+	// IPv6 times out, IPv4 moves: the IPv6 address is kept, the new IPv4
+	// one used.
+	answers["home.example.net"] = []string{"198.51.100.8", "TIMEOUT6"}
+	allowRefresh(false)
+	allowMu.Lock()
+	_, l := allowFindLocked("home")
+	v4, v6 := allowElements(*l, allowHosts, allowNow())
+	allowMu.Unlock()
+	if strings.Join(v4, ",") != "198.51.100.8" || strings.Join(v6, ",") != "2001:db8::7" {
+		t.Errorf("v4 %v v6 %v", v4, v6)
+	}
+	// Parked at 0.0.0.0: gone at once, not "failing".
+	answers["home.example.net"] = []string{"0.0.0.0"}
+	allowRefresh(false)
+	allowMu.Lock()
+	v4, v6 = allowElements(*l, allowHosts, allowNow())
+	allowMu.Unlock()
+	if len(v4) != 0 || len(v6) != 0 {
+		t.Errorf("parked name kept: %v %v", v4, v6)
+	}
+}
+
+func TestRefillFailureEmptiesTheSet(t *testing.T) {
+	f := baseFW()
+	installFakeFW(t, f)
+	allowLookupFn = fakeLookup(map[string][]string{"home.example.net": {"198.51.100.7"}})
+	if _, err := AllowSave(AllowSaveRequest{Name: "Home", Entries: []AllowEntry{{Value: "home.example.net"}, {Value: "203.0.113.5"}}}, "192.0.2.50"); err != nil {
+		t.Fatal(err)
+	}
+	ssh := ruleBy(t, "netgrip-remote-ssh")
+	if _, _, _, err := AllowUse(AllowUseRequest{Section: ssh.Section, List: "home"}, "192.0.2.50"); err != nil {
+		t.Fatal(err)
+	}
+	var scripts []string
+	allowNftFn = func(s string) error {
+		scripts = append(scripts, s)
+		if strings.Contains(s, "add element") {
+			return errors.New("Could not process rule")
+		}
+		return nil
+	}
+	allowRefresh(true)
+	flushOnly := 0
+	for _, s := range scripts {
+		if s == "flush set inet fw4 netgrip_allow_home_v4\n" {
+			flushOnly++
+		}
+	}
+	if flushOnly != 1 {
+		t.Errorf("not emptied on failure: %q", scripts)
+	}
+	p := ProbeAllowlists("192.0.2.50")
+	if p.Lists[0].Error == "" {
+		t.Error("failure not shown")
+	}
+}
+
+func TestRangePrefixes(t *testing.T) {
+	for in, want := range map[string]string{
+		"198.51.100.0-198.51.100.255": "198.51.100.0/24",
+		"198.51.100.5-198.51.100.9":   "198.51.100.5,198.51.100.6/31,198.51.100.8/31",
+		"198.51.100.7-198.51.100.7":   "198.51.100.7",
+		"2001:db8::-2001:db8::3":      "2001:db8::/126",
+		"198.51.100.9-198.51.100.5":   "",
+	} {
+		a, b, _ := strings.Cut(in, "-")
+		if got := strings.Join(rangePrefixes(a, b), ","); got != want {
+			t.Errorf("%s: %s", in, got)
+		}
+	}
+	text := "set s {\n elements = { 198.51.100.0-198.51.100.3, 203.0.113.9 }\n}"
+	if got := strings.Join(parseNftElements(text), ","); got != "198.51.100.0/30,203.0.113.9" {
+		t.Errorf("%s", got)
+	}
+}
+
+func TestCronLineChangedMeanwhileIsLeftAlone(t *testing.T) {
+	dir := t.TempDir()
+	tabs := filepath.Join(dir, "crontabs")
+	_ = os.MkdirAll(tabs, 0o755)
+	tab := filepath.Join(tabs, "root")
+	_ = os.WriteFile(tab, []byte("*/5 * * * * /usr/bin/other\n"), 0o600)
+	err := allowDisableCronLines([]allowCronLine{{File: tab, Line: 1, Text: "*/5 * * * * /usr/bin/fill-web"}}, "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(tab)
+	if string(b) != "*/5 * * * * /usr/bin/other\n" {
+		t.Errorf("%q", b)
+	}
+	entries, _ := os.ReadDir(tabs)
+	if len(entries) != 1 {
+		t.Errorf("stray files in the crontab dir: %v", entries)
+	}
+}
+
+func TestAllowUseNoopAndRemoteOff(t *testing.T) {
+	f := baseFW()
+	installFakeFW(t, f)
+	if _, err := AllowSave(AllowSaveRequest{Name: "Home", Entries: []AllowEntry{{Value: "192.0.2.0/24"}}}, "192.0.2.50"); err != nil {
+		t.Fatal(err)
+	}
+	ssh := ruleBy(t, "netgrip-remote-ssh")
+	_, _, changed, err := AllowUse(AllowUseRequest{Section: ssh.Section, List: "home"}, "192.0.2.50")
+	if err != nil || !changed {
+		t.Fatalf("changed=%v %v", changed, err)
+	}
+	reloads := f.reloads
+	if _, _, changed, err = AllowUse(AllowUseRequest{Section: ssh.Section, List: "home"}, "192.0.2.50"); err != nil || changed || f.reloads != reloads {
+		t.Errorf("no-op reloaded: changed=%v reloads %d->%d %v", changed, reloads, f.reloads, err)
+	}
+	// Remote SSH switched off (DROP): not listed, but its list can be
+	// released, so the list can be deleted.
+	f.find("netgrip_remote_ssh").opts["target"] = []string{"DROP"}
+	InvalidatePrefix("")
+	if _, _, _, err := AllowUse(AllowUseRequest{Section: "netgrip_remote_ssh", OpenToAnyone: true}, "192.0.2.50"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := AllowDelete("home", "192.0.2.50"); err != nil {
+		t.Errorf("list stuck: %v", err)
+	}
+}
+
+func TestAddFwdRuleLimitStagedFirst(t *testing.T) {
+	f := baseFW()
+	installFakeFW(t, f)
+	defer applyForFwdTest(t, f)()
+	if _, err := AllowSave(AllowSaveRequest{Name: "Friends", Entries: []AllowEntry{{Value: "198.51.100.7"}}}, "192.0.2.50"); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := AddFwdRule("8443", "192.0.2.20", "443", "tcp", "friends"); err != nil {
+		t.Fatal(err)
+	}
+	ops := f.applied[len(f.applied)-1]
+	for i, op := range ops {
+		if op.Args[0] == "firewall.netgrip_fwd_8443_192_0_2_20" {
+			if next := ops[i+1]; next.Args[0] != "firewall.netgrip_fwd_8443_192_0_2_20.ipset" {
+				t.Errorf("limit not staged right after the section: %+v", next)
+			}
+			return
+		}
+	}
+	t.Error("forward section not created")
+}
+
+func TestPendingChangesRefused(t *testing.T) {
+	f := baseFW()
+	installFakeFW(t, f)
+	if _, err := AllowSave(AllowSaveRequest{Name: "Home", Entries: []AllowEntry{{Value: "192.0.2.0/24"}}}, "192.0.2.50"); err != nil {
+		t.Fatal(err)
+	}
+	ssh := ruleBy(t, "netgrip-remote-ssh")
+	SetUciExecForTest(t, func(args ...string) ([]byte, error) {
+		if len(args) == 2 && args[0] == "changes" {
+			return []byte("firewall.x.ipset='-'\n"), nil
+		}
+		if len(args) == 2 && args[0] == "show" {
+			return []byte(f.show()), nil
+		}
+		return nil, errors.New("not found")
+	})
+	InvalidatePrefix("")
+	if _, _, _, err := AllowUse(AllowUseRequest{Section: ssh.Section, List: "home"}, "192.0.2.50"); !errors.Is(err, errAllowPending) {
+		t.Errorf("err %v", err)
+	}
+	if len(f.applied) != 0 {
+		t.Error("applied over someone else's staged changes")
 	}
 }

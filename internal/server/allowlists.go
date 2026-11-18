@@ -47,16 +47,17 @@ func (s *Server) handleAllowDelete(w http.ResponseWriter, r *http.Request) {
 	writeAllowResult(w, probe, rb, err)
 }
 
-// handleAllowUse ties a port to a list (or opens it to anyone). From
-// outside the router's own networks the change arms the revert timer: if
-// it cuts the requester off, the router puts the firewall back by itself.
+// handleAllowUse ties a port to a list (or opens it to anyone). Limiting a
+// port always arms the revert timer: whoever reached the panel through it
+// (from outside, through a tunnel or a proxy at home) and is cut off gets
+// the firewall put back by the router itself.
 func (s *Server) handleAllowUse(w http.ResponseWriter, r *http.Request) {
 	var req modules.AllowUseRequest
 	if !decodeJSON(w, r, &req) {
 		return
 	}
 	ip := requesterIP(r)
-	confirm := req.List != "" && !modules.AllowRequesterLocal(ip)
+	confirm := req.List != ""
 	s.riskyMu.Lock()
 	defer s.riskyMu.Unlock()
 	var snapshots map[string]string
@@ -67,13 +68,14 @@ func (s *Server) handleAllowUse(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	probe, rb, err := modules.AllowUse(req, ip)
+	probe, rb, changed, err := modules.AllowUse(req, ip)
 	var nf *modules.AllowNeedsForce
 	if errors.As(err, &nf) {
 		writeAllowResult(w, probe, rb, err)
 		return
 	}
-	s.finishRiskyApply(w, probe, rb, err, confirm, snapshots)
+	// Nothing changed: no window to confirm.
+	s.finishRiskyApply(w, probe, rb, err, confirm && changed, snapshots)
 }
 
 func (s *Server) handleAllowTakeoverInfo(w http.ResponseWriter, r *http.Request) {

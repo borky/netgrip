@@ -80,6 +80,23 @@ func firewallSections(kind string) []string {
 	return sections
 }
 
+// showSectionsOfType lists, in order, the sections of one type in a
+// `uci show` output: the same output the options are read from, so an
+// anonymous section's index cannot mean two different sections.
+func showSectionsOfType(show, pkg, kind string) []string {
+	var out []string
+	for _, line := range strings.Split(show, "\n") {
+		k, v, ok := strings.Cut(strings.TrimSpace(line), "=")
+		if !ok || v != kind || !strings.HasPrefix(k, pkg+".") {
+			continue
+		}
+		if name := strings.TrimPrefix(k, pkg+"."); !strings.Contains(name, ".") {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
 // internetZones names the firewall zones that face the Internet: the ones
 // carrying the network of the active uplink.
 //
@@ -216,7 +233,7 @@ func ProbeFwd() *FwdProbe {
 	// Only those coming FROM the Internet — a redirect from an internal
 	// zone is something else entirely (forcing local DNS, say), and
 	// counting it as an exposure would be alarming and wrong.
-	for _, section := range firewallSections("redirect") {
+	for _, section := range showSectionsOfType(show, "firewall", "redirect") {
 		if r, ok := fwdRuleOf(section, secs[section], wanZones, stock, secs, names); ok {
 			p.Rules = append(p.Rules, r)
 		}
@@ -227,7 +244,7 @@ func ProbeFwd() *FwdProbe {
 	// is a different question. A rule with no port is a protocol allowance
 	// (ping, ESP), not an open port. NetGrip's IPv6 twins of rules limited
 	// to an allow list are part of their rule, not listed on their own.
-	for _, section := range firewallSections("rule") {
+	for _, section := range showSectionsOfType(show, "firewall", "rule") {
 		if r, ok := fwdRuleOf(section, secs[section], wanZones, stock, secs, names); ok {
 			p.Rules = append(p.Rules, r)
 		}
@@ -293,16 +310,24 @@ func AddFwdRule(srcDport, destIP, destPort, proto, allowList string) (*FwdProbe,
 		{Kind: "uci_set", Args: []string{base + ".dest_port", destPort}},
 		{Kind: "uci_set", Args: []string{base + ".proto", proto}},
 	}
-	var allowSets []string
+	var allowSets []allowCheck
 	if allowList != "" {
 		if r := allowUnsupportedReason(); r != "" {
 			return ProbeFwd(), false, errors.New(r)
+		}
+		if allowFirewallPending() {
+			return ProbeFwd(), false, errAllowPending
 		}
 		more, sets, err := allowAddForwardOps(section, allowList)
 		if err != nil {
 			return ProbeFwd(), false, err
 		}
-		ops, allowSets = append(ops, more...), sets
+		// The sets first, then the forward with its limit straight after
+		// the section itself, before any of its ports: no partial state of
+		// this batch is a forward without the limit.
+		limit := more[len(more)-1]
+		withLimit := append([]executor.Op{ops[0], limit}, ops[1:]...)
+		ops, allowSets = append(append([]executor.Op{}, more[:len(more)-1]...), withLimit...), sets
 	}
 	ops = append(ops,
 		executor.Op{Kind: "uci_commit", Args: []string{"firewall"}},

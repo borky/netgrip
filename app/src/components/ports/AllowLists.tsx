@@ -47,8 +47,8 @@ export function AllowedFromChip({ af, onClick, disabled }: {
     >
       <Icon size={13} aria-hidden="true" className="shrink-0" />
       <span className="truncate">{allowedLabel(t, af)}</span>
-      {af?.kind === "list" && af.families === "ipv4" && (
-        <span className="text-faint shrink-0">· IPv4</span>
+      {af?.kind === "list" && af.ipv6_closed && (
+        <span className="text-faint shrink-0">· {t("allow.ipv4Only")}</span>
       )}
     </button>
   );
@@ -403,6 +403,7 @@ function ListRow({ l, busy, onEdit, onDelete }: {
           <Trash2 size={16} />
         </button>
       </div>
+      {l.error && <p className="text-caption text-danger mt-1 ml-6">{t("allow.setError", { error: l.error })}</p>}
       {l.entries.length === 0 ? (
         <p className="text-caption text-warn mt-1 ml-6">{t("allow.emptyNobody")}</p>
       ) : (

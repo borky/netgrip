@@ -353,6 +353,11 @@ func Restore(config, content string) error {
 	if !reUCIConfig.MatchString(config) {
 		return fmt.Errorf("invalid config name: %q", config)
 	}
+	// Drop the changes a failed apply left staged first: `uci import`
+	// overwrites the saved file but leaves /tmp/.uci/<config> alone, and the
+	// commit below would apply those half-made changes on top of the
+	// snapshot (verified on 25.12: a staged option survived the "restore").
+	_ = exec.Command("uci", "revert", config).Run()
 	cmd := exec.Command("uci", "import", config)
 	cmd.Stdin = bytes.NewBufferString(content)
 	if out, err := cmd.CombinedOutput(); err != nil {

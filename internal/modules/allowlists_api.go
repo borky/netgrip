@@ -35,6 +35,9 @@ type AllowListView struct {
 	V4        []string         `json:"v4"`
 	V6        []string         `json:"v6"`
 	UsedBy    []FwdRule        `json:"used_by"`
+	// Error: the running firewall's set could not be refilled (it was
+	// emptied instead: nobody gets in until this clears).
+	Error string `json:"error,omitempty"`
 }
 
 // AllowYou is the device using the panel, as the router sees it.
@@ -101,8 +104,7 @@ func ProbeAllowlists(requester string) *AllowProbe {
 					ev.Addresses = append(ev.Addresses, a.String())
 				}
 				if st != nil {
-					ev.Error = st.Err
-					ev.Stale = st.Err != "" && !st.NotFound && len(ev.Addresses) > 0
+					ev.Error, ev.Stale = allowHostStatus(st, l.KeepHours, now)
 					if !st.CheckedAt.IsZero() {
 						ev.CheckedAt = st.CheckedAt.Unix()
 					}
@@ -118,6 +120,11 @@ func ProbeAllowlists(requester string) *AllowProbe {
 		}
 		if v.V6 == nil {
 			v.V6 = []string{}
+		}
+		for _, fam := range []int{4, 6} {
+			if e := allowSetErr[allowSetName(l.ID, fam)]; e != "" {
+				v.Error = e
+			}
 		}
 		if u := allowUsers(rules, l.ID); u != nil {
 			v.UsedBy = u
@@ -167,14 +174,8 @@ func allowPreview(l AllowList) (v4, v6 []string) {
 			st = &allowHost{}
 			hosts[h] = st
 		}
-		switch {
-		case r.err == nil:
-			st.Addrs, st.OKAt, st.Err, st.NotFound = r.addrs, now, "", false
-		case r.notFound:
-			st.Addrs, st.Err, st.NotFound = nil, "not found", true
-		default:
-			st.Err = "failed"
-		}
+		allowRecordFam(&st.V4, r.v4, now)
+		allowRecordFam(&st.V6, r.v6, now)
 	}
 	return allowElements(l, hosts, now)
 }
@@ -183,6 +184,10 @@ func allowPreview(l AllowList) (v4, v6 []string) {
 // a change that would leave the requester out of a list in use is
 // refused unless forced.
 func AllowSave(req AllowSaveRequest, requester string) (*AllowProbe, error) {
+	// With the firewall writes: a port being limited to this list at the
+	// same time fills its sets from the list as saved, not as it was.
+	fwWriteMu.Lock()
+	defer fwWriteMu.Unlock()
 	if r := allowUnsupportedReason(); r != "" {
 		return ProbeAllowlists(requester), errors.New(r)
 	}
@@ -341,31 +346,43 @@ func allowFindRule(section string, expect *AllowRuleRef) (FwdRule, error) {
 		}
 		return r, nil
 	}
+	// Remote HTTPS or SSH switched off (its rule is kept, as DROP) is not
+	// listed as open, but may still be tied to a list: it can be untied or
+	// moved, or that list could never be deleted.
+	if section == remoteHTTPSIdx || section == remoteSSHIdx {
+		if s, ok := allowSections()[section]; ok && s.Type == "rule" {
+			af := allowedFromOf(section, s, allowSections(), allowListNames())
+			return FwdRule{Section: section, Name: s.Option("name"), SrcDport: s.Option("dest_port"),
+				Proto: s.Option("proto"), Kind: "input", AllowedFrom: &af}, nil
+		}
+	}
 	return FwdRule{}, errors.New("that port is not open to the Internet (any more): reload the page")
 }
 
 // AllowUse ties a rule to a list or makes it reachable from anyone.
-func AllowUse(req AllowUseRequest, requester string) (*AllowProbe, bool, error) {
+// changed is false when nothing had to change (no reload happened).
+func AllowUse(req AllowUseRequest, requester string) (probe *AllowProbe, rolledBack, changed bool, err error) {
 	if r := allowUnsupportedReason(); r != "" {
-		return ProbeAllowlists(requester), false, errors.New(r)
+		return ProbeAllowlists(requester), false, false, errors.New(r)
 	}
 	if allowAnonymous(req.Section) && req.Expect == nil {
-		return ProbeAllowlists(requester), false, errors.New("missing rule details: reload the page")
+		return ProbeAllowlists(requester), false, false, errors.New("missing rule details: reload the page")
 	}
 	fwWriteMu.Lock()
 	defer fwWriteMu.Unlock()
-	rule, err := allowFindRule(req.Section, req.Expect)
+	var rule FwdRule
+	rule, err = allowFindRule(req.Section, req.Expect)
 	if err != nil {
-		return ProbeAllowlists(requester), false, err
+		return ProbeAllowlists(requester), false, false, err
 	}
 	secs := allowSections()
 
 	if req.List == "" {
 		if rule.AllowedFrom == nil || rule.AllowedFrom.Kind == "anyone" {
-			return ProbeAllowlists(requester), false, nil
+			return ProbeAllowlists(requester), false, false, nil
 		}
 		if !req.OpenToAnyone {
-			return ProbeAllowlists(requester), false, &AllowNeedsForce{Reason: fmt.Sprintf(
+			return ProbeAllowlists(requester), false, false, &AllowNeedsForce{Reason: fmt.Sprintf(
 				"%s will be reachable from the whole Internet.", allowRuleLabel(rule))}
 		}
 		rb, err := allowApplyFirewall(allowDetachOps(secs, req.Section), func(after map[string]uciSection) error {
@@ -374,7 +391,7 @@ func AllowUse(req AllowUseRequest, requester string) (*AllowProbe, bool, error) 
 			}
 			return nil
 		})
-		return ProbeAllowlists(requester), rb, err
+		return ProbeAllowlists(requester), rb, err == nil, err
 	}
 
 	allowMu.Lock()
@@ -386,30 +403,32 @@ func AllowUse(req AllowUseRequest, requester string) (*AllowProbe, bool, error) 
 	}
 	allowMu.Unlock()
 	if lp == nil {
-		return ProbeAllowlists(requester), false, fmt.Errorf("list %s not found", req.List)
+		return ProbeAllowlists(requester), false, false, fmt.Errorf("list %s not found", req.List)
 	}
-	if rule.AllowedFrom != nil && rule.AllowedFrom.Kind == "list" && rule.AllowedFrom.List == l.ID &&
-		(rule.AllowedFrom.Families == "both" || rule.Kind == "forward") {
-		return ProbeAllowlists(requester), false, nil
+	// Already so: nothing to change (no reload, no revert window). A port
+	// that answers both families is "so" only with its IPv6 twin in place.
+	if rule.AllowedFrom != nil && rule.AllowedFrom.Kind == "list" && rule.AllowedFrom.List == l.ID && !rule.AllowedFrom.IPv6Closed {
+		return ProbeAllowlists(requester), false, false, nil
 	}
 	allowMu.Lock()
 	v4, v6 := allowWriteListFilesLocked(l)
 	allowMu.Unlock()
 	if !req.Force && !AllowRequesterLocal(requester) && !allowCovers(v4, requester) && !allowCovers(v6, requester) {
-		return ProbeAllowlists(requester), false, &AllowNeedsForce{Reason: fmt.Sprintf(
+		return ProbeAllowlists(requester), false, false, &AllowNeedsForce{Reason: fmt.Sprintf(
 			"You are connected from %s, which %q does not include. If you reach the router through %s, you will lose access.",
 			requester, l.Name, allowRuleLabel(rule))}
 	}
 	setOps, err := allowEnsureSetOps(secs, l.ID)
 	if err != nil {
-		return ProbeAllowlists(requester), false, err
+		return ProbeAllowlists(requester), false, false, err
 	}
-	attach, sets, err := allowAttachOps(secs, req.Section, l.ID)
+	attach, checks, err := allowAttachOps(secs, req.Section, l.ID, 0)
 	if err != nil {
-		return ProbeAllowlists(requester), false, fmt.Errorf("%s: %w", allowRuleLabel(rule), err)
+		return ProbeAllowlists(requester), false, false, fmt.Errorf("%s: %w", allowRuleLabel(rule), err)
 	}
-	rb, err := allowApplyFirewall(append(setOps, attach...), func(map[string]uciSection) error {
-		return allowVerifyRunning(sets)
+	var rb bool
+	rb, err = allowApplyFirewall(append(setOps, attach...), func(map[string]uciSection) error {
+		return allowVerifyRunning(checks)
 	})
 	if err == nil {
 		allowMu.Lock()
@@ -417,7 +436,7 @@ func AllowUse(req AllowUseRequest, requester string) (*AllowProbe, bool, error) 
 		allowMu.Unlock()
 		log.Printf("allowlists: %s now limited to the list %q", allowRuleLabel(rule), l.Name)
 	}
-	return ProbeAllowlists(requester), rb, err
+	return ProbeAllowlists(requester), rb, err == nil, err
 }
 
 func allowRuleLabel(r FwdRule) string {
@@ -449,16 +468,38 @@ func allowSyncCompanionsTick() {
 	}
 	ops := allowCompanionSyncOps(parseUCIShow(show, "firewall"))
 	if len(ops) == 0 {
+		allowSyncLast, allowSyncNote = "", ""
 		return
 	}
-	if out, err := uciExec("changes", "firewall"); err != nil || strings.TrimSpace(string(out)) != "" {
+	// The same repair again, right after it was made (or failed): it does
+	// not settle. Not again every two minutes (a firewall reload and a
+	// flash write each time); logged once, retried when anything changes.
+	sig := fmt.Sprint(ops)
+	if sig == allowSyncLast {
+		allowSyncNoteOnce("the IPv6 twin rules do not settle; leaving them until the rules change")
 		return
 	}
+	if allowFirewallPending() {
+		allowSyncNoteOnce("IPv6 twin rules not checked: the firewall has changes staged elsewhere and not applied")
+		return
+	}
+	allowSyncLast = sig
 	if _, err := allowApplyFirewall(ops, nil); err != nil {
 		log.Printf("allowlists: bring the IPv6 twin rules in step: %v", err)
 		return
 	}
+	allowSyncNote = ""
 	log.Printf("allowlists: IPv6 twin rules brought in step with their rules (%d changes)", len(ops))
+}
+
+// The tick's repair state (only the tick goroutine touches it).
+var allowSyncLast, allowSyncNote string
+
+func allowSyncNoteOnce(msg string) {
+	if allowSyncNote != msg {
+		allowSyncNote = msg
+		log.Printf("allowlists: %s", msg)
+	}
 }
 
 // allowCompanionSyncNowLocked brings the twins in step inside another
@@ -500,7 +541,7 @@ func AllowTakeoverInfo(set string) (*AllowExternal, error) {
 		}
 		seen[h] = true
 		match := false
-		for _, a := range res[h].addrs {
+		for _, a := range append(res[h].v4.addrs, res[h].v6.addrs...) {
 			for _, e := range ext.Elements {
 				if allowCovers([]string{e}, a.String()) {
 					match, covered[e] = true, true
@@ -621,15 +662,16 @@ func AllowTakeover(req AllowTakeoverRequest, requester string) (*AllowProbe, boo
 		undoList()
 		return ProbeAllowlists(requester), false, err
 	}
-	var sets []string
+	var checks []allowCheck
 	for _, r := range ext.UsedBy {
-		o, s, err := allowAttachOps(secs, r.Section, l.ID)
+		// Each port keeps the family the old set gave it.
+		o, c, err := allowAttachOps(secs, r.Section, l.ID, ext.Family)
 		if err != nil {
 			undoList()
 			return ProbeAllowlists(requester), false, fmt.Errorf("%s: %w", allowRuleLabel(r), err)
 		}
 		ops = append(ops, o...)
-		sets = append(sets, s...)
+		checks = append(checks, c...)
 	}
 	var old []string
 	for name, s := range secs {
@@ -644,7 +686,7 @@ func AllowTakeover(req AllowTakeoverRequest, requester string) (*AllowProbe, boo
 		if refs := allowReferences(after, req.Set); len(refs) > 0 {
 			return fmt.Errorf("%s is still used by %s", req.Set, strings.Join(refs, ", "))
 		}
-		return allowVerifyRunning(sets)
+		return allowVerifyRunning(checks)
 	})
 	if err != nil {
 		undoList()
@@ -689,7 +731,7 @@ func allowDeleteOrder(names []string) []string {
 // allowAddForwardOps limits a forward being created to a list: the set
 // sections and the forward's ipset, plus the set files written so the
 // reload fills them.
-func allowAddForwardOps(section, id string) ([]executor.Op, []string, error) {
+func allowAddForwardOps(section, id string) ([]executor.Op, []allowCheck, error) {
 	allowMu.Lock()
 	allowLoadLocked()
 	_, lp := allowFindLocked(id)
@@ -705,7 +747,7 @@ func allowAddForwardOps(section, id string) ([]executor.Op, []string, error) {
 		return nil, nil, err
 	}
 	set := allowSetName(id, 4)
-	return append(ops, setOp("firewall."+section+".ipset", set)), []string{set}, nil
+	return append(ops, setOp("firewall."+section+".ipset", set)), []allowCheck{{Set: set}}, nil
 }
 
 // allowForwardAdded records that the reload filled a list's sets.

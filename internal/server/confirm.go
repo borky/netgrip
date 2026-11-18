@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gnacho/netgrip/internal/executor"
+	"github.com/gnacho/netgrip/internal/modules"
 )
 
 // confirmTimeout is how long a connectivity-risky apply stays pending before
@@ -125,6 +126,13 @@ func (s *Server) runRevert(e *confirmEntry, why string) error {
 	s.confirmMu.Lock()
 	s.lastRevert = &revertResult{at: time.Now(), running: true}
 	s.confirmMu.Unlock()
+	// Not in the middle of an allow list or port change (their own rollback
+	// would undo this revert); bounded, like riskyMu.
+	if unlock, ok := modules.LockFirewallWritesWithin(defaultRiskyWait); ok {
+		defer unlock()
+	} else {
+		log.Printf("[confirm] a firewall change has held its lock for %s; reverting without it", defaultRiskyWait)
+	}
 	err := revertFn(e.snapshots)
 	if err != nil {
 		log.Printf("[confirm] revert after %s FAILED: %v", why, err)

@@ -239,6 +239,8 @@ export interface AllowedFrom {
   negated?: boolean;
   /** Families the limit lets in ("list"): ipv4, ipv6 or both. */
   families?: "ipv4" | "ipv6" | "both";
+  /** The port answers both families, but only IPv4 is let in. */
+  ipv6_closed?: boolean;
 }
 
 export interface AllowEntry {
@@ -263,6 +265,8 @@ export interface AllowListView {
   v4: string[];
   v6: string[];
   used_by: FwdRule[];
+  /** The running set could not be refilled (it was emptied instead). */
+  error?: string;
 }
 
 export interface AllowExternal {

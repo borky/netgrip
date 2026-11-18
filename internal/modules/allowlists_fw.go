@@ -32,6 +32,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gnacho/netgrip/internal/executor"
 	"github.com/gnacho/netgrip/internal/ubus"
@@ -78,9 +79,11 @@ type AllowedFrom struct {
 	Set      string `json:"set,omitempty"`
 	Negated  bool   `json:"negated,omitempty"` // "other": everyone BUT the set
 	// Families: which address families the limit lets in: "ipv4", "ipv6"
-	// or "both" (for "list"). A port that answered both and lost IPv6
-	// reads "ipv4".
+	// or "both" (for "list").
 	Families string `json:"families,omitempty"`
+	// IPv6Closed: the port answers both families but only IPv4 is let in
+	// (its IPv6 twin is missing).
+	IPv6Closed bool `json:"ipv6_closed,omitempty"`
 }
 
 // AllowRuleRef identifies a rule as the page saw it: an anonymous rule's
@@ -104,14 +107,26 @@ func allowSections() map[string]uciSection {
 
 func allowAnonymous(section string) bool { return reAnonSection.MatchString(section) }
 
+// ipsetRef reads a rule's "ipset" option as fw4 does: "[!] name [dirs]",
+// the "!" with or without a space after it.
+func ipsetRef(v string) (name string, negated bool) {
+	v = strings.TrimSpace(v)
+	negated = strings.HasPrefix(v, "!")
+	f := strings.Fields(strings.TrimPrefix(v, "!"))
+	if len(f) == 0 {
+		return "", negated
+	}
+	return f[0], negated
+}
+
 // allowSetOf reads a rule's set: the list id and family when it is one of
 // NetGrip's lists and not negated.
 func allowSetOf(s uciSection) (id string, family int, ok bool) {
-	f := strings.Fields(s.Option("ipset"))
-	if len(f) == 0 || strings.HasPrefix(f[0], "!") {
+	name, neg := ipsetRef(s.Option("ipset"))
+	if name == "" || neg {
 		return "", 0, false
 	}
-	m := reAllowSet.FindStringSubmatch(f[0])
+	m := reAllowSet.FindStringSubmatch(name)
 	if m == nil {
 		return "", 0, false
 	}
@@ -185,19 +200,21 @@ func allowSectionFamily(s uciSection) (int, error) {
 
 // allowedFromOf describes who may reach a rule now.
 func allowedFromOf(name string, s uciSection, secs map[string]uciSection, names map[string]string) AllowedFrom {
-	f := strings.Fields(s.Option("ipset"))
-	if len(f) == 0 {
+	set, neg := ipsetRef(s.Option("ipset"))
+	if set == "" && !neg {
 		return AllowedFrom{Kind: "anyone"}
 	}
-	set := strings.TrimPrefix(f[0], "!")
 	id, fam, ok := allowSetOf(s)
 	if !ok {
-		return AllowedFrom{Kind: "other", Set: set, Negated: strings.HasPrefix(f[0], "!")}
+		return AllowedFrom{Kind: "other", Set: set, Negated: neg}
 	}
 	a := AllowedFrom{Kind: "list", List: id, ListName: names[id], Set: set, Families: fmt.Sprintf("ipv%d", fam)}
 	if fam == 4 && s.Type == "rule" {
 		if c, ok := secs[name+allowCompanionSuffix]; ok && allowIsCompanion(name+allowCompanionSuffix, c) {
 			a.Families = "both"
+		} else if f, err := allowSectionFamily(s); err == nil && f == 0 {
+			// Answers both families, but IPv6 has no twin (yet): closed.
+			a.IPv6Closed = true
 		}
 	}
 	return a
@@ -221,7 +238,26 @@ func allowSetWant(id string, fam int) map[string][]string {
 	}
 }
 
+// cleanOpts drops the empty values (and options left with none): `uci show`
+// prints an empty list as "key=", which is no value at all.
+func cleanOpts(m map[string][]string) map[string][]string {
+	out := map[string][]string{}
+	for k, v := range m {
+		var vals []string
+		for _, x := range v {
+			if x != "" {
+				vals = append(vals, x)
+			}
+		}
+		if len(vals) > 0 {
+			out[k] = vals
+		}
+	}
+	return out
+}
+
 func optionsEqual(a, b map[string][]string) bool {
+	a, b = cleanOpts(a), cleanOpts(b)
 	if len(a) != len(b) {
 		return false
 	}
@@ -283,30 +319,48 @@ func allowEnsureSetOps(secs map[string]uciSection, id string) ([]executor.Op, er
 	return ops, nil
 }
 
-// allowCompanionWant is how the IPv6 twin of rule o must read.
-func allowCompanionWant(o uciSection, id string) map[string][]string {
+// allowCompanionWant is how the IPv6 twin of rule o must read. ok is false
+// when an option holds something NetGrip cannot write (a ";", a line break,
+// a backtick): no twin then, so IPv6 stays closed for that port.
+func allowCompanionWant(o uciSection, id string) (map[string][]string, bool) {
 	want := map[string][]string{}
-	for k, v := range o.Options {
+	for k, v := range cleanOpts(o.Options) {
 		switch k {
 		case "name", "ipset", "family":
 			continue
 		}
+		for _, x := range v {
+			if strings.ContainsAny(x, ";\n\r`") {
+				return nil, false
+			}
+		}
 		want[k] = append([]string(nil), v...)
 	}
-	name := o.Option("name")
-	if name == "" {
+	name := strings.Map(func(r rune) rune {
+		if strings.ContainsRune(";\n\r`", r) {
+			return -1
+		}
+		return r
+	}, o.Option("name"))
+	if strings.TrimSpace(name) == "" {
 		name = "rule"
 	}
 	want["name"] = []string{name + " (IPv6, netgrip allowlists)"}
 	want["family"] = []string{"ipv6"}
 	want["ipset"] = []string{allowSetName(id, 6)}
-	return want
+	return want, true
 }
 
 // allowCompanionOps makes twin c of rule o read as it must (nothing when
 // it already does).
 func allowCompanionOps(c string, o uciSection, id string, existing *uciSection) []executor.Op {
-	want := allowCompanionWant(o, id)
+	want, ok := allowCompanionWant(o, id)
+	if !ok {
+		if existing != nil {
+			return []executor.Op{{Kind: "uci_delete", Args: []string{"firewall." + c}}}
+		}
+		return nil
+	}
 	if existing != nil && existing.Type == "rule" && optionsEqual(existing.Options, want) {
 		return nil
 	}
@@ -367,8 +421,53 @@ func allowCompanionSyncOps(secs map[string]uciSection) []executor.Op {
 	return ops
 }
 
+// allowTwinInStep: twin c is NetGrip's IPv6 twin of a rule that still
+// needs it, and reads exactly as it must.
+func allowTwinInStep(c string, secs map[string]uciSection) bool {
+	t, ok := secs[c]
+	if !ok || !allowIsCompanion(c, t) {
+		return false
+	}
+	orig := strings.TrimSuffix(c, allowCompanionSuffix)
+	o, ok := secs[orig]
+	if !ok || o.Type != "rule" || allowAnonymous(orig) {
+		return false
+	}
+	id, fam, ok := allowSetOf(o)
+	if !ok || fam != 4 {
+		return false
+	}
+	if f, err := allowSectionFamily(o); err != nil || f != 0 {
+		return false
+	}
+	return allowCompanionOps(c, o, id, &t) == nil
+}
+
+// allowCheck is one thing the running firewall must show after a change:
+// a rule (by its name, when it has one) using a set.
+type allowCheck struct {
+	Set  string
+	Name string
+}
+
+func allowCheckSets(checks []allowCheck) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, c := range checks {
+		if !seen[c.Set] {
+			seen[c.Set] = true
+			out = append(out, c.Set)
+		}
+	}
+	return out
+}
+
 // allowAttachOps ties rule section (as parsed in secs) to list id.
-func allowAttachOps(secs map[string]uciSection, section, id string) (ops []executor.Op, sets []string, err error) {
+//
+// keepFam (4 or 6, 0 for none) keeps the family a rule had: a rule that
+// answered both families but was limited to an IPv4 set elsewhere only let
+// IPv4 in, and a takeover must not open IPv6 to it on the way.
+func allowAttachOps(secs map[string]uciSection, section, id string, keepFam int) (ops []executor.Op, checks []allowCheck, err error) {
 	s, ok := secs[section]
 	if !ok {
 		return nil, nil, fmt.Errorf("rule %s not found", section)
@@ -377,14 +476,29 @@ func allowAttachOps(secs map[string]uciSection, section, id string) (ops []execu
 	if err != nil {
 		return nil, nil, err
 	}
+	if keepFam != 0 && fam != 0 && fam != keepFam {
+		return nil, nil, fmt.Errorf("the rule is IPv%d but its set holds IPv%d addresses", fam, keepFam)
+	}
+	twin := section + allowCompanionSuffix
+	dropTwin := func() {
+		if c, ok := secs[twin]; ok && allowIsCompanion(twin, c) {
+			ops = append(ops, executor.Op{Kind: "uci_delete", Args: []string{"firewall." + twin}})
+		}
+	}
+	if keepFam != 0 && fam == 0 && s.Type == "rule" {
+		set := allowSetName(id, keepFam)
+		ops = append(ops,
+			setOp("firewall."+section+".family", fmt.Sprintf("ipv%d", keepFam)),
+			setOp("firewall."+section+".ipset", set))
+		dropTwin()
+		return ops, []allowCheck{{Set: set, Name: s.Option("name")}}, nil
+	}
 	if fam != 0 || s.Type != "rule" {
 		set := allowSetName(id, fam)
 		ops = append(ops, setOp("firewall."+section+".ipset", set))
 		// It might have had a twin from when it answered both families.
-		if c, ok := secs[section+allowCompanionSuffix]; ok && allowIsCompanion(section+allowCompanionSuffix, c) {
-			ops = append(ops, executor.Op{Kind: "uci_delete", Args: []string{"firewall." + section + allowCompanionSuffix}})
-		}
-		return ops, []string{set}, nil
+		dropTwin()
+		return ops, []allowCheck{{Set: set, Name: s.Option("name")}}, nil
 	}
 	target := section
 	if allowAnonymous(section) {
@@ -406,8 +520,13 @@ func allowAttachOps(secs map[string]uciSection, section, id string) (ops []execu
 	if cs, ok := secs[c]; ok {
 		ex = &cs
 	}
-	ops = append(ops, allowCompanionOps(c, o, id, ex)...)
-	return ops, []string{v4, allowSetName(id, 6)}, nil
+	cops := allowCompanionOps(c, o, id, ex)
+	ops = append(ops, cops...)
+	checks = []allowCheck{{Set: v4, Name: s.Option("name")}}
+	if want, ok := allowCompanionWant(o, id); ok {
+		checks = append(checks, allowCheck{Set: allowSetName(id, 6), Name: want["name"][0]})
+	}
+	return ops, checks, nil
 }
 
 // allowDetachOps unties a rule from whatever set limits it.
@@ -442,7 +561,13 @@ func fwdRuleOf(section string, s uciSection, wanZones, stock map[string]bool, se
 			Kind: "forward", Managed: reFwdSection.MatchString(section), AllowedFrom: &af,
 		}, true
 	case "rule":
-		if s.Option("target") != "ACCEPT" || s.Option("dest") != "" || allowIsCompanion(section, s) {
+		if s.Option("target") != "ACCEPT" || s.Option("dest") != "" {
+			return FwdRule{}, false
+		}
+		// A twin in step with its rule is part of that rule. One that is
+		// not (its rule went, or changed and the twin is not repaired yet)
+		// is listed on its own: it is what the firewall does.
+		if allowTwinInStep(section, secs) {
 			return FwdRule{}, false
 		}
 		port := join("dest_port")
@@ -493,7 +618,7 @@ func allowReferences(secs map[string]uciSection, sets ...string) []string {
 		if s.Type == "ipset" {
 			continue
 		}
-		if f := strings.Fields(s.Option("ipset")); len(f) > 0 && want[strings.TrimPrefix(f[0], "!")] {
+		if set, _ := ipsetRef(s.Option("ipset")); want[set] {
 			out = append(out, name)
 		}
 	}
@@ -512,6 +637,9 @@ func (e *AllowNeedsForce) Error() string { return e.Reason }
 // allowApplyFirewall runs ops, commits, reloads the firewall and checks the
 // result; anything wrong puts the config back as it was.
 func allowApplyFirewall(ops []executor.Op, verify func(map[string]uciSection) error) (rolledBack bool, err error) {
+	if allowFirewallPending() {
+		return false, errAllowPending
+	}
 	snap, err := allowSnapshotFn("firewall")
 	if err != nil {
 		return false, fmt.Errorf("snapshot firewall: %w", err)
@@ -540,19 +668,44 @@ func allowApplyFirewall(ops []executor.Op, verify func(map[string]uciSection) er
 	return false, nil
 }
 
-// allowVerifyRunning checks that the running firewall has the sets, each
-// used by a rule.
-func allowVerifyRunning(sets []string) error {
+// errAllowPending: changes someone else staged would be committed (or
+// "restored") along with ours.
+var errAllowPending = errors.New("the firewall has changes staged elsewhere and not applied (LuCI, a script): apply or discard them first")
+
+// allowFirewallPending: uncommitted firewall changes are staged.
+func allowFirewallPending() bool {
+	out, err := uciExec("changes", "firewall")
+	return err != nil || strings.TrimSpace(string(out)) != ""
+}
+
+// allowVerifyRunning checks that the running firewall has the sets, and
+// the very rules (by name: fw4 puts it in the rule's comment) using them.
+func allowVerifyRunning(checks []allowCheck) error {
 	ruleset, err := allowRulesetFn()
 	if err != nil {
 		return fmt.Errorf("could not read the running firewall: %w", err)
 	}
-	for _, set := range sets {
+	lines := strings.Split(ruleset, "\n")
+	for _, set := range allowCheckSets(checks) {
 		if _, err := allowNftListFn(set); err != nil {
 			return fmt.Errorf("the firewall did not create the set %s", set)
 		}
-		if !strings.Contains(ruleset, "@"+set+" ") {
-			return fmt.Errorf("the firewall left out the rule using %s", set)
+	}
+	for _, c := range checks {
+		named := c.Name != "" && !strings.ContainsAny(c.Name, "\"\\")
+		found := false
+		for _, l := range lines {
+			if strings.Contains(l, "@"+c.Set+" ") && (!named || strings.Contains(l, `comment "!fw4: `+c.Name+`"`)) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			what := "the rule using " + c.Set
+			if named {
+				what = fmt.Sprintf("%q", c.Name)
+			}
+			return fmt.Errorf("the firewall left out %s", what)
 		}
 	}
 	return nil
@@ -588,8 +741,11 @@ func AllowRequesterLocal(ip string) bool {
 		return false
 	}
 	a = a.Unmap().WithZone("")
-	if a.IsLoopback() {
-		return true
+	// Not loopback: that is how an SSH tunnel (ssh -L) arrives, from
+	// anywhere. Nor a host that a port open to the Internet forwards to: a
+	// reverse proxy there passes on requests from the whole Internet.
+	if a.IsLoopback() || allowForwardTargets()[a] {
+		return false
 	}
 	if a.Is6() {
 		return a.IsLinkLocalUnicast() || netip.MustParsePrefix("fc00::/7").Contains(a)
@@ -610,20 +766,63 @@ func AllowRequesterLocal(ip string) bool {
 	return false
 }
 
-// allowInternetNetworks: the interfaces of the zones that face the Internet.
+// allowInternetNetworks: the interfaces of the zones that face the Internet
+// (the zones holding the uplink, as internetZones finds them, read from one
+// `uci show` instead of a `uci get` per zone).
 func allowInternetNetworks() map[string]bool {
-	out := map[string]bool{ubus.ActiveWANInterfaceName(): true}
-	zones := internetZones()
+	wan := ubus.ActiveWANInterfaceName()
+	out := map[string]bool{wan: true}
 	show, ok := uciShowCached("firewall")
 	if !ok {
 		return out
 	}
+	type zone struct {
+		name string
+		nets []string
+	}
+	var all []zone
 	for _, s := range parseUCIShow(show, "firewall") {
-		if s.Type == "zone" && zones[s.Option("name")] {
-			for _, v := range s.Options["network"] {
-				for _, n := range strings.Fields(v) {
-					out[n] = true
-				}
+		if s.Type != "zone" {
+			continue
+		}
+		z := zone{name: s.Option("name")}
+		for _, v := range s.Options["network"] {
+			z.nets = append(z.nets, strings.Fields(v)...)
+		}
+		all = append(all, z)
+	}
+	var faces []zone
+	for _, z := range all {
+		for _, n := range z.nets {
+			if n == wan {
+				faces = append(faces, z)
+				break
+			}
+		}
+	}
+	if len(faces) == 0 { // as internetZones: the conventional name
+		for _, z := range all {
+			if z.name == "wan" {
+				faces = append(faces, z)
+			}
+		}
+	}
+	for _, z := range faces {
+		for _, n := range z.nets {
+			out[n] = true
+		}
+	}
+	return out
+}
+
+// allowForwardTargets: the LAN hosts that ports open to the Internet are
+// forwarded to.
+func allowForwardTargets() map[netip.Addr]bool {
+	out := map[netip.Addr]bool{}
+	for _, r := range ProbeFwd().Rules {
+		if r.Kind == "forward" {
+			if a, err := netip.ParseAddr(r.DestIP); err == nil {
+				out[a.Unmap()] = true
 			}
 		}
 	}
@@ -715,11 +914,56 @@ func parseNftElements(text string) []string {
 		if f == "" {
 			continue
 		}
+		if a, b, ok := strings.Cut(f, "-"); ok {
+			// An auto-merged interval set prints a range that is not a
+			// prefix as "first-last": cover it with prefixes.
+			out = append(out, rangePrefixes(a, b)...)
+			continue
+		}
 		if _, err := parseAddrOrPrefix(f); err == nil {
 			out = append(out, f)
 		}
 	}
 	return out
+}
+
+// rangePrefixes covers first..last exactly with prefixes.
+func rangePrefixes(first, last string) []string {
+	a, err1 := netip.ParseAddr(strings.TrimSpace(first))
+	b, err2 := netip.ParseAddr(strings.TrimSpace(last))
+	if err1 != nil || err2 != nil || a.Is4() != b.Is4() || b.Less(a) {
+		return nil
+	}
+	var out []string
+	for i := 0; i < 256 && !b.Less(a); i++ {
+		bits := a.BitLen()
+		// The widest prefix starting at a that ends at or before b.
+		for bits > 0 {
+			p := netip.PrefixFrom(a, bits-1).Masked()
+			if p.Addr() != a || prefixLast(p).Compare(b) > 0 {
+				break
+			}
+			bits--
+		}
+		p := netip.PrefixFrom(a, bits)
+		out = append(out, allowElemString(p))
+		next := prefixLast(p).Next()
+		if !next.IsValid() || next.Less(a) {
+			break
+		}
+		a = next
+	}
+	return out
+}
+
+// prefixLast is the last address of p.
+func prefixLast(p netip.Prefix) netip.Addr {
+	b := p.Masked().Addr().AsSlice()
+	for i := p.Bits(); i < len(b)*8; i++ {
+		b[i/8] |= 1 << (7 - uint(i%8))
+	}
+	a, _ := netip.AddrFromSlice(b)
+	return a
 }
 
 // allowCronWriters finds the scheduled jobs that fill set: a crontab line
@@ -833,11 +1077,14 @@ func allowHostCandidates(text string) []string {
 // readable, and restarts cron when a file changed.
 func allowDisableCronLines(lines []allowCronLine, listName string) error {
 	byFile := map[string]map[int]bool{}
+	texts := map[string]map[int]string{}
 	for _, l := range lines {
 		if byFile[l.File] == nil {
 			byFile[l.File] = map[int]bool{}
+			texts[l.File] = map[int]string{}
 		}
 		byFile[l.File][l.Line] = true
+		texts[l.File][l.Line] = l.Text
 	}
 	changed := false
 	for file, nums := range byFile {
@@ -848,12 +1095,15 @@ func allowDisableCronLines(lines []allowCronLine, listName string) error {
 		st, _ := os.Stat(file)
 		rows := strings.Split(string(b), "\n")
 		for i := range rows {
-			if nums[i+1] && !strings.HasPrefix(strings.TrimSpace(rows[i]), "#") {
+			// Only the very line found (the file may have changed since).
+			if nums[i+1] && texts[file][i+1] == rows[i] && !strings.HasPrefix(strings.TrimSpace(rows[i]), "#") {
 				rows[i] = fmt.Sprintf("# netgrip allowlists: replaced by the list %q: %s", listName, rows[i])
 				changed = true
 			}
 		}
-		if err := writeFileAtomic(file, []byte(strings.Join(rows, "\n"))); err != nil {
+		// The temporary file is made next to the crontab directory, not in
+		// it: crond reads every file there as a user's table.
+		if err := writeFileAtomicVia(filepath.Dir(filepath.Dir(file)), file, []byte(strings.Join(rows, "\n"))); err != nil {
 			return err
 		}
 		if st != nil {
@@ -866,4 +1116,40 @@ func allowDisableCronLines(lines []allowCronLine, listName string) error {
 		}
 	}
 	return nil
+}
+
+// writeFileAtomicVia writes path through a temporary file made in dir (on
+// the same filesystem), then renamed over it.
+func writeFileAtomicVia(dir, path string, data []byte) error {
+	tmp, err := os.CreateTemp(dir, ".netgrip-*.tmp")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), path)
+}
+
+// LockFirewallWritesWithin holds off the firewall writes allow lists take
+// part in (and their background check) until the returned func is called:
+// the panel's revert timer takes it, so a revert never interleaves with
+// them (one of them rolling back would undo the revert). ok is false when
+// it could not be had within d: the revert is a safety net and goes ahead.
+func LockFirewallWritesWithin(d time.Duration) (unlock func(), ok bool) {
+	deadline := time.Now().Add(d)
+	for {
+		if fwWriteMu.TryLock() {
+			return fwWriteMu.Unlock, true
+		}
+		if time.Now().After(deadline) {
+			return func() {}, false
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }

@@ -77,8 +77,12 @@ var allowKeepChoices = map[int]bool{0: true, 1: true, 6: true, 24: true}
 var (
 	allowStorePath = "/etc/netgrip/allowlists.json"
 	allowRunDir    = "/var/run/netgrip-allowlists"
-	allowLookupFn  = func(ctx context.Context, host string) ([]netip.Addr, error) {
-		return net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+	// network is "ip4" or "ip6": each family is looked up on its own, so a
+	// timeout in one does not drop the other's addresses. The name is
+	// queried as absolute (a trailing dot): the resolver's search domain
+	// ("lan") is never tried.
+	allowLookupFn = func(ctx context.Context, network, host string) ([]netip.Addr, error) {
+		return net.DefaultResolver.LookupNetIP(ctx, network, host)
 	}
 	allowNftFn = func(script string) error {
 		cmd := exec.Command("nft", "-f", "-")
@@ -117,13 +121,22 @@ type allowStore struct {
 	Lists []AllowList `json:"lists"`
 }
 
+// allowFam is what one name resolves to in one family.
+type allowFam struct {
+	Addrs []netip.Addr `json:"addrs,omitempty"` // last good answer
+	OKAt  time.Time    `json:"ok_at,omitzero"`
+	Err   string       `json:"err,omitempty"`
+	// NotFound: the family has no address for the name (it does not exist,
+	// has no record of this family, or points only at an address a list
+	// cannot hold, the way a parked dynamic DNS name points at 0.0.0.0).
+	NotFound bool `json:"not_found,omitempty"`
+}
+
 // allowHost is what NetGrip knows about one name.
 type allowHost struct {
-	Addrs     []netip.Addr `json:"addrs,omitempty"` // last good answer
-	OKAt      time.Time    `json:"ok_at,omitzero"`
-	Err       string       `json:"err,omitempty"`
-	NotFound  bool         `json:"not_found,omitempty"`
-	CheckedAt time.Time    `json:"checked_at,omitzero"`
+	V4        allowFam  `json:"v4"`
+	V6        allowFam  `json:"v6"`
+	CheckedAt time.Time `json:"checked_at,omitzero"`
 }
 
 var (
@@ -132,6 +145,7 @@ var (
 	allowData    allowStore
 	allowHosts   = map[string]*allowHost{}
 	allowApplied = map[string]string{} // set -> content last put into nft
+	allowSetErr  = map[string]string{} // set -> why the running set could not be refilled
 )
 
 // ---- entries ----
@@ -356,20 +370,48 @@ func allowElemString(p netip.Prefix) string {
 	return p.String()
 }
 
-// allowHostAddrs is what a name contributes to a list now: its last answer,
-// or, while it cannot be looked up, the last good one for as long as the
-// list keeps it. A name that does not exist contributes nothing.
+// allowHostAddrs is what a name contributes to a list now, per family: its
+// last answer, or, while that family cannot be looked up, the last good one
+// for as long as the list keeps it. A family the name has no address in
+// contributes nothing.
 func allowHostAddrs(h *allowHost, keepHours int, now time.Time) []netip.Addr {
-	if h == nil || h.NotFound || len(h.Addrs) == 0 {
+	if h == nil {
 		return nil
 	}
-	if h.Err == "" {
-		return h.Addrs
+	return append(allowFamAddrs(h.V4, keepHours, now), allowFamAddrs(h.V6, keepHours, now)...)
+}
+
+func allowFamAddrs(f allowFam, keepHours int, now time.Time) []netip.Addr {
+	if f.NotFound || len(f.Addrs) == 0 {
+		return nil
 	}
-	if keepHours > 0 && now.Sub(h.OKAt) <= time.Duration(keepHours)*time.Hour {
-		return h.Addrs
+	if f.Err == "" {
+		return f.Addrs
+	}
+	if keepHours > 0 && now.Sub(f.OKAt) <= time.Duration(keepHours)*time.Hour {
+		return f.Addrs
 	}
 	return nil
+}
+
+// allowHostStatus sums a name up for the page: an error to show, and
+// whether addresses are kept from an earlier answer.
+func allowHostStatus(h *allowHost, keepHours int, now time.Time) (errText string, stale bool) {
+	if h == nil {
+		return "", false
+	}
+	if h.V4.NotFound && h.V6.NotFound {
+		return "the name does not exist or has no usable address", false
+	}
+	for _, f := range []allowFam{h.V4, h.V6} {
+		if f.Err != "" {
+			errText = f.Err
+			if len(allowFamAddrs(f, keepHours, now)) > 0 {
+				stale = true
+			}
+		}
+	}
+	return errText, stale
 }
 
 // allowElements is what each of a list's two sets should hold.
@@ -441,9 +483,14 @@ func allowSetScript(set string, elems []string) string {
 	return s
 }
 
-// allowSetContent is what the loadfile holds (and the comparison key).
+// allowSetContent is what the loadfile holds (and the comparison key): one
+// element per line, nothing else (no comment line: not every fw4 skips
+// them).
 func allowSetContent(elems []string) string {
-	return "# netgrip allowlists: written by NetGrip, do not edit\n" + strings.Join(elems, "\n") + "\n"
+	if len(elems) == 0 {
+		return ""
+	}
+	return strings.Join(elems, "\n") + "\n"
 }
 
 // allowWriteLoadfile writes a set's file if it changed. tmpfs: no flash.
@@ -474,14 +521,19 @@ func allowPushSet(set string, elems []string, inConfig, force bool) {
 		return
 	}
 	if err := allowNftFn(allowSetScript(set, elems)); err != nil {
-		// The set is in the config but not (yet) in the running firewall:
-		// it is filled from the file by the next reload. Logged once.
-		if _, had := allowApplied[set]; had || force {
+		// Not refilled: the running set may still hold an address that was
+		// just removed. Empty it instead (closed, not open); the next tick
+		// tries again. A set the running firewall does not have yet makes
+		// this fail too, harmlessly: the next reload fills it from the file.
+		_ = allowNftFn(allowSetScript(set, nil))
+		if allowSetErr[set] == "" {
 			log.Printf("allowlists: refill %s: %v", set, err)
 		}
+		allowSetErr[set] = allowCleanText(err.Error(), 120)
 		delete(allowApplied, set)
 		return
 	}
+	delete(allowSetErr, set)
 	allowApplied[set] = content
 }
 
@@ -572,7 +624,8 @@ func allowHostsOf(lists []AllowList) []string {
 	return out
 }
 
-// allowLookup resolves names in parallel (bounded), without any lock held.
+// allowLookup resolves names in parallel (bounded), each family on its
+// own, without any lock held.
 func allowLookup(hosts []string) map[string]allowLookupResult {
 	out := make(map[string]allowLookupResult, len(hosts))
 	var mu sync.Mutex
@@ -584,19 +637,7 @@ func allowLookup(hosts []string) map[string]allowLookupResult {
 		go func(h string) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			ctx, cancel := context.WithTimeout(context.Background(), allowLookupTimeout)
-			addrs, err := allowLookupFn(ctx, h)
-			cancel()
-			r := allowLookupResult{err: err}
-			if err == nil {
-				r.addrs = allowUsableAddrs(addrs)
-				if len(r.addrs) == 0 {
-					r.err = errors.New("no usable address")
-				}
-			} else {
-				var dnsErr *net.DNSError
-				r.notFound = errors.As(err, &dnsErr) && dnsErr.IsNotFound
-			}
+			r := allowLookupResult{v4: allowLookupFam(h, "ip4"), v6: allowLookupFam(h, "ip6")}
 			mu.Lock()
 			out[h] = r
 			mu.Unlock()
@@ -606,10 +647,37 @@ func allowLookup(hosts []string) map[string]allowLookupResult {
 	return out
 }
 
-type allowLookupResult struct {
+type allowFamResult struct {
 	addrs    []netip.Addr
 	err      error
 	notFound bool
+}
+
+type allowLookupResult struct {
+	v4, v6 allowFamResult
+}
+
+func allowLookupFam(host, network string) allowFamResult {
+	ctx, cancel := context.WithTimeout(context.Background(), allowLookupTimeout)
+	addrs, err := allowLookupFn(ctx, network, host+".")
+	cancel()
+	if err != nil {
+		var dnsErr *net.DNSError
+		return allowFamResult{err: err, notFound: errors.As(err, &dnsErr) && dnsErr.IsNotFound}
+	}
+	var keep []netip.Addr
+	for _, a := range allowUsableAddrs(addrs) {
+		if a.Is4() == (network == "ip4") {
+			keep = append(keep, a)
+		}
+	}
+	// Only addresses a list cannot hold (0.0.0.0, 127.0.0.1: a parked
+	// dynamic DNS name, a sinkhole): the name points nowhere usable. Gone,
+	// not "failing": its old address may belong to someone else by now.
+	if len(keep) == 0 {
+		return allowFamResult{notFound: true}
+	}
+	return allowFamResult{addrs: keep}
 }
 
 // allowUsableAddrs keeps the addresses a list may hold, each once, at most
@@ -632,6 +700,26 @@ func allowUsableAddrs(in []netip.Addr) []netip.Addr {
 	return out
 }
 
+// allowRecordFam folds one family's answer into what is known.
+func allowRecordFam(f *allowFam, r allowFamResult, now time.Time) bool {
+	switch {
+	case r.err == nil && !r.notFound:
+		if f.Err == "" && !f.NotFound && !f.OKAt.IsZero() && addrsEqual(f.Addrs, r.addrs) {
+			f.OKAt = now
+			return false
+		}
+		f.Addrs, f.OKAt, f.Err, f.NotFound = r.addrs, now, "", false
+	case r.notFound:
+		if f.NotFound && len(f.Addrs) == 0 {
+			return false
+		}
+		f.Addrs, f.Err, f.NotFound = nil, "", true
+	default:
+		f.Err, f.NotFound = allowShortErr(r.err), false
+	}
+	return true
+}
+
 // allowRecordLocked stores lookup results.
 func allowRecordLocked(res map[string]allowLookupResult, now time.Time) {
 	changed := false
@@ -642,19 +730,12 @@ func allowRecordLocked(res map[string]allowLookupResult, now time.Time) {
 			allowHosts[h] = st
 		}
 		st.CheckedAt = now
-		switch {
-		case r.err == nil:
-			if !st.OKAt.IsZero() && st.Err == "" && !st.NotFound && addrsEqual(st.Addrs, r.addrs) {
-				st.OKAt = now
-				continue
-			}
-			st.Addrs, st.OKAt, st.Err, st.NotFound = r.addrs, now, "", false
-		case r.notFound:
-			st.Addrs, st.Err, st.NotFound = nil, "the name does not exist", true
-		default:
-			st.Err, st.NotFound = allowShortErr(r.err), false
+		if allowRecordFam(&st.V4, r.v4, now) {
+			changed = true
 		}
-		changed = true
+		if allowRecordFam(&st.V6, r.v6, now) {
+			changed = true
+		}
 	}
 	// Forget names no list has any more.
 	inUse := map[string]bool{}
@@ -701,8 +782,9 @@ func allowShortErr(err error) string {
 // ---- refresh ----
 
 var (
-	allowOnce  sync.Once
-	allowTicks int
+	allowOnce    sync.Once
+	allowTicks   int
+	allowStarted time.Time
 )
 
 // StartAllowlists keeps the lists' sets filled (see the top of the file).
@@ -710,6 +792,7 @@ var (
 func StartAllowlists() {
 	allowOnce.Do(func() {
 		go func() {
+			allowStarted = time.Now()
 			allowRefresh(true)
 			for {
 				d := allowTickEvery
@@ -725,13 +808,18 @@ func StartAllowlists() {
 	})
 }
 
-// allowNeedsRetry: some name was never resolved (the router just booted,
-// DNS not up yet): try again sooner.
+// allowNeedsRetry: in the first minutes after NetGrip started, some name
+// was never resolved (the router just booted, DNS not up yet): try again
+// sooner. Later, a name that keeps failing waits for the normal tick.
 func allowNeedsRetry() bool {
+	if time.Since(allowStarted) > 5*time.Minute {
+		return false
+	}
 	allowMu.Lock()
 	defer allowMu.Unlock()
 	for _, h := range allowHostsOf(allowData.Lists) {
-		if st := allowHosts[h]; st == nil || (st.OKAt.IsZero() && !st.NotFound) {
+		st := allowHosts[h]
+		if st == nil || (st.V4.OKAt.IsZero() && !st.V4.NotFound && st.V6.OKAt.IsZero() && !st.V6.NotFound) {
 			return true
 		}
 	}
@@ -753,10 +841,17 @@ func allowRefresh(force bool) {
 	hosts := allowHostsOf(allowData.Lists)
 	allowMu.Unlock()
 
+	var extra []string
 	if len(hosts) > allowMaxHosts {
-		hosts = hosts[:allowMaxHosts]
+		hosts, extra = hosts[:allowMaxHosts], hosts[allowMaxHosts:]
 	}
 	res := allowLookup(hosts)
+	// Names past the cap (only a hand-edited file can have them) count as
+	// failing, so whatever they had runs out like any failing name.
+	tooMany := allowFamResult{err: errors.New("too many host names")}
+	for _, h := range extra {
+		res[h] = allowLookupResult{v4: tooMany, v6: tooMany}
+	}
 
 	inConfig := allowSetsInConfig()
 	allowMu.Lock()
@@ -796,15 +891,25 @@ func allowRefreshList(id string) {
 	}
 }
 
-// allowSupported: fw4 (nftables) is what this feature is built on. fw3
-// (OpenWrt 21.02 and older) is not supported.
+// allowSupported: fw4 (nftables) with set files ("loadfile") is what this
+// feature is built on. fw3 (OpenWrt 21.02 and older), or an fw4 too old to
+// load a set from a file, is not supported. Read once.
 var allowSupported = func() bool {
-	if _, err := os.Stat("/usr/share/ucode/fw4.uc"); err != nil {
-		return false
-	}
-	_, err := exec.LookPath("nft")
-	return err == nil
+	allowSupportedOnce.Do(func() {
+		b, err := os.ReadFile("/usr/share/ucode/fw4.uc")
+		if err != nil || !strings.Contains(string(b), "loadfile") {
+			return
+		}
+		_, err = exec.LookPath("nft")
+		allowSupportedVal = err == nil
+	})
+	return allowSupportedVal
 }
+
+var (
+	allowSupportedOnce sync.Once
+	allowSupportedVal  bool
+)
 
 // allowSetsInConfig: the list sets that exist in the firewall config.
 func allowSetsInConfig() map[string]bool {

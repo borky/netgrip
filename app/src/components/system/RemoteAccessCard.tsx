@@ -60,7 +60,9 @@ export function RemoteAccessCard({ index = 1 }: { index?: number }) {
     const on = key === "remote_https" ? probe.remote_https : key === "remote_ssh" ? probe.remote_ssh : false;
     const af = key === "remote_https" ? probe.https_allowed : probe.ssh_allowed;
     const section = key === "remote_https" ? probe.https_section : probe.ssh_section;
-    if (!on || !af || !section) return null;
+    // Shown while on, and while off but still tied to a list (so the list
+    // can be released).
+    if (!af || !section || (!on && af.kind === "anyone")) return null;
     const label = key === "remote_https" ? t("remote.https") : t("remote.ssh");
     return (
       <div className="flex items-center gap-2 pb-3 -mt-1 text-caption text-muted">
