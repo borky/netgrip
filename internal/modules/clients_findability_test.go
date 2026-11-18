@@ -1,9 +1,7 @@
 package modules
 
 import (
-	"errors"
 	"path/filepath"
-	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -69,30 +67,64 @@ func TestParseBridgeArp(t *testing.T) {
 		"203.0.113.1      0x1         0x2         02:00:00:00:00:03     *        pppoe-wan\n" +
 		"192.0.2.54       0x1         0x0         00:00:00:00:00:00     *        br-lan\n" +
 		"198.51.100.5     0x1         0x2         02:00:00:00:00:04     *        br-lanx\n"
-	got := parseBridgeArp(content, "br-lan")
-	if len(got) != 2 || got["02:00:00:00:00:01"] != "192.0.2.52" || got["02:00:00:00:00:02"] != "192.0.2.53" {
+	// The bridge and the device stacked on it, whatever its name.
+	got := parseBridgeArp(content+"192.0.2.60       0x1         0x2         02:00:00:00:00:01     *        br-lan.10\n",
+		map[string]bool{"br-lan": true, "br-lan.10": true})
+	if len(got) != 2 || len(got["02:00:00:00:00:01"]) != 2 || got["02:00:00:00:00:02"][0].ip != "192.0.2.53" {
 		t.Fatalf("bridge arp = %+v", got)
 	}
 }
 
-func keepaliveTestSeams(t *testing.T, mode string, ages map[string]fdbAge, arp map[string]string) *[]string {
+func TestOnDeviceSubnet(t *testing.T) {
+	subnets := []ubus.Subnet{
+		{Interface: "lan", Device: "br-lan.10", Address: "192.0.2.1", Mask: 24},
+		{Interface: "wan", Device: "pppoe-wan", Address: "203.0.113.7", Mask: 32},
+	}
+	cases := []struct {
+		ip, dev string
+		want    bool
+	}{
+		{"192.0.2.52", "br-lan.10", true},
+		{"192.0.2.52", "br-lan.11", false},  // another device's subnet
+		{"169.254.3.4", "br-lan.10", false}, // off-subnet: would follow the default route
+		{"203.0.113.7", "pppoe-wan", false}, // a host route
+		{"2001:db8::1", "br-lan.10", false},
+	}
+	for _, c := range cases {
+		if got := onDeviceSubnet(c.ip, c.dev, subnets); got != c.want {
+			t.Errorf("onDeviceSubnet(%s, %s) = %v", c.ip, c.dev, got)
+		}
+	}
+}
+
+func keepaliveTestSeams(t *testing.T, mode string, ages map[string]fdbAge, arp map[string]string) (*[]string, *time.Duration) {
 	t.Helper()
 	sent := []string{}
-	oldMode, oldAges, oldAgeing, oldArp, oldSend, oldWireless := probeModeFn, fdbAgesFn, bridgeAgeingFn, keepaliveArpFn, keepaliveSendFn, isWirelessPortFn
-	probeModeFn = func() *ModeProbe { return &ModeProbe{Mode: mode} }
+	ageing := 300 * time.Second
+	oldMode, oldBridge, oldAges, oldAgeing, oldArp, oldSend, oldWireless, oldSubnets := keepaliveModeFn, keepaliveBridgeFn, fdbAgesFn, bridgeAgeingFn, keepaliveArpFn, keepaliveSendFn, isWirelessPortFn, clientSubnetsFn
+	keepaliveModeFn = func() string { return mode }
+	keepaliveBridgeFn = func() string { return "br-lan" }
 	fdbAgesFn = func(string) map[string]fdbAge { return ages }
-	bridgeAgeingFn = func(string) time.Duration { return 300 * time.Second }
-	keepaliveArpFn = func(string) map[string]string { return arp }
+	bridgeAgeingFn = func(string) time.Duration { return ageing }
+	keepaliveArpFn = func(string) map[string][]arpRow {
+		out := map[string][]arpRow{}
+		for mac, ip := range arp {
+			out[mac] = []arpRow{{ip: ip, dev: "br-lan.10"}}
+		}
+		return out
+	}
 	keepaliveSendFn = func(ip string) { sent = append(sent, ip) }
 	isWirelessPortFn = func(p string) bool { return strings.HasPrefix(p, "phy") }
-	SetUciExecForTest(t, func(args ...string) ([]byte, error) { return nil, errors.New("no uci") })
+	clientSubnetsFn = func() []ubus.Subnet {
+		return []ubus.Subnet{{Interface: "lan", Device: "br-lan.10", Address: "192.0.2.1", Mask: 24}}
+	}
 	keepaliveMu.Lock()
 	keepaliveLast = map[string]time.Time{}
 	keepaliveMu.Unlock()
 	t.Cleanup(func() {
-		probeModeFn, fdbAgesFn, bridgeAgeingFn, keepaliveArpFn, keepaliveSendFn, isWirelessPortFn = oldMode, oldAges, oldAgeing, oldArp, oldSend, oldWireless
+		keepaliveModeFn, keepaliveBridgeFn, fdbAgesFn, bridgeAgeingFn, keepaliveArpFn, keepaliveSendFn, isWirelessPortFn, clientSubnetsFn = oldMode, oldBridge, oldAges, oldAgeing, oldArp, oldSend, oldWireless, oldSubnets
 	})
-	return &sent
+	return &sent, &ageing
 }
 
 func TestWiredKeepaliveProbesOnlyQuietWiredDevices(t *testing.T) {
@@ -103,7 +135,7 @@ func TestWiredKeepaliveProbesOnlyQuietWiredDevices(t *testing.T) {
 		"02:00:00:00:00:04": {port: "lan2", age: 260 * time.Second},     // no address: nothing to send to
 	}
 	arp := map[string]string{"02:00:00:00:00:01": "192.0.2.52", "02:00:00:00:00:02": "192.0.2.53", "02:00:00:00:00:03": "192.0.2.54"}
-	sent := keepaliveTestSeams(t, "router", ages, arp)
+	sent, _ := keepaliveTestSeams(t, "router", ages, arp)
 	now := time.Unix(1_700_000_000, 0)
 	wiredKeepaliveTick(now)
 	if strings.Join(*sent, ",") != "192.0.2.52" {
@@ -122,10 +154,30 @@ func TestWiredKeepaliveProbesOnlyQuietWiredDevices(t *testing.T) {
 
 func TestWiredKeepaliveSendsNothingOnAnAccessPoint(t *testing.T) {
 	ages := map[string]fdbAge{"02:00:00:00:00:01": {port: "lan2", age: 290 * time.Second}}
-	sent := keepaliveTestSeams(t, "ap", ages, map[string]string{"02:00:00:00:00:01": "192.0.2.52"})
+	sent, _ := keepaliveTestSeams(t, "ap", ages, map[string]string{"02:00:00:00:00:01": "192.0.2.52"})
 	wiredKeepaliveTick(time.Now())
 	if len(*sent) != 0 {
 		t.Fatalf("an access point probed %v", *sent)
+	}
+}
+
+func TestWiredKeepaliveSkipsOffSubnetAndShortAgeing(t *testing.T) {
+	ages := map[string]fdbAge{"02:00:00:00:00:01": {port: "lan2", age: 250 * time.Second}}
+	// An address outside the device's subnet is never probed.
+	sent, ageing := keepaliveTestSeams(t, "router", ages, map[string]string{"02:00:00:00:00:01": "169.254.3.4"})
+	wiredKeepaliveTick(time.Now())
+	if len(*sent) != 0 {
+		t.Fatalf("an off-subnet address was probed: %v", *sent)
+	}
+	// An ageing time too short to probe in time: nothing is done.
+	keepaliveArpFn = func(string) map[string][]arpRow {
+		return map[string][]arpRow{"02:00:00:00:00:01": {{ip: "192.0.2.52", dev: "br-lan.10"}}}
+	}
+	*ageing = 90 * time.Second
+	ages["02:00:00:00:00:01"] = fdbAge{port: "lan2", age: 80 * time.Second}
+	wiredKeepaliveTick(time.Now())
+	if len(*sent) != 0 {
+		t.Fatalf("probed with a 90 s ageing time: %v", *sent)
 	}
 }
 
@@ -145,57 +197,85 @@ func TestKnownClientsNewOnlyOnce(t *testing.T) {
 	}
 	m := &Monitor{}
 	// First run: everything known is recorded, nothing announced.
-	if got := m.newClients(cl("02:00:00:00:00:01", "02:00:00:00:00:02"), now); len(got) != 0 {
+	if got := m.newClients(cl("02:00:00:00:00:01", "02:00:00:00:00:02"), now, false); len(got) != 0 {
 		t.Fatalf("first run announced %v", got)
 	}
 	// A device that drops out and comes back is not new; the quiet one
 	// seeded from the leases is not new either.
-	m.newClients(cl("02:00:00:00:00:01"), now)
-	if got := m.newClients(cl("02:00:00:00:00:01", "02:00:00:00:00:02", "02:00:00:00:00:09"), now); len(got) != 0 {
+	m.newClients(cl("02:00:00:00:00:01"), now, false)
+	if got := m.newClients(cl("02:00:00:00:00:01", "02:00:00:00:00:02", "02:00:00:00:00:09"), now, false); len(got) != 0 {
 		t.Fatalf("a returning device was announced: %v", got)
 	}
 	// A device never seen is new, once.
-	if got := m.newClients(cl("02:00:00:00:00:01", "02:00:00:00:00:0A"), now); len(got) != 1 || got[0].MAC != "02:00:00:00:00:0A" {
+	if got := m.newClients(cl("02:00:00:00:00:01", "02:00:00:00:00:0A"), now, false); len(got) != 1 || got[0].MAC != "02:00:00:00:00:0A" {
 		t.Fatalf("new device: %v", got)
 	}
-	if got := m.newClients(cl("02:00:00:00:00:0a"), now); len(got) != 0 {
+	if got := m.newClients(cl("02:00:00:00:00:0a"), now, false); len(got) != 0 {
 		t.Fatalf("announced twice (case): %v", got)
 	}
 	// Kept across restarts.
 	m2 := &Monitor{}
-	if got := m2.newClients(cl("02:00:00:00:00:0a", "02:00:00:00:00:02"), now); len(got) != 0 {
+	if got := m2.newClients(cl("02:00:00:00:00:0a", "02:00:00:00:00:02"), now, false); len(got) != 0 {
 		t.Fatalf("after a restart: %v", got)
 	}
-	if got := m2.newClients(cl("02:00:00:00:00:0b"), now); len(got) != 1 {
+	if got := m2.newClients(cl("02:00:00:00:00:0b"), now, false); len(got) != 1 {
 		t.Fatalf("after a restart a new device was not announced: %v", got)
 	}
 }
 
-func TestKnownClientsCap(t *testing.T) {
+func TestKnownClientsCapDropsLongestUnseenNeverPresent(t *testing.T) {
 	old := knownClientsPath
 	knownClientsPath = filepath.Join(t.TempDir(), "known-clients.json")
 	t.Cleanup(func() { knownClientsPath = old })
-	known := map[string]int64{}
-	for i := 0; i < knownClientsMax+5; i++ {
-		mac := []byte("02:00:00:00:00:00")
+	mac := func(i int) string {
+		b := []byte("02:00:00:00:00:00")
 		hex := "0123456789abcdef"
-		mac[12], mac[13] = hex[(i>>12)&15], hex[(i>>8)&15]
-		mac[15], mac[16] = hex[(i>>4)&15], hex[i&15]
-		known[string(mac)] = int64(i)
+		b[12], b[13] = hex[(i>>12)&15], hex[(i>>8)&15]
+		b[15], b[16] = hex[(i>>4)&15], hex[i&15]
+		return string(b)
 	}
-	if err := saveKnownClients(known); err != nil {
+	known, last := map[string]int64{}, map[string]int64{}
+	for i := 0; i < knownClientsMax+5; i++ {
+		known[mac(i)] = 0           // all first seen together (the seed)
+		last[mac(i)] = int64(i + 1) // seen at different times since
+	}
+	present := map[string]bool{mac(0): true, mac(1): true} // longest unseen, but online now
+	if err := saveKnownClients(known, last, present); err != nil {
 		t.Fatal(err)
 	}
-	got, ok := loadKnownClients()
+	got, gotLast, ok := loadKnownClients()
 	if !ok || len(got) != knownClientsMax {
 		t.Fatalf("kept %d", len(got))
 	}
-	var firsts []int64
-	for _, at := range got {
-		firsts = append(firsts, at)
+	for _, i := range []int{0, 1} {
+		if _, ok := got[mac(i)]; !ok {
+			t.Errorf("an online device was dropped: %s", mac(i))
+		}
 	}
-	sort.Slice(firsts, func(i, j int) bool { return firsts[i] < firsts[j] })
-	if firsts[0] != 5 {
-		t.Fatalf("the oldest were not dropped first: %d", firsts[0])
+	for _, i := range []int{2, 3, 4, 5, 6} {
+		if _, ok := got[mac(i)]; ok {
+			t.Errorf("a long-unseen device was kept: %s", mac(i))
+		}
+	}
+	if gotLast[mac(7)] != 8 {
+		t.Errorf("last seen not kept: %d", gotLast[mac(7)])
+	}
+}
+
+func TestKnownClientsSilentResync(t *testing.T) {
+	old := knownClientsPath
+	knownClientsPath = filepath.Join(t.TempDir(), "known-clients.json")
+	oldSeed := knownSeedMACsFn
+	knownSeedMACsFn = func() []string { return nil }
+	t.Cleanup(func() { knownClientsPath, knownSeedMACsFn = old, oldSeed })
+	now := time.Unix(1_700_000_000, 0)
+	m := &Monitor{}
+	m.newClients([]Client{{MAC: "02:00:00:00:00:01"}}, now, false)
+	// Notifications were off meanwhile: what joined is recorded, not announced.
+	if got := m.newClients([]Client{{MAC: "02:00:00:00:00:01"}, {MAC: "02:00:00:00:00:02"}}, now, true); len(got) != 0 {
+		t.Fatalf("resync announced %v", got)
+	}
+	if got := m.newClients([]Client{{MAC: "02:00:00:00:00:02"}, {MAC: "02:00:00:00:00:03"}}, now, false); len(got) != 1 || got[0].MAC != "02:00:00:00:00:03" {
+		t.Fatalf("after resync: %v", got)
 	}
 }

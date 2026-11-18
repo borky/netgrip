@@ -74,7 +74,9 @@ function loadView(): ClientsView {
     if (!v || typeof v !== "object") return DEFAULT_VIEW;
     const sort = v.sort && SORT_KEYS.includes(v.sort.key) && (v.sort.dir === "asc" || v.sort.dir === "desc") ? v.sort : DEFAULT_VIEW.sort;
     const str = (x: unknown, d: string) => (typeof x === "string" ? x : d);
-    return { sort, conn: str(v.conn, "all"), network: str(v.network, ""), dtype: str(v.dtype, ""), status: str(v.status, "") };
+    const conn = ["all", "wifi", "cable", "wifi24", "wifi5"].includes(v.conn as string) ? (v.conn as string) : "all";
+    const status = ["", "blocked", "reserved", "limited", "self"].includes(v.status as string) ? (v.status as string) : "";
+    return { sort, conn, network: str(v.network, ""), dtype: str(v.dtype, ""), status };
   } catch {
     return DEFAULT_VIEW;
   }
@@ -288,7 +290,9 @@ export function ClientsPage() {
   const filtered = useMemo(() => {
     if (!clients) return undefined;
     const q = query.trim().toLowerCase();
-    const qHex = q.replace(/[^0-9a-f]/g, "");
+    // A MAC typed without separators, or with others: only for a query made
+    // of hex digits and separators (a name like "dad's" is not a MAC).
+    const qHex = /^[0-9a-f:.\-]+$/.test(q) ? q.replace(/[^0-9a-f]/g, "") : "";
     return clients.filter((c) => {
       if (view.conn === "wifi" ? c.type === "cable" : view.conn === "cable" ? c.type !== "cable" : view.conn !== "all" && c.type !== view.conn) return false;
       if (view.network && c.network !== view.network) return false;
@@ -552,8 +556,8 @@ export function ClientsPage() {
                 aria-label={t("clients.filterConn")}>
                 <option value="all">{t("clients.connAll")}</option>
                 <option value="wifi">{t("clients.connWifi")}</option>
-                {options.conns.has("wifi24") && <option value="wifi24">{t("overview.band24")}</option>}
-                {options.conns.has("wifi5") && <option value="wifi5">{t("overview.band5")}</option>}
+                {(options.conns.has("wifi24") || view.conn === "wifi24") && <option value="wifi24">{t("overview.band24")}</option>}
+                {(options.conns.has("wifi5") || view.conn === "wifi5") && <option value="wifi5">{t("overview.band5")}</option>}
                 <option value="cable">{t("overview.cable")}</option>
               </select>
               {(options.networks.length > 1 || view.network) && (
@@ -591,7 +595,7 @@ export function ClientsPage() {
                   <option value="lease">{t("clients.leaseCol")}</option>
                 </select>
                 <button type="button" onClick={() => updateView({ sort: { key: sort.key, dir: sort.dir === "asc" ? "desc" : "asc" } })}
-                  aria-label={t(sort.dir === "asc" ? "clients.sortAsc" : "clients.sortDesc")} title={t(sort.dir === "asc" ? "clients.sortAsc" : "clients.sortDesc")}
+                  aria-label={t(sort.dir === "asc" ? "clients.sortDesc" : "clients.sortAsc")} title={t(sort.dir === "asc" ? "clients.sortDesc" : "clients.sortAsc")}
                   className="inline-flex h-9 w-9 items-center justify-center rounded-sm border border-border bg-surface-2 text-muted hover:text-text ring-focus">
                   {sort.dir === "asc" ? <ArrowUp size={14} /> : <ArrowDown size={14} />}
                 </button>

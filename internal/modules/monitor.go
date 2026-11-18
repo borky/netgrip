@@ -18,8 +18,13 @@ type Monitor struct {
 	// knownClientsPath. A device that drops out of the list for a while
 	// (a quiet wired device, a phone asleep) is not new when it comes back.
 	known       map[string]int64
+	lastSeen    map[string]int64 // in memory; saved along with a new device
 	knownLoaded bool
-	stopCh      chan struct{}
+	// resync: the next check records the list without announcing it: the
+	// first one after a start or after notifications were off, when the
+	// devices that joined meanwhile were not watched.
+	resync bool
+	stopCh chan struct{}
 }
 
 var monitorInstance *Monitor
@@ -30,6 +35,7 @@ func StartMonitor() {
 	}
 	m := &Monitor{
 		stopCh: make(chan struct{}),
+		resync: true,
 	}
 	monitorInstance = m
 	go m.run()
@@ -58,6 +64,9 @@ func (m *Monitor) run() {
 
 func (m *Monitor) check() {
 	if !anyChannelEnabled() {
+		m.mu.Lock()
+		m.resync = true
+		m.mu.Unlock()
 		return
 	}
 
@@ -101,7 +110,11 @@ func (m *Monitor) checkWan() {
 
 func (m *Monitor) checkNewClients() {
 	clients := listClientsFn("")
-	newOnes := m.newClients(clients, time.Now())
+	m.mu.Lock()
+	silent := m.resync
+	m.resync = false
+	m.mu.Unlock()
+	newOnes := m.newClients(clients, time.Now(), silent)
 	if len(newOnes) == 0 {
 		return
 	}

@@ -382,6 +382,7 @@ func ActiveWANDevice() string {
 // Subnet is one IPv4 network a router interface sits on.
 type Subnet struct {
 	Interface string // the netifd interface (lan, iot, ...)
+	Device    string // the device carrying it (br-lan.10, ...)
 	Address   string
 	Mask      int
 }
@@ -399,7 +400,7 @@ func ParseSubnets(raw []byte) ([]Subnet, error) {
 			continue
 		}
 		for _, a := range i.IPv4 {
-			out = append(out, Subnet{Interface: i.Interface, Address: a.Address, Mask: a.Mask})
+			out = append(out, Subnet{Interface: i.Interface, Device: i.L3Device, Address: a.Address, Mask: a.Mask})
 		}
 	}
 	return out, nil

@@ -10,15 +10,20 @@ package modules
 // stale entry, so it would keep listing devices that left long ago.
 //
 // So, once a minute, each wired MAC that has been quiet for most of the
-// ageing time gets one UDP datagram to the discard port of the address
-// the ARP table gives it. The kernel confirms the neighbour (a unicast ARP
-// request), and the device's answer, or any reply, refreshes the bridge
-// entry. A device that left answers nothing and ages out as before, so the
-// list still says only what the bridge saw. Nothing is sent on an access
+// ageing time gets one UDP datagram to the discard port of each address
+// the ARP table gives it on the bridge (a renumbered device may still have
+// its old row). The kernel confirms the neighbour (a unicast ARP request),
+// and the device's answer, or any reply, refreshes the bridge entry. A
+// device that left answers nothing and ages out as before, so the list
+// still says only what the bridge saw. Only addresses inside a subnet of
+// the very device the row was learned on are probed (never one that would
+// be routed elsewhere, out of an uplink). Nothing is sent on an access
 // point (its list is its Wi-Fi stations) or to Wi-Fi ports.
 
 import (
 	"net"
+
+	"github.com/gnacho/netgrip/internal/ubus"
 	"os"
 	"os/exec"
 	"strconv"
@@ -42,12 +47,31 @@ type fdbAge struct {
 	age  time.Duration
 }
 
+// arpRow is one ARP entry: an address and the device it was learned on.
+type arpRow struct {
+	ip  string
+	dev string
+}
+
 // Seams for tests.
 var (
 	fdbAgesFn       = fdbAges
 	bridgeAgeingFn  = bridgeAgeing
 	keepaliveArpFn  = bridgeArp
 	keepaliveSendFn = keepaliveSend
+	// The router's mode and LAN bridge, from the panel's caches: the tick
+	// runs every minute for good, and probing them forks several commands.
+	keepaliveModeFn = func() string {
+		p, _ := CachedRead("mode", 2*time.Minute, func() (*ModeProbe, error) { return probeModeFn(), nil })
+		if p == nil {
+			return ""
+		}
+		return p.Mode
+	}
+	keepaliveBridgeFn = func() string {
+		b, _ := CachedRead("keepalive|bridge", 10*time.Minute, func() (string, error) { return LANBridge(), nil })
+		return b
+	}
 )
 
 var (
@@ -71,23 +95,26 @@ func StartWiredKeepalive() {
 // wiredKeepaliveTick probes the wired MACs about to be forgotten. It
 // returns the addresses it probed (for tests).
 func wiredKeepaliveTick(now time.Time) []string {
-	if probeModeFn().Mode == "ap" {
+	if keepaliveModeFn() == "ap" {
 		return nil
 	}
-	bridge := LANBridge()
+	bridge := keepaliveBridgeFn()
+	if bridge == "" {
+		return nil
+	}
+	// An ageing time this short (a non-default setting) leaves no room to
+	// probe once a minute before entries go: nothing is done then.
+	ageing := bridgeAgeingFn(bridge)
+	if ageing < 2*keepaliveEvery {
+		return nil
+	}
 	ages := fdbAgesFn(bridge)
 	if len(ages) == 0 {
 		return nil
 	}
-	ageing := bridgeAgeingFn(bridge)
-	if ageing <= 0 {
-		return nil
-	}
 	threshold := ageing - keepaliveMargin
-	if threshold < ageing/2 {
-		threshold = ageing / 2
-	}
 	arp := keepaliveArpFn(bridge)
+	subnets := clientSubnetsFn()
 	keepaliveMu.Lock()
 	defer keepaliveMu.Unlock()
 	var sent []string
@@ -95,16 +122,23 @@ func wiredKeepaliveTick(now time.Time) []string {
 		if e.age < threshold || isWirelessPortFn(e.port) {
 			continue
 		}
-		ip := arp[mac]
-		if ip == "" {
+		var ips []string
+		for _, r := range arp[mac] {
+			if onDeviceSubnet(r.ip, r.dev, subnets) {
+				ips = append(ips, r.ip)
+			}
+		}
+		if len(ips) == 0 {
 			continue
 		}
 		if t, ok := keepaliveLast[mac]; ok && now.Sub(t) < keepaliveMinGap {
 			continue
 		}
 		keepaliveLast[mac] = now
-		keepaliveSendFn(ip)
-		sent = append(sent, ip)
+		for _, ip := range ips {
+			keepaliveSendFn(ip)
+			sent = append(sent, ip)
+		}
 	}
 	// Forget MACs the bridge no longer has: the map stays as small as the
 	// bridge table.
@@ -204,19 +238,55 @@ func bridgeAgeing(bridge string) time.Duration {
 	return time.Duration(cs) * 10 * time.Millisecond
 }
 
-// bridgeArp is the ARP table's MAC -> address for the bridge and its VLAN
-// devices only (bridge, bridge.<vid>): the networks the bridge's MACs live
-// on, never an uplink.
-func bridgeArp(bridge string) map[string]string {
-	raw, err := os.ReadFile(arpFilePath)
-	if err != nil {
-		return map[string]string{}
+// onDeviceSubnet: ip lies in a subnet of the very device the ARP row was
+// learned on, so a datagram to it leaves through that device and nowhere
+// else (an off-subnet address would follow the default route).
+func onDeviceSubnet(ip, dev string, subnets []ubus.Subnet) bool {
+	addr := net.ParseIP(ip)
+	if addr == nil || addr.To4() == nil {
+		return false
 	}
-	return parseBridgeArp(string(raw), bridge)
+	for _, s := range subnets {
+		if s.Device != dev || s.Mask < 1 || s.Mask > 30 {
+			continue
+		}
+		base := net.ParseIP(s.Address)
+		if base == nil || base.To4() == nil {
+			continue
+		}
+		n := net.IPNet{IP: base.Mask(net.CIDRMask(s.Mask, 32)), Mask: net.CIDRMask(s.Mask, 32)}
+		if n.Contains(addr) {
+			return true
+		}
+	}
+	return false
 }
 
-func parseBridgeArp(content, bridge string) map[string]string {
-	out := map[string]string{}
+// bridgeDevices: the bridge and the devices stacked on it (its VLAN
+// devices, whatever they are named), from sysfs.
+func bridgeDevices(bridge string) map[string]bool {
+	devs := map[string]bool{bridge: true}
+	entries, _ := os.ReadDir("/sys/class/net/" + bridge)
+	for _, e := range entries {
+		if name, ok := strings.CutPrefix(e.Name(), "upper_"); ok && name != "" {
+			devs[name] = true
+		}
+	}
+	return devs
+}
+
+// bridgeArp is the ARP table's MAC -> rows on the bridge and the devices
+// stacked on it only: the networks the bridge's MACs live on.
+func bridgeArp(bridge string) map[string][]arpRow {
+	raw, err := os.ReadFile(arpFilePath)
+	if err != nil {
+		return map[string][]arpRow{}
+	}
+	return parseBridgeArp(string(raw), bridgeDevices(bridge))
+}
+
+func parseBridgeArp(content string, devs map[string]bool) map[string][]arpRow {
+	out := map[string][]arpRow{}
 	for i, line := range strings.Split(content, "\n") {
 		if i == 0 || line == "" {
 			continue
@@ -229,10 +299,10 @@ func parseBridgeArp(content, bridge string) map[string]string {
 		if flags == "0x0" || !reMac.MatchString(mac) || mac == "00:00:00:00:00:00" {
 			continue
 		}
-		if dev != bridge && !strings.HasPrefix(dev, bridge+".") {
+		if !devs[dev] {
 			continue
 		}
-		out[mac] = ip
+		out[mac] = append(out[mac], arpRow{ip: ip, dev: dev})
 	}
 	return out
 }

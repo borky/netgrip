@@ -26,48 +26,82 @@ var (
 )
 
 // knownClientsMax bounds the list (devices with random addresses add one
-// each time they change it); the oldest go first.
+// each time they change it). The ones not seen for longest go first, never
+// one in the list right now: dropping a device that is online would
+// announce it again at the next check.
 const knownClientsMax = 4096
 
 type knownClientsFile struct {
 	FirstSeen map[string]int64 `json:"first_seen"`
+	LastSeen  map[string]int64 `json:"last_seen,omitempty"`
 }
 
-func loadKnownClients() (map[string]int64, bool) {
+func loadKnownClients() (first, last map[string]int64, ok bool) {
 	data, err := os.ReadFile(knownClientsPath)
 	if err != nil {
-		return nil, false
+		return nil, nil, false
 	}
 	var f knownClientsFile
 	if err := json.Unmarshal(data, &f); err != nil || f.FirstSeen == nil {
-		return nil, false
+		log.Printf("netgrip: known clients: %s cannot be read; starting it again", knownClientsPath)
+		return nil, nil, false
 	}
-	out := make(map[string]int64, len(f.FirstSeen))
+	first = make(map[string]int64, len(f.FirstSeen))
+	last = make(map[string]int64, len(f.FirstSeen))
 	for mac, at := range f.FirstSeen {
 		if mac = strings.ToLower(mac); reMac.MatchString(mac) {
-			out[mac] = at
+			first[mac] = at
+			last[mac] = at
 		}
 	}
-	return out, true
+	for mac, at := range f.LastSeen {
+		if mac = strings.ToLower(mac); reMac.MatchString(mac) {
+			if _, ok := first[mac]; ok {
+				last[mac] = at
+			}
+		}
+	}
+	return first, last, true
 }
 
-func saveKnownClients(known map[string]int64) error {
+// saveKnownClients writes the list, first trimming it to knownClientsMax
+// (see there); present: the MACs in the client list now.
+func saveKnownClients(known, lastSeen map[string]int64, present map[string]bool) error {
 	if len(known) > knownClientsMax {
 		macs := make([]string, 0, len(known))
 		for mac := range known {
-			macs = append(macs, mac)
+			if !present[mac] {
+				macs = append(macs, mac)
+			}
+		}
+		seen := func(mac string) int64 {
+			if at, ok := lastSeen[mac]; ok {
+				return at
+			}
+			return known[mac]
 		}
 		sort.Slice(macs, func(i, j int) bool {
-			if known[macs[i]] != known[macs[j]] {
-				return known[macs[i]] < known[macs[j]]
+			if seen(macs[i]) != seen(macs[j]) {
+				return seen(macs[i]) < seen(macs[j])
 			}
 			return macs[i] < macs[j]
 		})
-		for _, mac := range macs[:len(known)-knownClientsMax] {
+		drop := len(known) - knownClientsMax
+		if drop > len(macs) {
+			drop = len(macs)
+		}
+		for _, mac := range macs[:drop] {
 			delete(known, mac)
+			delete(lastSeen, mac)
 		}
 	}
-	data, err := json.Marshal(knownClientsFile{FirstSeen: known})
+	last := make(map[string]int64, len(known))
+	for mac := range known {
+		if at, ok := lastSeen[mac]; ok {
+			last[mac] = at
+		}
+	}
+	data, err := json.Marshal(knownClientsFile{FirstSeen: known, LastSeen: last})
 	if err != nil {
 		return err
 	}
@@ -97,29 +131,36 @@ func knownSeedMACs() []string {
 	return out
 }
 
-// newClients returns the clients never seen before and records them. The
-// first call with no saved list records everything known and reports
-// nothing.
-func (m *Monitor) newClients(clients []Client, now time.Time) []Client {
+// newClients returns the clients never seen before and records them.
+// silent records without reporting (see Monitor.resync); the first call
+// with no saved list records everything known and reports nothing.
+func (m *Monitor) newClients(clients []Client, now time.Time, silent bool) []Client {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	at := now.Unix()
+	present := map[string]bool{}
+	for _, c := range clients {
+		if mac := strings.ToLower(c.MAC); reMac.MatchString(mac) {
+			present[mac] = true
+		}
+	}
 	if !m.knownLoaded {
-		known, ok := loadKnownClients()
-		m.known, m.knownLoaded = known, true
+		known, last, ok := loadKnownClients()
+		m.known, m.lastSeen, m.knownLoaded = known, last, true
 		if !ok {
-			m.known = map[string]int64{}
-			for _, c := range clients {
-				if mac := strings.ToLower(c.MAC); reMac.MatchString(mac) {
-					m.known[mac] = at
-				}
+			m.known, m.lastSeen = map[string]int64{}, map[string]int64{}
+			for mac := range present {
+				m.known[mac] = at
 			}
 			for _, mac := range knownSeedMACsFn() {
 				if mac = strings.ToLower(mac); reMac.MatchString(mac) {
 					m.known[mac] = at
 				}
 			}
-			if err := knownClientsSave(m.known); err != nil {
+			for mac := range present {
+				m.lastSeen[mac] = at
+			}
+			if err := knownClientsSave(m.known, m.lastSeen, present); err != nil {
 				log.Printf("netgrip: known clients: %v", err)
 			}
 			return nil
@@ -131,6 +172,7 @@ func (m *Monitor) newClients(clients []Client, now time.Time) []Client {
 		if !reMac.MatchString(mac) {
 			continue
 		}
+		m.lastSeen[mac] = at
 		if _, ok := m.known[mac]; ok {
 			continue
 		}
@@ -138,9 +180,12 @@ func (m *Monitor) newClients(clients []Client, now time.Time) []Client {
 		fresh = append(fresh, c)
 	}
 	if len(fresh) > 0 {
-		if err := knownClientsSave(m.known); err != nil {
+		if err := knownClientsSave(m.known, m.lastSeen, present); err != nil {
 			log.Printf("netgrip: known clients: %v", err)
 		}
+	}
+	if silent {
+		return nil
 	}
 	return fresh
 }
