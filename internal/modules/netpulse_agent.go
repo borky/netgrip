@@ -563,8 +563,6 @@ func applyNetPulseAgent(p netpulsePaths) {
 		// detection (both only with a pinned HTTPS server).
 		Quarantine:           quarantineReportInfo,
 		OnQuarantineStations: QuarantineNoteStations,
-		// Display only: names for clients NetGrip has none for.
-		OnDeviceNames:  NoteNetPulseNames,
 		OnUpgrade:      netPulseUpgradeTrigger,
 		OnConfigBackup: netPulseConfigBackupTrigger,
 	}
@@ -576,6 +574,16 @@ func applyNetPulseAgent(p netpulsePaths) {
 	npMu.Unlock()
 
 	opts.OnStatus = statusCallbackGen(gen)
+	// Display only: names for clients NetGrip has none for. Only from the
+	// agent running now: a late reply of one just stopped or replaced must
+	// not bring its server's names back after they were cleared.
+	opts.OnDeviceNames = func(names map[string]string) {
+		npMu.Lock()
+		defer npMu.Unlock()
+		if gen == npGen {
+			NoteNetPulseNames(names)
+		}
+	}
 
 	interval := opts.Interval
 	if interval <= 0 {

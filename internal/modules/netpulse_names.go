@@ -74,8 +74,11 @@ func npCleanName(s string) string {
 		case unicode.IsSpace(r): // tabs and line breaks too: one space
 			space = true
 			continue
-		// Controls and invisible format characters: direction overrides,
-		// zero-width ones, soft hyphens, word joiners, tags, BOM.
+		// Joiners stay (Persian, Indic scripts, emoji sequences), and tag
+		// characters (subdivision flags).
+		case r == 0x200C, r == 0x200D, r >= 0xE0020 && r <= 0xE007F:
+		// Other controls and invisible format characters: direction
+		// overrides, zero-width spaces, soft hyphens, word joiners, BOM.
 		case unicode.IsControl(r), unicode.Is(unicode.Cf, r):
 			continue
 		}

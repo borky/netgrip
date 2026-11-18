@@ -65,6 +65,7 @@ func TestNoteNetPulseNamesKeepsOnlyCleanData(t *testing.T) {
 		"02-00-00-00-00-07": "Dashes",                        // not the form NetGrip keys on
 		"02:00:00:00:00:08": string([]byte{0xff, 0xfe, 'a'}), // not UTF-8
 		"02:00:00:00:00:09": "Soft\u00adhyphen\u2060x",       // invisible format characters
+		"02:00:00:00:00:0a": "می‌خواهم 👨‍👩",                  // ZWNJ and ZWJ stay
 	})
 	cases := map[string]string{
 		"02:00:00:00:00:01": "Printer Hall",
@@ -76,6 +77,7 @@ func TestNoteNetPulseNamesKeepsOnlyCleanData(t *testing.T) {
 		"02:00:00:00:00:07": "",
 		"02:00:00:00:00:08": "",
 		"02:00:00:00:00:09": "Softhyphenx",
+		"02:00:00:00:00:0a": "می‌خواهم 👨‍👩",
 	}
 	for mac, want := range cases {
 		if got := netpulseNameFor(mac); got != want {
