@@ -575,6 +575,8 @@ export interface Client {
   quota_period?: string;
   quota_throttled?: boolean;
   quota_exceeded?: boolean;
+  /** The router interface whose subnet holds the client's address (lan, iot, ...). */
+  network?: string;
 }
 
 export interface BlockedClient {

@@ -83,6 +83,12 @@ export const demoQuotas: T.QuotaProbe = {
   ts: 0,
 };
 
+// The network each address belongs to, as the router reports it.
+for (const c of demoClients) {
+  if (c.ip?.startsWith("192.168.8.")) c.network = "lan";
+  else if (c.ip?.startsWith("192.168.9.")) c.network = "guest";
+}
+
 export const demoLeases: T.Lease[] = demoClients.filter((c) => c.ip).map((c) => ({
   expires: "11h 32m", mac: c.mac, ip: c.ip!, hostname: c.name.split(" (")[0],
 }));

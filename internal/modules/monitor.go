@@ -12,10 +12,14 @@ import (
 const monitorInterval = 15 * time.Second
 
 type Monitor struct {
-	mu        sync.Mutex
-	wanUp     *bool
-	knownMACs map[string]bool
-	stopCh    chan struct{}
+	mu    sync.Mutex
+	wanUp *bool
+	// known: every client MAC ever seen (first seen, Unix time), kept in
+	// knownClientsPath. A device that drops out of the list for a while
+	// (a quiet wired device, a phone asleep) is not new when it comes back.
+	known       map[string]int64
+	knownLoaded bool
+	stopCh      chan struct{}
 }
 
 var monitorInstance *Monitor
@@ -25,8 +29,7 @@ func StartMonitor() {
 		return
 	}
 	m := &Monitor{
-		knownMACs: make(map[string]bool),
-		stopCh:    make(chan struct{}),
+		stopCh: make(chan struct{}),
 	}
 	monitorInstance = m
 	go m.run()
@@ -97,32 +100,8 @@ func (m *Monitor) checkWan() {
 }
 
 func (m *Monitor) checkNewClients() {
-	clients := ListClients("")
-
-	currentMACs := make(map[string]bool, len(clients))
-	for _, c := range clients {
-		if c.MAC != "" {
-			currentMACs[c.MAC] = true
-		}
-	}
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if len(m.knownMACs) == 0 {
-		m.knownMACs = currentMACs
-		return
-	}
-
-	var newOnes []Client
-	for _, c := range clients {
-		if c.MAC != "" && !m.knownMACs[c.MAC] {
-			newOnes = append(newOnes, c)
-		}
-	}
-
-	m.knownMACs = currentMACs
-
+	clients := listClientsFn("")
+	newOnes := m.newClients(clients, time.Now())
 	if len(newOnes) == 0 {
 		return
 	}

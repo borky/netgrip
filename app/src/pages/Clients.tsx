@@ -53,6 +53,46 @@ function RatePair({ down, up, downColor = "var(--color-ok)", upColor = "var(--co
 
 type SortKey = "name" | "traffic" | "ip" | "type" | "lease";
 type SortDir = "asc" | "desc";
+const SORT_KEYS: SortKey[] = ["name", "ip", "traffic", "type", "lease"];
+
+/** The list's view (sort and filters), kept per browser. */
+interface ClientsView {
+  sort: { key: SortKey; dir: SortDir };
+  /** all | wifi | cable | wifi24 | wifi5 */
+  conn: string;
+  network: string;
+  dtype: string;
+  /** "" | blocked | reserved | limited | self */
+  status: string;
+}
+const VIEW_KEY = "netgrip:clients:view";
+const DEFAULT_VIEW: ClientsView = { sort: { key: "name", dir: "asc" }, conn: "all", network: "", dtype: "", status: "" };
+
+function loadView(): ClientsView {
+  try {
+    const v = JSON.parse(localStorage.getItem(VIEW_KEY) ?? "null") as Partial<ClientsView> | null;
+    if (!v || typeof v !== "object") return DEFAULT_VIEW;
+    const sort = v.sort && SORT_KEYS.includes(v.sort.key) && (v.sort.dir === "asc" || v.sort.dir === "desc") ? v.sort : DEFAULT_VIEW.sort;
+    const str = (x: unknown, d: string) => (typeof x === "string" ? x : d);
+    return { sort, conn: str(v.conn, "all"), network: str(v.network, ""), dtype: str(v.dtype, ""), status: str(v.status, "") };
+  } catch {
+    return DEFAULT_VIEW;
+  }
+}
+
+function saveView(v: ClientsView) {
+  try { localStorage.setItem(VIEW_KEY, JSON.stringify(v)); } catch { /* private mode: not kept */ }
+}
+
+/** An IPv4 address as a number, so .52 sorts before .100; no address last. */
+function ipOrder(ip?: string): number {
+  const m = /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/.exec(ip ?? "");
+  if (!m) return Number.MAX_SAFE_INTEGER;
+  return ((+m[1] * 256 + +m[2]) * 256 + +m[3]) * 256 + +m[4];
+}
+
+// Two per row on phones, their own width from sm up.
+const FILTER_SELECT = "h-9 min-w-0 basis-[calc(50%-0.25rem)] grow sm:basis-auto sm:grow-0 rounded-sm border border-border bg-surface-2 px-2.5 text-small text-text outline-none focus:border-accent ring-focus";
 
 function SignalBars({ signal, title }: { signal?: number; title?: string }) {
   const level = signal === undefined ? 0 : signal >= -55 ? 4 : signal >= -65 ? 3 : signal >= -75 ? 2 : 1;
@@ -141,7 +181,13 @@ export function ClientsPage() {
   const [rates, setRates] = useState<Record<string, { rx: number; tx: number }>>({});
   const [error, setError] = useState(false);
   const [query, setQuery] = useState("");
-  const [sort, setSort] = useState<{ key: SortKey; dir: SortDir }>({ key: "name", dir: "asc" });
+  const [view, setView] = useState<ClientsView>(loadView);
+  const sort = view.sort;
+  const updateView = (patch: Partial<ClientsView>) => setView((v) => {
+    const next = { ...v, ...patch };
+    saveView(next);
+    return next;
+  });
   const [busyMac, setBusyMac] = useState<string>();
   const [menuMac, setMenuMac] = useState<string>();
   const [editTarget, setEditTarget] = useState<Client>();
@@ -220,17 +266,51 @@ export function ClientsPage() {
     if (detailTarget) { loadQos(); loadQuota(); }
   }, [detailTarget, loadQos, loadQuota]);
 
+  // What the filters can offer: only what the list has.
+  const options = useMemo(() => {
+    const networks = new Set<string>();
+    const types = new Set<string>();
+    const conns = new Set<string>();
+    for (const c of clients ?? []) {
+      if (c.network) networks.add(c.network);
+      types.add(c.device_type || "other");
+      conns.add(c.type);
+    }
+    return { networks: [...networks].sort(), types: [...types].sort(), conns };
+  }, [clients]);
+
+  const typeLabel = useCallback((type?: string) =>
+    t(DEVICE_TYPES[(type || "other") as DeviceType]?.labelKey ?? "clients.type.other"), [t]);
+
+  const filtersOn = view.conn !== "all" || view.network !== "" || view.dtype !== "" || view.status !== "" || query.trim() !== "";
+  const clearFilters = () => { setQuery(""); updateView({ conn: "all", network: "", dtype: "", status: "" }); };
+
   const filtered = useMemo(() => {
     if (!clients) return undefined;
     const q = query.trim().toLowerCase();
-    if (!q) return clients;
-    return clients.filter((c) =>
-      c.name.toLowerCase().includes(q) ||
-      (c.ip ?? "").includes(q) ||
-      c.mac.toLowerCase().includes(q) ||
-      (c.device_type ?? "").includes(q)
-    );
-  }, [clients, query]);
+    const qHex = q.replace(/[^0-9a-f]/g, "");
+    return clients.filter((c) => {
+      if (view.conn === "wifi" ? c.type === "cable" : view.conn === "cable" ? c.type !== "cable" : view.conn !== "all" && c.type !== view.conn) return false;
+      if (view.network && c.network !== view.network) return false;
+      if (view.dtype && (c.device_type || "other") !== view.dtype) return false;
+      switch (view.status) {
+        case "blocked": if (!c.blocked && !(c.blocked_on?.length)) return false; break;
+        case "reserved": if (!c.reserved) return false; break;
+        case "limited": if (!c.parental_blocked && !c.quota_throttled && !c.quota_exceeded && !c.quota_limit) return false; break;
+        case "self": if (!c.self) return false; break;
+      }
+      if (!q) return true;
+      return c.name.toLowerCase().includes(q) ||
+        (c.ip ?? "").includes(q) ||
+        c.mac.toLowerCase().includes(q) ||
+        // A MAC typed without separators (or with dashes) still matches.
+        (qHex.length >= 4 && c.mac.toLowerCase().replace(/:/g, "").includes(qHex)) ||
+        (c.device_type ?? "").includes(q) ||
+        typeLabel(c.device_type).toLowerCase().includes(q) ||
+        (c.network ?? "").toLowerCase().includes(q) ||
+        (c.iface ?? "").toLowerCase().includes(q);
+    });
+  }, [clients, query, view, typeLabel]);
 
   const sorted = useMemo(() => {
     if (!filtered) return undefined;
@@ -240,7 +320,7 @@ export function ClientsPage() {
       switch (key) {
         case "name": return a.name.localeCompare(b.name) * mult;
         case "traffic": return ((a.rx_bytes + a.tx_bytes) - (b.rx_bytes + b.tx_bytes)) * mult;
-        case "ip": return ((a.ip ?? "") <= (b.ip ?? "") ? -1 : 1) * mult;
+        case "ip": return (ipOrder(a.ip) - ipOrder(b.ip)) * mult;
         case "type": return connectionKey(a).localeCompare(connectionKey(b)) * mult;
         case "lease": {
           const av = a.lease_expiry ?? Number.MAX_SAFE_INTEGER;
@@ -251,7 +331,7 @@ export function ClientsPage() {
     });
   }, [filtered, sort]);
 
-  const toggleSort = (key: SortKey) => setSort((s) => s.key === key ? { key, dir: s.dir === "asc" ? "desc" : "asc" } : { key, dir: "asc" });
+  const toggleSort = (key: SortKey) => updateView({ sort: sort.key === key ? { key, dir: sort.dir === "asc" ? "desc" : "asc" } : { key, dir: "asc" } });
 
   const typeSummary = useMemo(() => {
     const byType = new Map<string, number>();
@@ -460,16 +540,79 @@ export function ClientsPage() {
               <span className="text-caption" style={{ fontVariantNumeric: "tabular-nums" }}>{blockedList.length}</span>
             )}
           </button>
-          <div className="relative hidden sm:block">
-            <Search size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-muted" aria-hidden="true" />
-            <Input value={query} onChange={(e) => setQuery(e.target.value)}
-              placeholder={t("clients.search")} className="w-[21rem] pl-8" aria-label={t("clients.search")} />
-          </div>
         </div>}>
+        {clients && clients.length > 0 && (
+          <div className="mb-3 flex flex-col gap-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <div className="min-w-full sm:min-w-[12rem] flex-1">
+                <Input icon={Search} value={query} onChange={(e) => setQuery(e.target.value)} type="search"
+                  placeholder={t("clients.search")} aria-label={t("clients.search")} />
+              </div>
+              <select className={FILTER_SELECT} value={view.conn} onChange={(e) => updateView({ conn: e.target.value })}
+                aria-label={t("clients.filterConn")}>
+                <option value="all">{t("clients.connAll")}</option>
+                <option value="wifi">{t("clients.connWifi")}</option>
+                {options.conns.has("wifi24") && <option value="wifi24">{t("overview.band24")}</option>}
+                {options.conns.has("wifi5") && <option value="wifi5">{t("overview.band5")}</option>}
+                <option value="cable">{t("overview.cable")}</option>
+              </select>
+              {(options.networks.length > 1 || view.network) && (
+                <select className={FILTER_SELECT} value={view.network} onChange={(e) => updateView({ network: e.target.value })}
+                  aria-label={t("clients.filterNetwork")}>
+                  <option value="">{t("clients.networkAll")}</option>
+                  {options.networks.map((n) => <option key={n} value={n}>{n}</option>)}
+                  {view.network && !options.networks.includes(view.network) && <option value={view.network}>{view.network}</option>}
+                </select>
+              )}
+              {(options.types.length > 1 || view.dtype) && (
+                <select className={FILTER_SELECT} value={view.dtype} onChange={(e) => updateView({ dtype: e.target.value })}
+                  aria-label={t("clients.filterType")}>
+                  <option value="">{t("clients.typeAll")}</option>
+                  {options.types.map((k) => <option key={k} value={k}>{typeLabel(k)}</option>)}
+                  {view.dtype && !options.types.includes(view.dtype) && <option value={view.dtype}>{typeLabel(view.dtype)}</option>}
+                </select>
+              )}
+              <select className={FILTER_SELECT} value={view.status} onChange={(e) => updateView({ status: e.target.value })}
+                aria-label={t("clients.filterStatus")}>
+                <option value="">{t("clients.statusAll")}</option>
+                <option value="blocked">{t("clients.statusBlocked")}</option>
+                <option value="reserved">{t("clients.statusReserved")}</option>
+                <option value="limited">{t("clients.statusLimited")}</option>
+                <option value="self">{t("clients.statusSelf")}</option>
+              </select>
+              {/* The table's headers sort on wide screens; phones get this. */}
+              <span className="flex w-full sm:w-auto items-center gap-1 md:hidden">
+                <select className={FILTER_SELECT} value={sort.key} onChange={(e) => updateView({ sort: { key: e.target.value as SortKey, dir: sort.dir } })}
+                  aria-label={t("clients.sortBy")}>
+                  <option value="name">{t("clients.name")}</option>
+                  <option value="ip">{t("clients.ip")}</option>
+                  <option value="traffic">{t("clients.traffic")}</option>
+                  <option value="type">{t("clients.connection")}</option>
+                  <option value="lease">{t("clients.leaseCol")}</option>
+                </select>
+                <button type="button" onClick={() => updateView({ sort: { key: sort.key, dir: sort.dir === "asc" ? "desc" : "asc" } })}
+                  aria-label={t(sort.dir === "asc" ? "clients.sortAsc" : "clients.sortDesc")} title={t(sort.dir === "asc" ? "clients.sortAsc" : "clients.sortDesc")}
+                  className="inline-flex h-9 w-9 items-center justify-center rounded-sm border border-border bg-surface-2 text-muted hover:text-text ring-focus">
+                  {sort.dir === "asc" ? <ArrowUp size={14} /> : <ArrowDown size={14} />}
+                </button>
+              </span>
+            </div>
+            {filtersOn && (
+              <p className="text-caption text-muted">
+                {t("clients.showing", { shown: sorted?.length ?? 0, total: clients.length })}
+                {" · "}
+                <button type="button" onClick={clearFilters} className="text-accent hover:underline ring-focus rounded-sm">{t("clients.clearFilters")}</button>
+              </p>
+            )}
+          </div>
+        )}
         {error ? (
           <EmptyState small title={t("common.loadError")} action={<Button variant="secondary" size="sm" onClick={load}>{t("common.retry")}</Button>} />
         ) : !sorted ? (
           <SkeletonRows rows={4} />
+        ) : sorted.length === 0 && clients && clients.length > 0 ? (
+          <EmptyState small title={t("clients.noMatch")}
+            action={<Button variant="secondary" size="sm" onClick={clearFilters}>{t("clients.clearFilters")}</Button>} />
         ) : sorted.length === 0 ? (
           <EmptyState illustration={<IlluDevices size={120} />} title={t("overview.devicesEmpty")} body={t("overview.devicesEmptyBody")} />
         ) : (
@@ -507,7 +650,10 @@ export function ClientsPage() {
                     <td className="py-1.5 px-3 w-32 font-mono text-caption whitespace-nowrap" style={{ fontVariantNumeric: "tabular-nums" }}>
                       {fmtBytes(c.rx_bytes + c.tx_bytes)}
                     </td>
-                    <td className="py-1.5 px-3 w-40"><span className="font-mono text-caption">{c.ip ?? "—"}</span></td>
+                    <td className="py-1.5 px-3 w-40">
+                      <span className="font-mono text-caption">{c.ip ?? "—"}</span>
+                      {c.network && <span className="block text-caption text-faint truncate" title={t("clients.filterNetwork")}>{c.network}</span>}
+                    </td>
                     <td className="py-1.5 px-3 w-32 text-caption text-muted whitespace-nowrap"
                       style={{ fontVariantNumeric: "tabular-nums" }} title={lease.title}>
                       {lease.text}
@@ -527,7 +673,7 @@ export function ClientsPage() {
                   </div>
                   <div className="mt-1.5 flex items-center justify-between pl-12">
                     <span className="font-mono text-caption text-muted">
-                      {c.ip ?? c.mac} · {fmtBytes(c.rx_bytes + c.tx_bytes)}
+                      {c.ip ?? c.mac}{c.network ? ` · ${c.network}` : ""} · {fmtBytes(c.rx_bytes + c.tx_bytes)}
                       {c.lease_expiry && ` · ${leaseCell(c, t).text}`}
                     </span>
                     {actions(c)}

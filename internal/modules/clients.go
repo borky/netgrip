@@ -3,6 +3,7 @@ package modules
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"regexp"
@@ -51,6 +52,9 @@ type Client struct {
 	QuotaPeriod    string `json:"quota_period,omitempty"`
 	QuotaThrottled bool   `json:"quota_throttled,omitempty"`
 	QuotaExceeded  bool   `json:"quota_exceeded,omitempty"`
+	// Network: the router interface whose subnet holds the client's
+	// address (lan, iot, ...), so the list can be filtered by it.
+	Network string `json:"network,omitempty"`
 }
 
 var reMac = regexp.MustCompile(`^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$`)
@@ -167,6 +171,11 @@ func ListClients(requesterIP string) []Client {
 				clients = append(clients, c)
 			}
 		}
+	}
+
+	subnets := clientSubnetsFn()
+	for i := range clients {
+		clients[i].Network = networkForIP(clients[i].IP, subnets)
 	}
 
 	// Apply user-assigned metadata (custom name + device type) overrides.
@@ -928,4 +937,38 @@ func uciShellCommands(ops []executor.Op) []string {
 		}
 	}
 	return out
+}
+
+// clientSubnetsFn: the router's interface subnets, read at most every 30 s
+// (the clients page polls every few seconds). A seam for tests.
+var clientSubnetsFn = func() []ubus.Subnet {
+	v, _ := CachedRead("clients|subnets", 30*time.Second, func() ([]ubus.Subnet, error) {
+		return ubus.DumpSubnets()
+	})
+	return v
+}
+
+// networkForIP names the interface whose subnet holds ip: the most
+// specific one, ignoring point-to-point and host routes (/31, /32: an
+// uplink's own address, not a network clients live on).
+func networkForIP(ip string, subnets []ubus.Subnet) string {
+	addr := net.ParseIP(ip)
+	if addr == nil || addr.To4() == nil {
+		return ""
+	}
+	best, bestMask := "", -1
+	for _, s := range subnets {
+		if s.Mask < 1 || s.Mask > 30 || s.Mask <= bestMask {
+			continue
+		}
+		base := net.ParseIP(s.Address)
+		if base == nil || base.To4() == nil {
+			continue
+		}
+		n := net.IPNet{IP: base.Mask(net.CIDRMask(s.Mask, 32)), Mask: net.CIDRMask(s.Mask, 32)}
+		if n.Contains(addr) {
+			best, bestMask = s.Interface, s.Mask
+		}
+	}
+	return best
 }

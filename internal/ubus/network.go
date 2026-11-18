@@ -378,3 +378,38 @@ func ActiveWANDevice() string {
 	}
 	return iface.Device
 }
+
+// Subnet is one IPv4 network a router interface sits on.
+type Subnet struct {
+	Interface string // the netifd interface (lan, iot, ...)
+	Address   string
+	Mask      int
+}
+
+// ParseSubnets lists the IPv4 subnets of the interfaces that are up, from
+// a `network.interface dump` payload. Pure, for tests.
+func ParseSubnets(raw []byte) ([]Subnet, error) {
+	var dump interfaceDump
+	if err := json.Unmarshal(raw, &dump); err != nil {
+		return nil, err
+	}
+	out := []Subnet{}
+	for _, i := range dump.Interface {
+		if !i.Up {
+			continue
+		}
+		for _, a := range i.IPv4 {
+			out = append(out, Subnet{Interface: i.Interface, Address: a.Address, Mask: a.Mask})
+		}
+	}
+	return out, nil
+}
+
+// DumpSubnets is ParseSubnets on the router's live interfaces.
+func DumpSubnets() ([]Subnet, error) {
+	raw, err := Call("network.interface", "dump")
+	if err != nil {
+		return []Subnet{}, err
+	}
+	return ParseSubnets(raw)
+}
