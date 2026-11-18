@@ -21,9 +21,9 @@ package modules
 // point (its list is its Wi-Fi stations) or to Wi-Fi ports.
 
 import (
+	"encoding/binary"
 	"net"
 	"os"
-	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
@@ -62,7 +62,7 @@ var (
 	// The router's mode and LAN bridge, from the panel's caches: the tick
 	// runs every minute for good, and probing them forks several commands.
 	keepaliveModeFn = func() string {
-		p, _ := CachedRead("mode", 2*time.Minute, func() (*ModeProbe, error) { return probeModeFn(), nil })
+		p, _ := CachedRead("mode", 10*time.Minute, func() (*ModeProbe, error) { return probeModeFn(), nil })
 		if p == nil {
 			return ""
 		}
@@ -94,10 +94,11 @@ func StartWiredKeepalive() {
 
 // wiredKeepaliveTick probes the wired MACs about to be forgotten. It
 // returns the addresses it probed (for tests).
+//
+// Most ticks cost two small file reads (sysfs): the router's mode, the
+// ARP table and its subnets are looked at only when some wired MAC is
+// actually close to its ageing time.
 func wiredKeepaliveTick(now time.Time) []string {
-	if keepaliveModeFn() == "ap" {
-		return nil
-	}
 	bridge := keepaliveBridgeFn()
 	if bridge == "" {
 		return nil
@@ -109,19 +110,29 @@ func wiredKeepaliveTick(now time.Time) []string {
 		return nil
 	}
 	ages := fdbAgesFn(bridge)
-	if len(ages) == 0 {
-		return nil
-	}
 	threshold := ageing - keepaliveMargin
-	arp := keepaliveArpFn(bridge)
-	subnets := clientSubnetsFn()
+	var due []string
+	for mac, e := range ages {
+		if e.age >= threshold && !isWirelessPortFn(e.port) {
+			due = append(due, mac)
+		}
+	}
 	keepaliveMu.Lock()
 	defer keepaliveMu.Unlock()
-	var sent []string
-	for mac, e := range ages {
-		if e.age < threshold || isWirelessPortFn(e.port) {
-			continue
+	// Forget MACs the bridge no longer has: the map stays as small as the
+	// bridge table.
+	for mac := range keepaliveLast {
+		if _, ok := ages[mac]; !ok {
+			delete(keepaliveLast, mac)
 		}
+	}
+	if len(due) == 0 || keepaliveModeFn() == "ap" {
+		return nil
+	}
+	arp := keepaliveArpFn(bridge)
+	subnets := clientSubnetsFn()
+	var sent []string
+	for _, mac := range due {
 		var ips []string
 		for _, r := range arp[mac] {
 			if onDeviceSubnet(r.ip, r.dev, subnets) {
@@ -140,13 +151,6 @@ func wiredKeepaliveTick(now time.Time) []string {
 			sent = append(sent, ip)
 		}
 	}
-	// Forget MACs the bridge no longer has: the map stays as small as the
-	// bridge table.
-	for mac := range keepaliveLast {
-		if _, ok := ages[mac]; !ok {
-			delete(keepaliveLast, mac)
-		}
-	}
 	return sent
 }
 
@@ -161,62 +165,51 @@ func keepaliveSend(ip string) {
 	_ = conn.Close()
 }
 
-// fdbAges reads the bridge's forwarding table with each entry's age
-// (brctl showmacs: port no, mac, is local, ageing timer in seconds), the
-// youngest per MAC. Local entries (the router's own ports) are left out.
+// fdbAges reads the bridge's forwarding table with each entry's age, the
+// youngest per MAC, from sysfs (brforward: the kernel's own records, no
+// command to run and no tool needed). Local entries (the router's own
+// ports) are left out.
 func fdbAges(bridge string) map[string]fdbAge {
-	brifDir := "/sys/class/net/" + bridge + "/brif"
-	entries, err := os.ReadDir(brifDir)
+	brif := sysNetDir + "/" + bridge + "/brif"
+	entries, err := os.ReadDir(brif)
 	if err != nil {
 		return nil
 	}
-	portNames := map[int]string{}
+	ports := map[int]string{}
 	for _, e := range entries {
-		data, err := os.ReadFile(brifDir + "/" + e.Name() + "/port_id")
+		data, err := os.ReadFile(brif + "/" + e.Name() + "/port_no")
 		if err != nil {
 			continue
 		}
-		id, err := strconv.ParseInt(strings.TrimSpace(string(data)), 0, 64)
+		n, err := strconv.ParseInt(strings.TrimSpace(string(data)), 0, 64)
 		if err != nil {
 			continue
 		}
-		portNames[int(id&0xff)] = e.Name()
+		ports[int(n)] = e.Name()
 	}
-	out, err := exec.Command("brctl", "showmacs", bridge).Output()
+	raw, err := os.ReadFile(sysNetDir + "/" + bridge + "/brforward")
 	if err != nil {
 		return nil
 	}
-	return parseFdbAges(string(out), portNames)
+	return parseBrforward(raw, ports)
 }
 
-func parseFdbAges(out string, portNames map[int]string) map[string]fdbAge {
+// parseBrforward reads brforward's records, struct __fdb_entry (16 bytes):
+// mac[6], port_no, is_local, ageing_timer_value (u32, hundredths of a
+// second, the CPU's own byte order), port_hi, pad, unused[2].
+func parseBrforward(raw []byte, ports map[int]string) map[string]fdbAge {
 	ages := map[string]fdbAge{}
-	lines := strings.Split(out, "\n")
-	if len(lines) > 0 {
-		lines = lines[1:] // header
-	}
-	for _, line := range lines {
-		f := strings.Fields(line)
-		if len(f) < 4 || f[2] == "yes" {
+	for off := 0; off+16 <= len(raw); off += 16 {
+		r := raw[off : off+16]
+		if r[7] != 0 { // is_local
 			continue
 		}
-		portNo, err := strconv.Atoi(f[0])
-		if err != nil {
-			continue
-		}
-		port, ok := portNames[portNo]
+		port, ok := ports[int(r[12])<<8|int(r[6])]
 		if !ok {
 			continue
 		}
-		mac := strings.ToLower(f[1])
-		if !reMac.MatchString(mac) {
-			continue
-		}
-		secs, err := strconv.ParseFloat(f[3], 64)
-		if err != nil {
-			continue
-		}
-		age := time.Duration(secs * float64(time.Second))
+		mac := net.HardwareAddr(r[0:6]).String()
+		age := time.Duration(binary.NativeEndian.Uint32(r[8:12])) * 10 * time.Millisecond
 		if cur, ok := ages[mac]; !ok || age < cur.age {
 			ages[mac] = fdbAge{port: port, age: age}
 		}
@@ -227,7 +220,7 @@ func parseFdbAges(out string, portNames map[int]string) map[string]fdbAge {
 // bridgeAgeing is how long the bridge keeps a quiet MAC (sysfs, in
 // hundredths of a second).
 func bridgeAgeing(bridge string) time.Duration {
-	data, err := os.ReadFile("/sys/class/net/" + bridge + "/bridge/ageing_time")
+	data, err := os.ReadFile(sysNetDir + "/" + bridge + "/bridge/ageing_time")
 	if err != nil {
 		return 0
 	}

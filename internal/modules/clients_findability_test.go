@@ -1,6 +1,8 @@
 package modules
 
 import (
+	"encoding/binary"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -45,19 +47,58 @@ func TestParseSubnetsSkipsDownInterfaces(t *testing.T) {
 	}
 }
 
-func TestParseFdbAges(t *testing.T) {
-	out := "port no\tmac addr\t\tis local?\tageing timer\n" +
-		"  1\t02:00:00:00:00:01\tno\t\t 211.85\n" +
-		"  1\t02:00:00:00:00:01\tno\t\t  12.00\n" + // same MAC, another VLAN: the youngest wins
-		"  2\t02:00:00:00:00:02\tno\t\t   0.44\n" +
-		"  1\t02:00:00:00:00:aa\tyes\t\t   0.00\n" + // local
-		"  9\t02:00:00:00:00:03\tno\t\t   1.00\n" // unknown port
-	ages := parseFdbAges(out, map[int]string{1: "lan2", 2: "phy1-ap0"})
+// fdbRecord builds one brforward record (struct __fdb_entry).
+func fdbRecord(mac string, port int, local bool, ageCS uint32) []byte {
+	r := make([]byte, 16)
+	hw, _ := net.ParseMAC(mac)
+	copy(r[0:6], hw)
+	r[6] = byte(port & 0xff)
+	if local {
+		r[7] = 1
+	}
+	binary.NativeEndian.PutUint32(r[8:12], ageCS)
+	r[12] = byte(port >> 8)
+	return r
+}
+
+func TestParseBrforward(t *testing.T) {
+	var raw []byte
+	raw = append(raw, fdbRecord("02:00:00:00:00:01", 1, false, 21185)...)
+	raw = append(raw, fdbRecord("02:00:00:00:00:01", 1, false, 1200)...) // another VLAN: the youngest wins
+	raw = append(raw, fdbRecord("02:00:00:00:00:02", 300, false, 44)...) // a port past 255
+	raw = append(raw, fdbRecord("02:00:00:00:00:aa", 1, true, 0)...)     // local
+	raw = append(raw, fdbRecord("02:00:00:00:00:03", 9, false, 100)...)  // unknown port
+	raw = append(raw, 1, 2, 3)                                           // a torn record is ignored
+	ages := parseBrforward(raw, map[int]string{1: "lan2", 300: "lan300"})
 	if len(ages) != 2 {
 		t.Fatalf("ages = %+v", ages)
 	}
 	if a := ages["02:00:00:00:00:01"]; a.port != "lan2" || a.age != 12*time.Second {
 		t.Errorf("youngest entry not kept: %+v", a)
+	}
+	if a := ages["02:00:00:00:00:02"]; a.port != "lan300" || a.age != 440*time.Millisecond {
+		t.Errorf("high port: %+v", a)
+	}
+}
+
+func TestFdbAgesFromSysfs(t *testing.T) {
+	dir := t.TempDir()
+	old := sysNetDir
+	sysNetDir = dir
+	t.Cleanup(func() { sysNetDir = old })
+	if err := os.MkdirAll(filepath.Join(dir, "br0/brif/eth1"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(dir, "br0/brif/eth1/port_no"), []byte("0x2\n"), 0o644)
+	os.WriteFile(filepath.Join(dir, "br0/brforward"), fdbRecord("02:00:00:00:00:05", 2, false, 25000), 0o644)
+	os.MkdirAll(filepath.Join(dir, "br0/bridge"), 0o755)
+	os.WriteFile(filepath.Join(dir, "br0/bridge/ageing_time"), []byte("30000\n"), 0o644)
+	ages := fdbAges("br0")
+	if a := ages["02:00:00:00:00:05"]; a.port != "eth1" || a.age != 250*time.Second {
+		t.Fatalf("fdbAges = %+v", ages)
+	}
+	if got := bridgeAgeing("br0"); got != 300*time.Second {
+		t.Fatalf("ageing = %v", got)
 	}
 }
 
