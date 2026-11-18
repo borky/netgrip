@@ -103,6 +103,24 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+/** Allow list changes answer an AllowResult on success and on refusal
+ *  alike (409: the change needs the user's confirmation; 500: it failed),
+ *  so the page can show the reason instead of a bare error. */
+async function allowRequest(path: string, body: unknown): Promise<import("./types").AllowResult> {
+  const res = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (res.status === 401) {
+    if (onUnauthorized) onUnauthorized();
+    throw new UnauthorizedError();
+  }
+  const data = await res.json().catch(() => ({})) as import("./types").AllowResult;
+  if (!data.status) return { status: "failed", error: data.error || `HTTP ${res.status}` };
+  return data;
+}
+
 /** POST helper for the quarantine endpoints (they all answer QResult). */
 function postQ(path: string, body: unknown) {
   return request<import("./types").QResult>(path, {
@@ -416,11 +434,26 @@ const realApi = {
       body: JSON.stringify({ iface }),
     }),
   portforward: () => request<import("./types").FwdProbe>("/api/portforward"),
-  addFwdRule: (src_dport: string, dest_ip: string, dest_port: string, proto: string) =>
+  allowlists: () => request<import("./types").AllowProbe>("/api/allowlists"),
+  saveAllowlist: (list: { id?: string; name: string; keep_hours: number; entries: import("./types").AllowEntry[]; force?: boolean }) =>
+    allowRequest("/api/allowlists", list),
+  deleteAllowlist: (id: string) => allowRequest("/api/allowlists/delete", { id }),
+  allowUse: (req: {
+    section: string;
+    list: string;
+    expect?: { name: string; port: string; proto: string; kind: string };
+    open_to_anyone?: boolean;
+    force?: boolean;
+  }) => allowRequest("/api/allowlists/use", req),
+  allowTakeoverInfo: (set: string) =>
+    request<import("./types").AllowExternal>(`/api/allowlists/takeover?set=${encodeURIComponent(set)}`),
+  allowTakeover: (req: { set: string; name: string; keep_hours: number; entries: import("./types").AllowEntry[]; force?: boolean }) =>
+    allowRequest("/api/allowlists/takeover", req),
+  addFwdRule: (src_dport: string, dest_ip: string, dest_port: string, proto: string, allow_list = "") =>
     request<import("./types").ModuleResult<import("./types").FwdProbe>>("/api/portforward", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ src_dport, dest_ip, dest_port, proto }),
+      body: JSON.stringify({ src_dport, dest_ip, dest_port, proto, allow_list }),
     }),
   deleteFwdRule: (section: string) =>
     request<import("./types").ModuleResult<import("./types").FwdProbe>>("/api/portforward/delete", {

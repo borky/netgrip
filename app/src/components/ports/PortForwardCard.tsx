@@ -6,7 +6,7 @@ import {
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { api } from "../../api";
-import type { Client, FwdProbe, FwdRule } from "../../types";
+import type { AllowListView, Client, FwdProbe, FwdRule } from "../../types";
 import {
   ActionBanner, Banner, Button, Card, ConfirmDialog, EmptyState,
   Field, IconTile, Input, Modal, Pill, SegmentedControl, SkeletonRows,
@@ -14,6 +14,7 @@ import {
 import { IlluPlug } from "../ui/illustrations";
 import { useActionCycle } from "../wifi/action";
 import { isValidIp } from "../lan/LanConfigCard";
+import { AllowedFromChip, AllowedFromDialog, type AllowTarget } from "./AllowLists";
 
 interface FwdTemplate {
   id: string;
@@ -38,24 +39,33 @@ function ruleName(t: TFunction, r: FwdRule): string {
 }
 
 /** Card "Abrir algo a Internet" (ports.md §2) + plantillas rápidas (§3). */
-export function PortForwardCard({ probe, onChange }: {
+export function PortForwardCard({ probe, onChange, onAllowChanged }: {
   probe: FwdProbe | undefined;
   onChange: (p: FwdProbe) => void;
+  /** A port's allow list changed (the lists card shows who uses what). */
+  onAllowChanged?: () => void;
 }) {
   const { t } = useTranslation();
   const { phase, detail, busy, run, clear } = useActionCycle();
   const [modal, setModal] = useState<FwdTemplate>();
   const [toDelete, setToDelete] = useState<FwdRule>();
+  const [allowFor, setAllowFor] = useState<AllowTarget>();
 
   const applicable = !!probe?.has_wan && !!probe?.firewall;
 
-  const addRule = (srcDport: string, destIP: string, destPort: string, proto: string) => {
-    run(() => api.addFwdRule(srcDport, destIP, destPort, proto)).then((res) => {
+  const addRule = (srcDport: string, destIP: string, destPort: string, proto: string, allowList: string) => {
+    run(() => api.addFwdRule(srcDport, destIP, destPort, proto, allowList)).then((res) => {
       if (res?.status === "applied") {
         onChange(res.state);
         setModal(undefined);
+        if (allowList) onAllowChanged?.();
       }
     });
+  };
+
+  const refresh = () => {
+    api.portforward().then(onChange).catch(() => {});
+    onAllowChanged?.();
   };
 
   const deleteRule = (r: FwdRule) => {
@@ -114,6 +124,13 @@ export function PortForwardCard({ probe, onChange }: {
                     <span className="font-mono text-caption text-muted uppercase bg-surface-2 border border-border rounded-sm px-1.5 py-0.5">
                       {r.proto}
                     </span>
+                    {r.allowed_from && (
+                      <AllowedFromChip
+                        af={r.allowed_from}
+                        disabled={busy}
+                        onClick={() => setAllowFor({ section: r.section, label: ruleName(t, r), rule: r, current: r.allowed_from })}
+                      />
+                    )}
                     <span className="flex-1" />
                     <Pill tone="ok">{t("fwd.active")}</Pill>
                     {/* Only what NetGrip created is removable from here;
@@ -186,6 +203,8 @@ export function PortForwardCard({ probe, onChange }: {
         onConfirm={addRule}
       />
 
+      <AllowedFromDialog target={allowFor} onClose={() => setAllowFor(undefined)} onApplied={refresh} />
+
       <ConfirmDialog
         open={!!toDelete}
         onClose={() => setToDelete(undefined)}
@@ -206,7 +225,7 @@ function NewRuleModal({ template, probe, busy, onClose, onConfirm }: {
   probe: FwdProbe | undefined;
   busy: boolean;
   onClose: () => void;
-  onConfirm: (srcDport: string, destIP: string, destPort: string, proto: string) => void;
+  onConfirm: (srcDport: string, destIP: string, destPort: string, proto: string, allowList: string) => void;
 }) {
   const { t } = useTranslation();
   const [sel, setSel] = useState<FwdTemplate>(TEMPLATES[0]);
@@ -215,6 +234,8 @@ function NewRuleModal({ template, probe, busy, onClose, onConfirm }: {
   const [destPort, setDestPort] = useState("");
   const [proto, setProto] = useState("tcp");
   const [clients, setClients] = useState<Client[]>([]);
+  const [lists, setLists] = useState<AllowListView[]>();
+  const [allowList, setAllowList] = useState("");
 
   // Pre-relleno al abrir con una plantilla.
   useEffect(() => {
@@ -232,6 +253,21 @@ function NewRuleModal({ template, probe, busy, onClose, onConfirm }: {
     api.clients().then((r) => setClients(r.clients.filter((c) => !!c.ip && !c.self))).catch(() => {});
   }, [template]);
 
+  // Allow lists for "Who may reach it?". With lists, a new port starts
+  // limited to the first one: opening to everyone is a choice, not a default.
+  useEffect(() => {
+    if (!template) return;
+    setLists(undefined);
+    setAllowList("");
+    api.allowlists()
+      .then((p) => {
+        const ls = p.supported ? p.lists : [];
+        setLists(ls);
+        setAllowList(ls[0]?.id ?? "");
+      })
+      .catch(() => setLists([]));
+  }, [template]);
+
   const portOk = (p: string) => /^\d+$/.test(p) && Number(p) >= 1 && Number(p) <= 65535;
   const duplicate = probe?.rules.some((r) => r.src_dport === srcDport && srcDport !== "");
   const valid = portOk(srcDport) && portOk(destPort) && isValidIp(destIP) && !duplicate;
@@ -241,7 +277,7 @@ function NewRuleModal({ template, probe, busy, onClose, onConfirm }: {
       footer={
         <>
           <Button variant="ghost" onClick={onClose}>{t("common.cancel")}</Button>
-          <Button onClick={() => onConfirm(srcDport, destIP, destPort, proto)} disabled={!valid} loading={busy}>
+          <Button onClick={() => onConfirm(srcDport, destIP, destPort, proto, allowList)} disabled={!valid || lists === undefined} loading={busy}>
             {t("fwd.open")}
           </Button>
         </>
@@ -305,6 +341,26 @@ function NewRuleModal({ template, probe, busy, onClose, onConfirm }: {
           ]}
         />
       </div>
+
+      {/* 4. Who may reach it? */}
+      <p className="text-small font-medium mt-4 mb-2">{t("allow.stepWho")}</p>
+      <select
+        className="h-9 w-full rounded-sm border border-border bg-surface-2 px-2.5 text-small text-text outline-none focus:border-accent ring-focus"
+        value={allowList}
+        onChange={(e) => setAllowList(e.target.value)}
+        disabled={lists === undefined}
+        aria-label={t("allow.stepWho")}
+      >
+        {(lists ?? []).map((l) => (
+          <option key={l.id} value={l.id}>{l.name}</option>
+        ))}
+        <option value="">{t("allow.anyoneLong")}</option>
+      </select>
+      <p className={`text-caption mt-1 ${allowList === "" ? "text-warn" : "text-muted"}`}>
+        {allowList === ""
+          ? (lists && lists.length === 0 ? t("allow.stepWhoNoLists") : t("allow.anyoneDetail"))
+          : t("allow.stepWhoList")}
+      </p>
     </Modal>
   );
 }

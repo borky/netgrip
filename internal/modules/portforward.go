@@ -1,6 +1,7 @@
 package modules
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"regexp"
@@ -32,6 +33,8 @@ type FwdRule struct {
 	// Anything set up in LuCI or by hand is listed read-only: hiding it
 	// would be worse than not offering to delete it.
 	Managed bool `json:"managed"`
+	// AllowedFrom: who may reach it (anyone, or an allow list).
+	AllowedFrom *AllowedFrom `json:"allowed_from,omitempty"`
 }
 
 // FwdProbe is the read-only port forwarding state.
@@ -40,6 +43,15 @@ type FwdProbe struct {
 	Firewall bool      `json:"firewall"`
 	Rules    []FwdRule `json:"rules"`
 }
+
+// Seams for tests.
+var (
+	fwdApplyFn           = executor.Apply
+	fwdSnapshotFn        = executor.Snapshot
+	fwdRestoreFn         = executor.Restore
+	fwdRunFn             = executor.Run
+	fwdFirewallEnabledFn = func() bool { return executor.ServiceEnabled("firewall") }
+)
 
 var (
 	reIPv4       = regexp.MustCompile(`^(\d{1,3}\.){3}\d{1,3}$`)
@@ -190,61 +202,35 @@ func parseStockNames(config string) map[string]bool {
 func ProbeFwd() *FwdProbe {
 	p := &FwdProbe{
 		HasWan:   hasUplink(),
-		Firewall: executor.ServiceEnabled("firewall"),
+		Firewall: fwdFirewallEnabledFn(),
 		Rules:    []FwdRule{},
 	}
 	wanZones := internetZones()
 	stock := stockRuleNames()
+	// One `uci show` for the whole page, not a `uci get` per option.
+	show, _ := uciShowCached("firewall")
+	secs := parseUCIShow(show, "firewall")
+	names := allowListNames()
 
 	// DNAT redirects: a port on the router handed to a host on the LAN.
 	// Only those coming FROM the Internet — a redirect from an internal
 	// zone is something else entirely (forcing local DNS, say), and
 	// counting it as an exposure would be alarming and wrong.
 	for _, section := range firewallSections("redirect") {
-		base := "firewall." + section
-		if uciGet(base+".enabled") == "0" || !wanZones[uciGet(base+".src")] {
-			continue
+		if r, ok := fwdRuleOf(section, secs[section], wanZones, stock, secs, names); ok {
+			p.Rules = append(p.Rules, r)
 		}
-		if t := uciGet(base + ".target"); t != "" && t != "DNAT" {
-			continue
-		}
-		p.Rules = append(p.Rules, FwdRule{
-			Section:  section,
-			Name:     uciGet(base + ".name"),
-			SrcDport: uciGet(base + ".src_dport"),
-			DestIP:   uciGet(base + ".dest_ip"),
-			DestPort: uciGet(base + ".dest_port"),
-			Proto:    uciGet(base + ".proto"),
-			Kind:     "forward",
-			Managed:  reFwdSection.MatchString(section),
-		})
 	}
 
 	// Input rules: a port open on the router itself. No dest zone means the
 	// traffic ends here; with a dest it is a forward between zones, which
 	// is a different question. A rule with no port is a protocol allowance
-	// (ping, ESP), not an open port.
+	// (ping, ESP), not an open port. NetGrip's IPv6 twins of rules limited
+	// to an allow list are part of their rule, not listed on their own.
 	for _, section := range firewallSections("rule") {
-		base := "firewall." + section
-		if uciGet(base+".enabled") == "0" || uciGet(base+".target") != "ACCEPT" {
-			continue
+		if r, ok := fwdRuleOf(section, secs[section], wanZones, stock, secs, names); ok {
+			p.Rules = append(p.Rules, r)
 		}
-		if !wanZones[uciGet(base+".src")] || uciGet(base+".dest") != "" {
-			continue
-		}
-		port := uciGet(base + ".dest_port")
-		name := uciGet(base + ".name")
-		if port == "" || stock[name] {
-			continue
-		}
-		p.Rules = append(p.Rules, FwdRule{
-			Section:  section,
-			Name:     name,
-			SrcDport: port,
-			Proto:    uciGet(base + ".proto"),
-			Kind:     "input",
-			Managed:  reFwdSection.MatchString(section),
-		})
 	}
 	return p
 }
@@ -267,7 +253,11 @@ func validProto(p string) bool {
 }
 
 // AddFwdRule creates a redirect rule with snapshot, reload and rollback.
-func AddFwdRule(srcDport, destIP, destPort, proto string) (*FwdProbe, bool, error) {
+// With allowList the forward is limited to that list from the start: it is
+// never reachable from anyone, not even for the moment between two changes.
+func AddFwdRule(srcDport, destIP, destPort, proto, allowList string) (*FwdProbe, bool, error) {
+	fwWriteMu.Lock()
+	defer fwWriteMu.Unlock()
 	InvalidateKey("ucishow|firewall")
 	InvalidateKey("portforward")
 	if err := fwdApplicable(); err != nil {
@@ -281,13 +271,13 @@ func AddFwdRule(srcDport, destIP, destPort, proto string) (*FwdProbe, bool, erro
 			return ProbeFwd(), false, fmt.Errorf("a rule for external port %s already exists", srcDport)
 		}
 	}
-	snap, err := executor.Snapshot("firewall")
+	snap, err := fwdSnapshotFn("firewall")
 	if err != nil {
 		return nil, false, err
 	}
 	rollback := func() {
-		_ = executor.Restore("firewall", snap)
-		_ = executor.Run(executor.Op{Kind: "initd", Args: []string{"firewall", "reload"}})
+		_ = fwdRestoreFn("firewall", snap)
+		_ = fwdRunFn(executor.Op{Kind: "initd", Args: []string{"firewall", "reload"}})
 	}
 
 	section := fwdPrefix + srcDport + "_" + strings.ReplaceAll(destIP, ".", "_")
@@ -302,17 +292,41 @@ func AddFwdRule(srcDport, destIP, destPort, proto string) (*FwdProbe, bool, erro
 		{Kind: "uci_set", Args: []string{base + ".dest_ip", destIP}},
 		{Kind: "uci_set", Args: []string{base + ".dest_port", destPort}},
 		{Kind: "uci_set", Args: []string{base + ".proto", proto}},
-		{Kind: "uci_commit", Args: []string{"firewall"}},
-		{Kind: "initd", Args: []string{"firewall", "reload"}},
 	}
-	if err := executor.Apply(ops, nil); err != nil {
+	var allowSets []string
+	if allowList != "" {
+		if r := allowUnsupportedReason(); r != "" {
+			return ProbeFwd(), false, errors.New(r)
+		}
+		more, sets, err := allowAddForwardOps(section, allowList)
+		if err != nil {
+			return ProbeFwd(), false, err
+		}
+		ops, allowSets = append(ops, more...), sets
+	}
+	ops = append(ops,
+		executor.Op{Kind: "uci_commit", Args: []string{"firewall"}},
+		executor.Op{Kind: "initd", Args: []string{"firewall", "reload"}})
+	if err := fwdApplyFn(ops, nil); err != nil {
 		rollback()
 		return ProbeFwd(), true, err
 	}
+	InvalidateKey("ucishow|firewall")
 	for _, r := range ProbeFwd().Rules {
-		if r.Section == section {
-			return ProbeFwd(), false, nil
+		if r.Section != section {
+			continue
 		}
+		if allowList != "" {
+			if err := allowVerifyRunning(allowSets); err != nil || r.AllowedFrom == nil || r.AllowedFrom.List != allowList {
+				rollback()
+				if err == nil {
+					err = errors.New("the forward is not limited to the list")
+				}
+				return ProbeFwd(), true, fmt.Errorf("%w; rolled back", err)
+			}
+			allowForwardAdded(allowList)
+		}
+		return ProbeFwd(), false, nil
 	}
 	rollback()
 	return ProbeFwd(), true, fmt.Errorf("rule not present after reload, rolled back")
@@ -320,6 +334,8 @@ func AddFwdRule(srcDport, destIP, destPort, proto string) (*FwdProbe, bool, erro
 
 // RemoveFwdRule deletes a redirect rule by section.
 func RemoveFwdRule(section string) (*FwdProbe, bool, error) {
+	fwWriteMu.Lock()
+	defer fwWriteMu.Unlock()
 	InvalidateKey("ucishow|firewall")
 	InvalidateKey("portforward")
 	if err := fwdApplicable(); err != nil {
@@ -328,20 +344,20 @@ func RemoveFwdRule(section string) (*FwdProbe, bool, error) {
 	if !strings.HasPrefix(section, fwdPrefix) || !reFwdSection.MatchString(section) {
 		return ProbeFwd(), false, fmt.Errorf("not an netgrip rule")
 	}
-	snap, err := executor.Snapshot("firewall")
+	snap, err := fwdSnapshotFn("firewall")
 	if err != nil {
 		return nil, false, err
 	}
 	rollback := func() {
-		_ = executor.Restore("firewall", snap)
-		_ = executor.Run(executor.Op{Kind: "initd", Args: []string{"firewall", "reload"}})
+		_ = fwdRestoreFn("firewall", snap)
+		_ = fwdRunFn(executor.Op{Kind: "initd", Args: []string{"firewall", "reload"}})
 	}
 	ops := []executor.Op{
 		{Kind: "uci_delete", Args: []string{"firewall." + section}},
 		{Kind: "uci_commit", Args: []string{"firewall"}},
 		{Kind: "initd", Args: []string{"firewall", "reload"}},
 	}
-	if err := executor.Apply(ops, nil); err != nil {
+	if err := fwdApplyFn(ops, nil); err != nil {
 		rollback()
 		return ProbeFwd(), true, err
 	}

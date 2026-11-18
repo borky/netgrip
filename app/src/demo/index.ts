@@ -36,6 +36,7 @@ const state = {
   captive: { ...D.demoCaptivePortal },
   iot: { ...D.demoIot },
   fwd: structuredClone(D.demoFwd),
+  allow: structuredClone(D.demoAllow),
   mwan: structuredClone(D.demoMultiWan),
   ts: { ...D.demoTailscale },
   lan: structuredClone(D.demoLan),
@@ -190,6 +191,16 @@ const demoQ: { state: QuarantineProbe; you: string } = {
   },
 };
 const qResult = async (): Promise<QResult> => { await wait(200, 500); return { status: "applied", state: structuredClone(demoQ.state) }; };
+
+/** The demo's "who uses which list", from the port rules. */
+function demoAllowUsers() {
+  for (const l of state.allow.lists) {
+    l.used_by = state.fwd.rules.filter((r) => r.allowed_from?.kind === "list" && r.allowed_from.list === l.id);
+  }
+  for (const e of state.allow.external) {
+    e.used_by = state.fwd.rules.filter((r) => r.allowed_from?.kind === "other" && r.allowed_from.set === e.set);
+  }
+}
 
 export const demoApi: typeof api = {
   // sesión
@@ -682,9 +693,53 @@ export const demoApi: typeof api = {
     return write(state.mwan);
   },
   portforward: () => get(state.fwd),
-  addFwdRule: async (src_dport, dest_ip, dest_port, proto) => {
-    state.fwd.rules.push({ section: `fwd_${state.fwd.rules.length}`, name: "", src_dport, dest_ip, dest_port, proto });
+  addFwdRule: async (src_dport, dest_ip, dest_port, proto, allow_list = "") => {
+    const l = state.allow.lists.find((x) => x.id === allow_list);
+    state.fwd.rules.push({
+      section: `fwd_${state.fwd.rules.length}`, name: "", src_dport, dest_ip, dest_port, proto, kind: "forward", managed: true,
+      allowed_from: l ? { kind: "list", list: l.id, list_name: l.name, set: `netgrip_allow_${l.id}_v4`, families: "ipv4" } : { kind: "anyone" },
+    });
+    demoAllowUsers();
     return write(state.fwd);
+  },
+  allowlists: async () => { demoAllowUsers(); return get(state.allow); },
+  saveAllowlist: async (req) => {
+    await wait(600, 1200);
+    const entries = req.entries.map((e) => ({
+      value: e.value, note: e.note, addresses: e.value.includes(".") && !/^[\d./]+$/.test(e.value) ? ["198.51.100.99"] : [e.value],
+      kind: (/^[\d.]+$/.test(e.value) ? "ip" : e.value.includes("/") ? "net" : "host") as "ip" | "net" | "host",
+    }));
+    const v4 = entries.flatMap((e) => e.addresses.filter((a) => !a.includes(":")));
+    const existing = state.allow.lists.find((x) => x.id === req.id);
+    if (existing) Object.assign(existing, { name: req.name, keep_hours: req.keep_hours, entries, v4, v6: [] });
+    else state.allow.lists.push({ id: `l${state.allow.lists.length + 1}`, name: req.name, keep_hours: req.keep_hours, entries, v4, v6: [], used_by: [] });
+    demoAllowUsers();
+    return { status: "applied", state: state.allow };
+  },
+  deleteAllowlist: async (id) => {
+    await wait(400, 800);
+    state.allow.lists = state.allow.lists.filter((x) => x.id !== id);
+    return { status: "applied", state: state.allow };
+  },
+  allowUse: async (req) => {
+    await wait(800, 1500);
+    if (req.list === "" && !req.open_to_anyone) return { status: "needs_force", needs_force: true, error: "It will be reachable from the whole Internet." };
+    const l = state.allow.lists.find((x) => x.id === req.list);
+    const af: T.AllowedFrom = l ? { kind: "list", list: l.id, list_name: l.name, set: `netgrip_allow_${l.id}_v4`, families: "both" } : { kind: "anyone" };
+    for (const r of state.fwd.rules) if (r.section === req.section) r.allowed_from = { ...af, families: r.kind === "forward" && l ? "ipv4" : af.families };
+    if (req.section === "netgrip_remote_ssh") state.remote.ssh_allowed = af;
+    demoAllowUsers();
+    return { status: "applied", state: state.allow };
+  },
+  allowTakeoverInfo: async (set) => get(state.allow.external.find((e) => e.set === set)!),
+  allowTakeover: async (req) => {
+    await wait(1000, 1800);
+    const id = `l${state.allow.lists.length + 1}`;
+    state.allow.lists.push({ id, name: req.name, keep_hours: req.keep_hours, entries: req.entries.map((e) => ({ ...e, kind: "ip", addresses: [e.value] })), v4: req.entries.map((e) => e.value), v6: [], used_by: [] });
+    state.allow.external = state.allow.external.filter((e) => e.set !== req.set);
+    for (const r of state.fwd.rules) if (r.allowed_from?.set === req.set) r.allowed_from = { kind: "list", list: id, list_name: req.name, set: `netgrip_allow_${id}_v4`, families: "ipv4" };
+    demoAllowUsers();
+    return { status: "applied", state: state.allow };
   },
   deleteFwdRule: async (section) => {
     state.fwd.rules = state.fwd.rules.filter((r) => r.section !== section);

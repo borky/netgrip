@@ -225,6 +225,78 @@ export interface FwdRule {
   /** Created by NetGrip, so it can be removed from here. Rules set up in
    *  LuCI or by hand are listed read-only. */
   managed?: boolean;
+  /** Who may reach it: anyone, an allow list, or a set managed elsewhere. */
+  allowed_from?: AllowedFrom;
+}
+
+/** Who may reach a port open to the Internet. */
+export interface AllowedFrom {
+  kind: "anyone" | "list" | "other";
+  list?: string;
+  list_name?: string;
+  set?: string;
+  /** "other": the set blocks instead of allowing. */
+  negated?: boolean;
+  /** Families the limit lets in ("list"): ipv4, ipv6 or both. */
+  families?: "ipv4" | "ipv6" | "both";
+}
+
+export interface AllowEntry {
+  value: string;
+  note?: string;
+}
+
+export interface AllowEntryView extends AllowEntry {
+  kind: "ip" | "net" | "host" | "";
+  addresses: string[];
+  error?: string;
+  /** The name cannot be looked up now; its last addresses are kept. */
+  stale?: boolean;
+  checked_at?: number;
+}
+
+export interface AllowListView {
+  id: string;
+  name: string;
+  keep_hours: number;
+  entries: AllowEntryView[];
+  v4: string[];
+  v6: string[];
+  used_by: FwdRule[];
+}
+
+export interface AllowExternal {
+  set: string;
+  family: number;
+  elements: string[];
+  used_by: FwdRule[];
+  /** Scheduled jobs (crontab lines) that fill it. */
+  writers: string[];
+  can_take_over: boolean;
+  why?: string;
+  /** Entries proposed for the list that would replace it. */
+  suggest?: AllowEntry[];
+}
+
+export interface AllowProbe {
+  supported: boolean;
+  reason?: string;
+  lists: AllowListView[];
+  external: AllowExternal[];
+  you: { ip: string; local: boolean; lists: string[] };
+  max_lists: number;
+  max_entries: number;
+}
+
+/** Result of an allow list change. needs_force: the change waits for the
+ *  user to confirm `error` (the reason). */
+export interface AllowResult {
+  status: "applied" | "rolled_back" | "failed" | "needs_force";
+  needs_force?: boolean;
+  rolled_back?: boolean;
+  error?: string;
+  state?: AllowProbe;
+  confirm?: { id: string; expires: number };
 }
 
 export interface FwdProbe {
@@ -392,6 +464,10 @@ export interface RemoteAccess {
   ping_wan: boolean;
   remote_https: boolean;
   remote_ssh: boolean;
+  https_allowed?: AllowedFrom;
+  ssh_allowed?: AllowedFrom;
+  https_section?: string;
+  ssh_section?: string;
 }
 
 export interface Reservation {

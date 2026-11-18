@@ -205,8 +205,38 @@ export const demoFwd: T.FwdProbe = {
   has_wan: true,
   firewall: true,
   rules: [
-    { section: "fwd_https_nas", name: "HTTPS al NAS", src_dport: "443", dest_ip: "192.168.8.10", dest_port: "443", proto: "tcp" },
+    { section: "fwd_https_nas", name: "HTTPS al NAS", src_dport: "443", dest_ip: "192.168.8.10", dest_port: "443", proto: "tcp",
+      kind: "forward", managed: true, allowed_from: { kind: "list", list: "home", list_name: "Home and office", set: "netgrip_allow_home_v4", families: "ipv4" } },
+    { section: "fwd_game", name: "Game server", src_dport: "25565", dest_ip: "192.168.8.30", dest_port: "25565", proto: "tcp",
+      kind: "forward", managed: true, allowed_from: { kind: "other", set: "friends_allowed" } },
+    { section: "vpn_in", name: "VPN", src_dport: "51820", dest_ip: "", dest_port: "", proto: "udp",
+      kind: "input", managed: false, allowed_from: { kind: "anyone" } },
   ],
+};
+
+export const demoAllow: T.AllowProbe = {
+  supported: true,
+  lists: [
+    {
+      id: "home", name: "Home and office", keep_hours: 24,
+      entries: [
+        { value: "home.example.net", note: "home (dynamic DNS)", kind: "host", addresses: ["198.51.100.7", "2001:db8::7"], checked_at: 0 },
+        { value: "203.0.113.0/24", note: "office", kind: "net", addresses: ["203.0.113.0/24"] },
+      ],
+      v4: ["198.51.100.7", "203.0.113.0/24"], v6: ["2001:db8::7"],
+      used_by: [],
+    },
+  ],
+  external: [
+    {
+      set: "friends_allowed", family: 4, elements: ["198.51.100.40", "198.51.100.41"],
+      used_by: [], writers: ["*/5 * * * * /etc/friends_update.sh"], can_take_over: true,
+      suggest: [{ value: "friend.example.org" }, { value: "198.51.100.41", note: "was in friends_allowed" }],
+    },
+  ],
+  you: { ip: "192.168.8.100", local: true, lists: [] },
+  max_lists: 32,
+  max_entries: 64,
 };
 
 export const demoMultiWan: T.MultiWanProbe = {
@@ -302,7 +332,9 @@ export const demoRemoteAccess: T.RemoteAccess = {
   applicable: true,
   ping_wan: false,
   remote_https: false,
-  remote_ssh: false,
+  remote_ssh: true,
+  ssh_allowed: { kind: "list", list: "home", list_name: "Home and office", set: "netgrip_allow_home_v4", families: "both" },
+  ssh_section: "netgrip_remote_ssh",
 };
 
 export const demoOffload: T.OffloadProbe = {

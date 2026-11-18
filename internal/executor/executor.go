@@ -131,6 +131,8 @@ var (
 	// by `uci show` for anonymous sections and accepted by the CLI).
 	reUCIKey    = regexp.MustCompile(`^[a-z][a-z0-9_]*(\.(@[a-zA-Z0-9_-]+\[\d+\]|[a-zA-Z0-9_@:-]+))+$`)
 	reUCIConfig = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
+	// A section name uci accepts when naming one.
+	reUCISectionName = regexp.MustCompile(`^[a-zA-Z0-9_]{1,64}$`)
 	reService   = regexp.MustCompile(`^[a-z0-9_-]+$`)
 	rePkg       = regexp.MustCompile(`^[a-z0-9][a-z0-9+_.-]*$`)
 	reBadChars  = regexp.MustCompile("[;\n\r`]")
@@ -157,6 +159,14 @@ func Validate(op Op) error {
 	case "uci_delete":
 		if len(op.Args) != 1 || !reUCIKey.MatchString(op.Args[0]) {
 			return fmt.Errorf("invalid uci_delete args: %v", op.Args)
+		}
+	case "uci_rename":
+		// Args: <config.section> <new section name>. Gives an anonymous
+		// section a name, so it can be referred to after other sections
+		// are added or removed (an index like @rule[3] moves).
+		if len(op.Args) != 2 || !reUCIKey.MatchString(op.Args[0]) || strings.Count(op.Args[0], ".") != 1 ||
+			!reUCISectionName.MatchString(op.Args[1]) {
+			return fmt.Errorf("invalid uci_rename args: %v", op.Args)
 		}
 	case "uci_commit":
 		if len(op.Args) != 1 || !reUCIConfig.MatchString(op.Args[0]) {
@@ -230,6 +240,8 @@ func Run(op Op) error {
 		cmd = exec.Command("uci", "del_list", op.Args[0]+"="+op.Args[1])
 	case "uci_delete":
 		cmd = exec.Command("uci", "delete", op.Args[0])
+	case "uci_rename":
+		cmd = exec.Command("uci", "rename", op.Args[0]+"="+op.Args[1])
 	case "uci_commit":
 		cmd = exec.Command("uci", "commit", op.Args[0])
 	case "pkg_add":

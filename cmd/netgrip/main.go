@@ -103,6 +103,7 @@ func main() {
 	modules.StartWifiScheduleScheduler()
 	modules.StartButtons()
 	modules.StartWiredKeepalive()
+	modules.StartAllowlists()
 	modules.StartBanipWarmup()
 	modules.StartAnnouncements()
 	// The login form posts the router's root password, so how the panel

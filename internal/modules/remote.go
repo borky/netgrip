@@ -15,6 +15,13 @@ type RemoteAccess struct {
 	PingWAN     bool `json:"ping_wan"`
 	RemoteHTTPS bool `json:"remote_https"`
 	RemoteSSH   bool `json:"remote_ssh"`
+	// Who may reach the panel and SSH from the Internet (when the rule
+	// exists): anyone, or an allow list. Section is what to send to change
+	// it.
+	HTTPSAllowed *AllowedFrom `json:"https_allowed,omitempty"`
+	SSHAllowed   *AllowedFrom `json:"ssh_allowed,omitempty"`
+	HTTPSSection string       `json:"https_section,omitempty"`
+	SSHSection   string       `json:"ssh_section,omitempty"`
 }
 
 const (
@@ -31,6 +38,19 @@ func ProbeRemoteAccess() *RemoteAccess {
 		PingWAN:     panicOnPingRule(),
 		RemoteHTTPS: remoteRuleTarget(remoteHTTPSIdx) == "ACCEPT",
 		RemoteSSH:   remoteRuleTarget(remoteSSHIdx) == "ACCEPT",
+	}
+	if p.Applicable {
+		show, _ := uciShowCached("firewall")
+		secs := parseUCIShow(show, "firewall")
+		names := allowListNames()
+		if sec, ok := secs[remoteHTTPSIdx]; ok {
+			a := allowedFromOf(remoteHTTPSIdx, sec, secs, names)
+			p.HTTPSAllowed, p.HTTPSSection = &a, remoteHTTPSIdx
+		}
+		if sec, ok := secs[remoteSSHIdx]; ok {
+			a := allowedFromOf(remoteSSHIdx, sec, secs, names)
+			p.SSHAllowed, p.SSHSection = &a, remoteSSHIdx
+		}
 	}
 	return p
 }
@@ -66,6 +86,8 @@ func listFirewallRules() []fwRule {
 // SetRemoteAccess applies a remote-access toggle with snapshot, reload and
 // rollback. Only one toggle is applied per call (the non-nil flag wins).
 func SetRemoteAccess(pingWAN, remoteHTTPS, remoteSSH *bool) (*RemoteAccess, bool, error) {
+	fwWriteMu.Lock()
+	defer fwWriteMu.Unlock()
 	probe := ProbeRemoteAccess()
 	if !probe.Applicable {
 		return probe, false, fmt.Errorf("remote access only applies on the gateway (needs WAN and firewall)")
@@ -96,7 +118,14 @@ func SetRemoteAccess(pingWAN, remoteHTTPS, remoteSSH *bool) (*RemoteAccess, bool
 		rollback()
 		return ProbeRemoteAccess(), true, err
 	}
+	// A rule limited to an allow list has an IPv6 twin: switched off or on
+	// with it, in the same reload.
+	if err := allowCompanionSyncNowLocked(); err != nil {
+		rollback()
+		return ProbeRemoteAccess(), true, err
+	}
 	_ = executor.Run(executor.Op{Kind: "initd", Args: []string{"firewall", "reload"}})
+	InvalidateKey("ucishow|firewall")
 
 	after := ProbeRemoteAccess()
 	if !remoteAccessHealthy(after, pingWAN, remoteHTTPS, remoteSSH) {

@@ -185,6 +185,12 @@ func New(rpcdURL, version string, secure bool, servingCert string) *Server {
 	s.mux.HandleFunc("GET /api/portforward", s.requireAuth(s.handleFwdGet))
 	s.mux.HandleFunc("POST /api/portforward", s.requireAuth(s.handleFwdAdd))
 	s.mux.HandleFunc("POST /api/portforward/delete", s.requireAuth(s.handleFwdDelete))
+	s.mux.HandleFunc("GET /api/allowlists", s.requireAuth(s.handleAllowGet))
+	s.mux.HandleFunc("POST /api/allowlists", s.requireAuth(s.handleAllowSave))
+	s.mux.HandleFunc("POST /api/allowlists/delete", s.requireAuth(s.handleAllowDelete))
+	s.mux.HandleFunc("POST /api/allowlists/use", s.requireAuth(s.handleAllowUse))
+	s.mux.HandleFunc("GET /api/allowlists/takeover", s.requireAuth(s.handleAllowTakeoverInfo))
+	s.mux.HandleFunc("POST /api/allowlists/takeover", s.requireAuth(s.handleAllowTakeover))
 	s.mux.HandleFunc("GET /api/tailscale", s.requireAuth(s.handleTSGet))
 	s.mux.HandleFunc("POST /api/tailscale", s.requireAuth(s.handleTSSet))
 	s.mux.HandleFunc("GET /api/guestwifi", s.requireAuth(s.handleGuestGet))
@@ -1474,6 +1480,8 @@ type fwdAddRequest struct {
 	DestIP   string `json:"dest_ip"`
 	DestPort string `json:"dest_port"`
 	Proto    string `json:"proto"`
+	// AllowList limits the new forward to an allow list ("" = anyone).
+	AllowList string `json:"allow_list"`
 }
 
 func (s *Server) handleFwdAdd(w http.ResponseWriter, r *http.Request) {
@@ -1482,7 +1490,7 @@ func (s *Server) handleFwdAdd(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid json")
 		return
 	}
-	probe, rolledBack, err := modules.AddFwdRule(req.SrcDport, req.DestIP, req.DestPort, req.Proto)
+	probe, rolledBack, err := modules.AddFwdRule(req.SrcDport, req.DestIP, req.DestPort, req.Proto, req.AllowList)
 	writeModuleResult(w, probe, rolledBack, err)
 }
 
