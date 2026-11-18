@@ -2024,7 +2024,9 @@ func (s *Server) handleClients(w http.ResponseWriter, r *http.Request) {
 	// computed inside the cache so it stays consistent with the cached
 	// byte counters; writes invalidate via invalidateClients (#356).
 	payload, _ := modules.CachedRead("clients|"+requesterIP, probeCacheTTL, func() (map[string]any, error) {
-		return map[string]any{"clients": modules.ListClients(requesterIP), "bands": modules.AvailableBands(), "ts": time.Now().UnixMilli()}, nil
+		// NetPulse's names only on this copy, for display (see
+		// WithNetPulseNames): the list other features use is untouched.
+		return map[string]any{"clients": modules.WithNetPulseNames(modules.ListClients(requesterIP)), "bands": modules.AvailableBands(), "ts": time.Now().UnixMilli()}, nil
 	})
 	writeJSON(w, payload)
 }

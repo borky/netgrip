@@ -584,6 +584,8 @@ export default {
   clients: {
     title: "Clientes",
     summaryTitle: "Tus dispositivos",
+    fromNetPulse: "NetPulse",
+    fromNetPulseTip: "Nombre de NetPulse: este router no conoce ninguno para el dispositivo. Edítalo para darle uno propio.",
     search: "Buscar por nombre, IP, MAC, tipo o red",
     filterConn: "Conexión",
     connAll: "Cualquier conexión",

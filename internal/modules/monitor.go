@@ -120,7 +120,8 @@ func (m *Monitor) checkNewClients() {
 		return
 	}
 
-	for _, c := range newOnes {
+	// A name from NetPulse helps tell what joined (display only).
+	for _, c := range WithNetPulseNames(newOnes) {
 		name := c.Name
 		if name == "" {
 			name = "Unknown device"

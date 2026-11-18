@@ -577,6 +577,9 @@ export interface Client {
   quota_exceeded?: boolean;
   /** The router interface whose subnet holds the client's address (lan, iot, ...). */
   network?: string;
+  /** Where the name comes from when not the DHCP lease: reservation |
+   *  quarantine | netpulse (shown from NetPulse, display only). */
+  name_source?: string;
 }
 
 export interface BlockedClient {

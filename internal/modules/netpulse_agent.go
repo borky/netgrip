@@ -559,8 +559,10 @@ func applyNetPulseAgent(p netpulsePaths) {
 		// detection (both only with a pinned HTTPS server).
 		Quarantine:           quarantineReportInfo,
 		OnQuarantineStations: QuarantineNoteStations,
-		OnUpgrade:            netPulseUpgradeTrigger,
-		OnConfigBackup:       netPulseConfigBackupTrigger,
+		// Display only: names for clients NetGrip has none for.
+		OnDeviceNames:  NoteNetPulseNames,
+		OnUpgrade:      netPulseUpgradeTrigger,
+		OnConfigBackup: netPulseConfigBackupTrigger,
 	}
 
 	ctx, cancel := context.WithCancel(base)

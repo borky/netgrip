@@ -421,6 +421,9 @@ export function ClientsPage() {
           </span>
           <span className="block text-caption text-muted">
             {c.device_type ? t(DEVICE_TYPES[c.device_type as DeviceType]?.labelKey ?? "clients.type.other") : c.mac}
+            {c.name_source === "netpulse" && (
+              <span className="text-faint" title={t("clients.fromNetPulseTip")}> · {t("clients.fromNetPulse")}</span>
+            )}
           </span>
         </span>
       </>
@@ -1392,14 +1395,16 @@ function EditClientModal({ client, busy, onSave, onClose }: {
 
   useEffect(() => {
     if (!client) return;
-    setName(client.name && client.name !== client.mac ? client.name : "");
+    // A name shown from NetPulse is not this device's own: never pre-filled,
+    // so saving (a type, say) does not make it one. It is the hint instead.
+    setName(client.name && client.name !== client.mac && client.name_source !== "netpulse" ? client.name : "");
     setDeviceType(client.device_type || "other");
     setReserved(client.reserved);
     setIp(client.ip ?? "");
   }, [client]);
 
   if (!client) return null;
-  const hasCustom = (client.name && client.name !== client.mac) || !!client.device_type;
+  const hasCustom = (client.name && client.name !== client.mac && client.name_source !== "netpulse") || !!client.device_type;
   const ipValid = !reserved || /^\d{1,3}(\.\d{1,3}){3}$/.test(ip.trim());
 
   return (
@@ -1420,7 +1425,8 @@ function EditClientModal({ client, busy, onSave, onClose }: {
       }>
       <div className="flex flex-col gap-4">
         <Field label={t("clients.nameLabel")} inputProps={{
-          value: name, onChange: (e) => setName(e.target.value), placeholder: t("clients.namePlaceholder"), maxLength: 40,
+          value: name, onChange: (e) => setName(e.target.value),
+          placeholder: client.name_source === "netpulse" ? client.name : t("clients.namePlaceholder"), maxLength: 40,
         }} />
         <div className="relative">
           <Field label={t("clients.typeLabel")}>
