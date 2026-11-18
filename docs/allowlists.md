@@ -19,7 +19,11 @@ own networks (NAT reflection included).
 ## Failing closed
 
 - An empty list lets nobody in.
-- A name that no longer exists (NXDOMAIN) is dropped at once.
+- A name that no longer exists (NXDOMAIN), or that points only at an
+  address a list cannot hold (a dynamic DNS name parked at 0.0.0.0, a
+  sinkhole at 127.0.0.1), is dropped at once: its old address may belong
+  to someone else by then. Each family (A, AAAA) is looked up on its own,
+  so a timeout in one does not drop the other.
 - A name that cannot be looked up (DNS down, timeout) keeps its last
   address for the time the list allows (none, 1, 6 or 24 hours), then is
   dropped.
@@ -66,13 +70,17 @@ refill a set something else emptied.
 
 ## Safety while connected from outside
 
-When the panel is used from outside the router's own networks:
+When the panel is used from outside the router's own networks (through
+an SSH tunnel, from the loopback address, or through a host a port forward
+points at, such as a reverse proxy at home, counts as outside):
 
 - limiting a port to a list that does not include the address the panel is
   used from asks first;
 - removing that address from a list in use asks first;
 - limiting a port arms the revert timer: unless "Keep" is pressed, the
-  firewall is put back by itself;
+  firewall is put back by itself (limiting remote HTTPS or SSH arms it
+  from anywhere; from home otherwise it is not armed, as a missed "Keep"
+  would open the port to everyone again);
 - taking a set over is refused (the scheduled job it turns off is not part
   of a firewall rollback).
 
@@ -87,7 +95,9 @@ NetGrip". "Take over" proposes a list made of the host names found in the
 script that fills it (kept only when they resolve to an address the set
 holds now) and the set's other addresses, then in one firewall change:
 creates the list, moves every port that used the set to it, and removes
-the set. Addresses the set allows now and the new list would not are
+the set. Each port keeps the family the old set gave it (a port that
+answers both families but was limited to an IPv4 set gets `family ipv4`,
+so IPv6 does not open on the way). Addresses the set allows now and the new list would not are
 shown and must be confirmed. The scheduled job that filled the set is then
 commented out in its crontab (kept, not deleted) and cron restarted.
 
@@ -97,5 +107,8 @@ something other than addresses.
 
 ## Requirements
 
-fw4 (nftables): OpenWrt 22.03 or newer. No package to install. Older
-firewalls (fw3, iptables) show the card as not available.
+fw4 (nftables) able to load a set from a file (`loadfile`). No package
+to install. Older firewalls (fw3, iptables), or an fw4 without set files,
+show the card as not available. Firewall changes staged elsewhere and not
+applied (LuCI, a script) must be applied or discarded first: they are
+never committed along with NetGrip's.

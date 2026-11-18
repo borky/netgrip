@@ -9,6 +9,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/gnacho/netgrip/internal/executor"
 )
@@ -313,6 +314,7 @@ func AllowDelete(id, requester string) (*AllowProbe, bool, error) {
 	err := allowSaveLocked()
 	for _, set := range sets {
 		delete(allowApplied, set)
+		delete(allowSetErr, set)
 		_ = os.Remove(allowLoadfile(set))
 	}
 	allowRecordLocked(nil, allowNow()) // forget its names
@@ -471,29 +473,42 @@ func allowSyncCompanionsTick() {
 		allowSyncLast, allowSyncNote = "", ""
 		return
 	}
-	// The same repair again, right after it was made (or failed): it does
-	// not settle. Not again every two minutes (a firewall reload and a
-	// flash write each time); logged once, retried when anything changes.
+	// The same repair again right after it was made: it does not settle.
+	// Not again every two minutes (a firewall reload and a flash write each
+	// time); logged once, retried when anything changes. A repair that
+	// failed is retried, but at most every 30 minutes.
 	sig := fmt.Sprint(ops)
 	if sig == allowSyncLast {
 		allowSyncNoteOnce("the IPv6 twin rules do not settle; leaving them until the rules change")
+		return
+	}
+	if sig == allowSyncFailed && time.Since(allowSyncFailedAt) < 30*time.Minute {
 		return
 	}
 	if allowFirewallPending() {
 		allowSyncNoteOnce("IPv6 twin rules not checked: the firewall has changes staged elsewhere and not applied")
 		return
 	}
-	allowSyncLast = sig
 	if _, err := allowApplyFirewall(ops, nil); err != nil {
+		allowSyncFailed, allowSyncFailedAt = sig, time.Now()
 		log.Printf("allowlists: bring the IPv6 twin rules in step: %v", err)
 		return
 	}
-	allowSyncNote = ""
+	allowSyncLast, allowSyncFailed, allowSyncNote = sig, "", ""
 	log.Printf("allowlists: IPv6 twin rules brought in step with their rules (%d changes)", len(ops))
 }
 
 // The tick's repair state (only the tick goroutine touches it).
-var allowSyncLast, allowSyncNote string
+var (
+	allowSyncLast, allowSyncNote, allowSyncFailed string
+	allowSyncFailedAt                             time.Time
+)
+
+// AllowIsRemoteAccessRule: section is remote HTTPS or SSH, the way into the
+// router itself; limiting it arms the revert timer from anywhere.
+func AllowIsRemoteAccessRule(section string) bool {
+	return section == remoteHTTPSIdx || section == remoteSSHIdx
+}
 
 func allowSyncNoteOnce(msg string) {
 	if allowSyncNote != msg {

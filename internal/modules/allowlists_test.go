@@ -1483,3 +1483,25 @@ func TestPendingChangesRefused(t *testing.T) {
 		t.Error("applied over someone else's staged changes")
 	}
 }
+
+func TestCronCRLFLineIsCommented(t *testing.T) {
+	dir := t.TempDir()
+	tabs := filepath.Join(dir, "crontabs")
+	_ = os.MkdirAll(tabs, 0o755)
+	tab := filepath.Join(tabs, "root")
+	_ = os.WriteFile(tab, []byte("*/5 * * * * /usr/bin/fill-web\r\n"), 0o600)
+	old := allowCrontabDir
+	allowCrontabDir = tabs
+	defer func() { allowCrontabDir = old }()
+	lines := allowCronWriters("fill-web")
+	if len(lines) != 1 {
+		t.Fatalf("%+v", lines)
+	}
+	if err := allowDisableCronLines(lines, "x"); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(tab)
+	if !strings.HasPrefix(string(b), "# netgrip allowlists") {
+		t.Errorf("%q", b)
+	}
+}

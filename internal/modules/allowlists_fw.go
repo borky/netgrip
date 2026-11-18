@@ -729,6 +729,8 @@ func allowWriteListFilesLocked(l AllowList) (v4, v6 []string) {
 func allowMarkAppliedLocked(id string, v4, v6 []string) {
 	allowApplied[allowSetName(id, 4)] = allowSetContent(v4)
 	allowApplied[allowSetName(id, 6)] = allowSetContent(v6)
+	delete(allowSetErr, allowSetName(id, 4))
+	delete(allowSetErr, allowSetName(id, 6))
 }
 
 // ---- the requester ----
@@ -1096,7 +1098,8 @@ func allowDisableCronLines(lines []allowCronLine, listName string) error {
 		rows := strings.Split(string(b), "\n")
 		for i := range rows {
 			// Only the very line found (the file may have changed since).
-			if nums[i+1] && texts[file][i+1] == rows[i] && !strings.HasPrefix(strings.TrimSpace(rows[i]), "#") {
+			// (The line was read without a CRLF file's "\r".)
+			if nums[i+1] && texts[file][i+1] == strings.TrimRight(rows[i], "\r") && !strings.HasPrefix(strings.TrimSpace(rows[i]), "#") {
 				rows[i] = fmt.Sprintf("# netgrip allowlists: replaced by the list %q: %s", listName, rows[i])
 				changed = true
 			}

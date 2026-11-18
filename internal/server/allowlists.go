@@ -48,16 +48,17 @@ func (s *Server) handleAllowDelete(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleAllowUse ties a port to a list (or opens it to anyone). Limiting a
-// port always arms the revert timer: whoever reached the panel through it
-// (from outside, through a tunnel or a proxy at home) and is cut off gets
-// the firewall put back by the router itself.
+// port from outside the router's own networks (a tunnel and a proxy at home
+// count as outside), or limiting remote HTTPS/SSH from anywhere, arms the
+// revert timer: whoever is cut off gets the firewall put back by the router
+// itself. Not otherwise: a missed "Keep" would re-open the port to everyone.
 func (s *Server) handleAllowUse(w http.ResponseWriter, r *http.Request) {
 	var req modules.AllowUseRequest
 	if !decodeJSON(w, r, &req) {
 		return
 	}
 	ip := requesterIP(r)
-	confirm := req.List != ""
+	confirm := req.List != "" && (!modules.AllowRequesterLocal(ip) || modules.AllowIsRemoteAccessRule(req.Section))
 	s.riskyMu.Lock()
 	defer s.riskyMu.Unlock()
 	var snapshots map[string]string

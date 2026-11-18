@@ -515,6 +515,7 @@ func allowPushSet(set string, elems []string, inConfig, force bool) {
 	}
 	if !inConfig {
 		delete(allowApplied, set)
+		delete(allowSetErr, set)
 		return
 	}
 	if !force && allowApplied[set] == content {
